@@ -33,6 +33,9 @@ CCF_FIELDS = [
     "purity", "purity_source", "purity_confidence", "ploidy",
     "purity_consensus_status", "purity_range", "purity_n_tools", "purity_tool_values",
     "purity_recommendation_file",
+    # Audit C5: every CCF row must carry the versioned rule that produced its
+    # purity-confidence label, not just the input-QC sidecar.
+    "purity_confidence_criteria",
     "total_cn", "major_cn", "minor_cn", "loh_status", "cnv_confidence",
     "multiplicity_candidates", "multiplicity_best", "multiplicity_confidence", "multiplicity_ambiguity",
     "multiplicity_sensitivity",

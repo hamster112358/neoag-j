@@ -93,7 +93,7 @@ def build_expression_evidence(
     """Event-level expression evidence from raw events (+ optional TPM table join)."""
     tpm_map = _load_expression_map(
         expression_path,
-        ("gene", "gene_symbol", "symbol", "Gene", "gene_id", "ensembl_gene_id"),
+        ("gene", "gene_symbol", "symbol", "gene_name", "Gene", "gene_id", "ensembl_gene_id"),
     )
     transcript_map, transcript_gene_map = _load_transcript_expression_maps(
         transcript_expression_path

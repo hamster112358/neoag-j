@@ -19,10 +19,15 @@ excluded from the weighted score; the weight is now profile-tunable so saved sco
 tables can be reranked without rerunning predictors.
 """
 import csv
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
 
 from neoag.utils import write_tsv
 
-from neoag.appm_v2 import load_hla_loh
+from neoag.appm_v2 import load_expression, load_hla_loh
 from neoag.evidence_consensus import load_consensus_rules
 from neoag.evidence_states import derive_rna_support
 
@@ -365,6 +370,16 @@ def test_c5_purity_confidence_criteria_are_explicit(tmp_path):
     assert info["purity_confidence_criteria"] == PURITY_CONFIDENCE_CRITERIA
     assert "0.20<=purity<0.35=medium" in PURITY_CONFIDENCE_CRITERIA
 
+    # The production regression this guards: the per-event ccf_2.tsv writer
+    # silently dropped the key because CCF_FIELDS omitted it.
+    rows = _ccf_rows(
+        tmp_path,
+        [{"chrom": "chr9", "start": "1", "end": "1000", "total_cn": "2", "major_cn": "2", "minor_cn": "0"}],
+        [_event("CRI", "0.30")],
+        purity="0.80",
+    )
+    assert rows[0]["purity_confidence_criteria"] == PURITY_CONFIDENCE_CRITERIA
+
 
 def test_f5_low_expression_suggests_but_does_not_prove_biallelic_loss():
     from neoag.appm_v2 import _biallelic_status, _functional_status, _gene_integrity_score, _gene_integrity_status
@@ -382,3 +397,59 @@ def test_f5_low_expression_suggests_but_does_not_prove_biallelic_loss():
                                 {"TP53": {"copy_number_status": "homozygous deletion", "loh_status": ""}},
                                 {"TP53": 8.0}, True, 1.0)
     assert hard == "BIALLELIC_LOSS"
+
+
+# --- Live-run follow-up (2026-11-04 audit run): ENSG-only gene_tpm namespace break ---
+# The production run showed appm_input_status "parsed_but_no_appm_relevant_columns_or
+# _records" (86369 rows, 0 relevant) and 349/349 expression events UNASSESSED_ID_NOT_MAPPED:
+# salmon_quant_to_gene_tpm.py dropped the tx2gene symbol column, so every symbol-keyed
+# consumer (APPM load_expression, evidence gene join) silently matched nothing.
+
+
+def _write_expression_namespace_fixtures(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "salmon_quant_to_gene_tpm.py"
+    quant = tmp_path / "quant.sf"
+    _write_tsv(quant, ["Name", "Length", "EffectiveLength", "TPM", "NumReads"], [
+        ["ENST00000269305.9", "2500", "2000", "10.0", "100"],
+        ["ENST00000318531.8", "1800", "1500", "2.5", "50"],
+    ])
+    tx2gene = tmp_path / "tx2gene.tsv"
+    _write_tsv(tx2gene, ["transcript_id", "gene_id", "gene_name"], [
+        ["ENST00000269305.9", "ENSG00000141510.18", "TP53"],
+        ["ENST00000318531.8", "ENSG00000146648.19", "EGFR"],
+    ])
+    gene_tpm = tmp_path / "gene_tpm.tsv"
+    subprocess.run(
+        [sys.executable, str(script), "--quant-sf", str(quant), "--tx2gene", str(tx2gene),
+         "--out", str(gene_tpm)],
+        check=True,
+    )
+    return gene_tpm
+
+
+def test_gene_tpm_keeps_symbol_column_from_tx2gene(tmp_path):
+    gene_tpm = _write_expression_namespace_fixtures(tmp_path)
+    rows = list(csv.DictReader(gene_tpm.open(encoding="utf-8"), delimiter="\t"))
+    assert list(rows[0]) == ["gene_id", "gene_name", "tpm"]
+    by_symbol = {r["gene_name"]: float(r["tpm"]) for r in rows}
+    assert by_symbol["TP53"] == pytest.approx(10.0)
+    assert by_symbol["EGFR"] == pytest.approx(2.5)
+    # APPM side: load_expression must key by the symbol the APPM gene lists use.
+    expr = load_expression(gene_tpm)
+    assert expr.get("TP53") == pytest.approx(10.0)
+    assert "ENSG00000141510" not in expr
+
+
+def test_expression_evidence_joins_symbol_genes_against_gene_tpm(tmp_path):
+    from neoag.evidence_layer import build_expression_evidence
+
+    gene_tpm = _write_expression_namespace_fixtures(tmp_path)
+    events = tmp_path / "raw_events.tsv"
+    _write_tsv(events, ["event_id", "sample_id", "gene", "transcript_id"], [
+        ["EV1", "S1", "TP53", "ENST00000269305"],
+    ])
+    out = tmp_path / "expression_evidence.tsv"
+    rows = build_expression_evidence(events, out, expression_path=gene_tpm, sample_id="S1")
+    assert len(rows) == 1
+    assert rows[0]["expression_evidence_status"] != "UNASSESSED_ID_NOT_MAPPED"
+    assert float(rows[0]["gene_expression_tpm"]) == pytest.approx(10.0)

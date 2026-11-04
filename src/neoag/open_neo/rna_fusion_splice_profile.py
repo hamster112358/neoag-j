@@ -525,6 +525,9 @@ def generate_rna_fusion_splice_manifest(
         "",
         "[evidence]",
         'expression = "{outdir}/rna/expression/gene_tpm.tsv"',
+        # transcript_tpm.tsv carries GENCODE composite keys (ENST|ENSG|...|SYMBOL);
+        # without this line the symbol bridge for expression evidence never reaches run-full.
+        'transcript_expression = "{outdir}/rna/expression/transcript_tpm.tsv"',
     ]
     if salmon_primary and rsem_available and quant_method == "auto":
         lines += [
