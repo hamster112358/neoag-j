@@ -182,6 +182,8 @@ def consensus(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "status": "MISSING",
                 "high_resolution_status": "MISSING",
                 "details": "no tool result",
+                "ranked_votes": "",
+                "tie": "no",
             })
             continue
         pairs = []
@@ -197,7 +199,14 @@ def consensus(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 high_pairs.append(" / ".join(high_vals))
                 high_rows.append(row)
         counts = Counter(pairs)
-        best, support = counts.most_common(1)[0]
+        # Audit item HLA A1: most_common(1) picked arbitrarily among tied votes
+        # and threw the rest away. Rank deterministically (support desc, pair
+        # asc) and keep the whole vote distribution plus a tie flag so the
+        # uncertainty survives into the consensus table.
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        best, support = ranked[0]
+        tie = sum(1 for _, cnt in ranked if cnt == support) > 1
+        ranked_votes = ";".join(f"{pair}={cnt}" for pair, cnt in ranked)
         high_counts = Counter(high_pairs)
         high_best, high_support = high_counts.most_common(1)[0] if high_counts else ("", 0)
         n_tools = len({r["tool"] for r in locus_rows})
@@ -221,8 +230,10 @@ def consensus(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 else "DISCORDANT" if high_rows
                 else "MISSING"
             ),
-            "details": "; ".join(f"{r['tool']}={r.get('lowres1','')}/{r.get('lowres2','')}" for r in locus_rows),
-        })
+                "details": "; ".join(f"{r['tool']}={r.get('lowres1','')}/{r.get('lowres2','')}" for r in locus_rows),
+                "ranked_votes": ranked_votes,
+                "tie": "yes" if tie else "no",
+            })
     return out
 
 
@@ -270,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     standardized_columns = ["tool", "locus", "allele1", "allele2", "lowres1", "lowres2", "highres1", "highres2", "source_file"]
     write_tsv(outdir / "hla_typing_tool_summary.tsv", rows, standardized_columns)
     write_tsv(outdir / "hla_typing.standardized.tsv", rows, standardized_columns)
-    consensus_columns = ["locus", "consensus_lowres", "consensus_2field", "consensus_high_resolution", "support", "high_resolution_support", "status", "high_resolution_status", "details"]
+    consensus_columns = ["locus", "consensus_lowres", "consensus_2field", "consensus_high_resolution", "support", "high_resolution_support", "status", "high_resolution_status", "details", "ranked_votes", "tie"]
     write_tsv(outdir / "hla_typing_consensus.tsv", cons, consensus_columns)
     write_tsv(outdir / "hla_typing_run_suggestions.tsv", run_suggestions, ["tool", "command"])
     write_json(outdir / "hla_typing_recommendation.json", {"sample_id": args.sample_id or "", "n_tool_locus_calls": len(rows), "consensus": cons})

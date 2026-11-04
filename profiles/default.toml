@@ -41,6 +41,7 @@ netmhcpan_ba = 0.25
 netmhcpan_el = 0.35
 mhcflurry_presentation = 0.30
 mhcflurry_processing = 0.10
+netmhcstabpan_stability = 0.05
 [score_weights]
 event_score = 0.35
 binding_evidence = 0.20
@@ -86,6 +87,9 @@ subclonal_multiplier = 0.75
 low_frequency_multiplier = 0.45
 [scoring]
 high_expression_tpm = 20.0
+# Audit B3: downgrade applied when immunogenicity evidence is missing,
+# on top of weight redistribution. 1.0 restores pure redistribution.
+immunogenicity_unresolved_multiplier = 0.90
 
 [gates]
 enabled = true

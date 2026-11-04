@@ -35,6 +35,7 @@ CCF_FIELDS = [
     "purity_recommendation_file",
     "total_cn", "major_cn", "minor_cn", "loh_status", "cnv_confidence",
     "multiplicity_candidates", "multiplicity_best", "multiplicity_confidence", "multiplicity_ambiguity",
+    "multiplicity_sensitivity",
     "raw_ccf", "ccf_best", "ccf_min", "ccf_max", "ccf_ci_low", "ccf_ci_high",
     "ccf_interval_method", "ccf_interpretation", "ccf_formula_assumptions",
     "local_cnv_status", "normal_alt_count", "normal_depth", "normal_vaf", "normal_alt_vaf", "normal_contamination_status",
@@ -52,6 +53,7 @@ CCF_FIELDS = [
 
 CCF_INPUT_QC_FIELDS = [
     "sample_id", "purity", "purity_source", "purity_confidence", "ploidy", "cnv_source",
+    "purity_confidence_criteria",
     "purity_consensus_status", "purity_range", "purity_n_tools", "purity_tool_values",
     "purity_recommendation_file",
     "cnv_quality_status", "cnv_segment_count", "fraction_genome_cna", "fraction_genome_loh",
@@ -83,6 +85,17 @@ def load_purity(path: str | Path | None) -> tuple[float | None, float | None]:
     return info["purity"], info["ploidy"]
 
 
+# Audit item C5: the purity/confidence rules are now explicit and versioned
+# instead of implicit in two loaders. Every emitted row carries this string so
+# a reviewer can see which rule produced a given confidence.
+PURITY_CONFIDENCE_CRITERIA = (
+    "purity-confidence-v1: consensus JSON - CONCORDANT=high, "
+    "SINGLE_TOOL/MODERATE_DISCORDANCE=medium, other=low; single-value TSV - an "
+    "explicit confidence column wins, otherwise purity>=0.35=high, "
+    "0.20<=purity<0.35=medium, purity<0.20 or invalid=low"
+)
+
+
 def _load_purity_recommendation(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     status = str(payload.get("status") or "NO_PURITY").upper()
@@ -101,6 +114,7 @@ def _load_purity_recommendation(path: Path) -> dict[str, Any]:
         "ploidy": None,
         "purity_source": source,
         "purity_confidence": confidence,
+        "purity_confidence_criteria": PURITY_CONFIDENCE_CRITERIA,
         "purity_consensus_status": status,
         "purity_range": str(payload.get("range") or ""),
         "purity_n_tools": n_tools,
@@ -113,6 +127,7 @@ def _load_purity_recommendation(path: Path) -> dict[str, Any]:
 def _with_purity_consensus_defaults(info: dict[str, Any]) -> dict[str, Any]:
     return {
         **info,
+        "purity_confidence_criteria": info.get("purity_confidence_criteria", PURITY_CONFIDENCE_CRITERIA),
         "purity_consensus_status": info.get("purity_consensus_status", "NOT_ASSESSED"),
         "purity_range": info.get("purity_range", ""),
         "purity_n_tools": info.get("purity_n_tools", ""),
@@ -161,6 +176,7 @@ def load_purity_info(path: str | Path | None) -> dict[str, Any]:
         "ploidy": ploidy if ploidy > 0 else None,
         "purity_source": source,
         "purity_confidence": conf,
+        "purity_confidence_criteria": PURITY_CONFIDENCE_CRITERIA,
         "reason": "purity_loaded" if purity > 0 else "invalid_purity",
     })
 
@@ -463,6 +479,31 @@ def clonality_multiplier(status: str, profile: Mapping[str, Any]) -> float:
     if status in {"low_frequency_subclonal", "low_frequency_subclonal_compatible"}:
         return float(cfg.get("low_frequency_multiplier", 0.45))
     return float(cfg.get("missing_ccf_multiplier", 0.65))
+
+
+def multiplicity_sensitivity(
+    ccf_min: float | None,
+    ccf_max: float | None,
+    confidence: str,
+    profile: Mapping[str, Any],
+) -> str:
+    """Audit item C3: does the plausible multiplicity range change the verdict?
+
+    Buckets the lowest and highest biologically valid multiplicity's CCF with
+    the pipeline's own clonal/subclonal thresholds; any bucket change is
+    material for ranking (the clonality multiplier would differ).
+    """
+    if ccf_min is None or ccf_max is None or ccf_min == ccf_max:
+        return "stable"
+    cfg = profile.get("ccf_lite", {}) if profile else {}
+    clonal = float(cfg.get("clonal_threshold", 0.80))
+    sub = float(cfg.get("subclonal_threshold", 0.30))
+
+    def bucket(value: float) -> str:
+        return "clonal" if value >= clonal else ("subclonal" if value < sub else "intermediate")
+
+    lo, hi = bucket(ccf_min), bucket(ccf_max)
+    return "stable" if lo == hi else f"material:{lo}..{hi}"
 
 
 def _clonality_confidence(
@@ -948,6 +989,7 @@ def build_ccf_2(
             "purity_n_tools": str(purity_info.get("purity_n_tools", "")),
             "purity_tool_values": str(purity_info.get("purity_tool_values", "")),
             "purity_recommendation_file": str(purity_info.get("purity_recommendation_file", "")),
+            "purity_confidence_criteria": str(purity_info.get("purity_confidence_criteria", PURITY_CONFIDENCE_CRITERIA)),
             "total_cn": f"{total_cn:.4f}",
             "major_cn": cn.get("major_cn", ""),
             "minor_cn": cn.get("minor_cn", ""),
@@ -961,6 +1003,7 @@ def build_ccf_2(
             "ccf_best": "" if ccf_best is None else f"{ccf_best:.4f}",
             "ccf_min": "" if ccf_min is None else f"{ccf_min:.4f}",
             "ccf_max": "" if ccf_max is None else f"{ccf_max:.4f}",
+            "multiplicity_sensitivity": multiplicity_sensitivity(ccf_min, ccf_max, confidence, profile),
             "ccf_ci_low": "" if ci_low is None else f"{ci_low:.4f}",
             "ccf_ci_high": "" if ci_high is None else f"{ci_high:.4f}",
             "ccf_interval_method": "Wilson 95% VAF interval propagated through purity/CN/multiplicity formula" if ci_low is not None else "not_available_without_tumor_depth",

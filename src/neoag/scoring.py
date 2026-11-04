@@ -334,6 +334,16 @@ def compute_peptide_efficacy(
     score = composite * safety_multiplier(safety, profile) * appm * gate_mult * ccf
     score *= to_float(peptide.get("escape_multiplier"), 1.0)
     score *= to_float(event.get("cross_platform_multiplier"), 1.0)
+    if (
+        float(profile.get("score_weights", {}).get("immunogenicity", 0.15)) > 0
+        and w.get("immunogenicity", 0.0) <= 0.0
+    ):
+        # Audit item B3: effective_weights() redistributes the immunogenicity
+        # weight onto binding/presentation when no real immunogenicity exists,
+        # which alone silently re-scores the candidate as if nothing were
+        # missing. The explicit unresolved multiplier applies the honest
+        # downgrade (profile-tunable; 1.0 restores pure redistribution).
+        score *= clamp(float(profile.get("scoring", {}).get("immunogenicity_unresolved_multiplier", 0.90)))
     return {
         "efficacy_score": f"{clamp(score):.4f}",
         "immunogenicity_resolved": "yes" if w.get("immunogenicity", 0.0) > 0 else "no",

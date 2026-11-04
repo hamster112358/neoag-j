@@ -20,6 +20,8 @@ tables can be reranked without rerunning predictors.
 """
 import csv
 
+from neoag.utils import write_tsv
+
 from neoag.appm_v2 import load_hla_loh
 from neoag.evidence_consensus import load_consensus_rules
 from neoag.evidence_states import derive_rna_support
@@ -49,7 +51,8 @@ def test_consensus_status_table_marks_only_lost_alleles(tmp_path):
     assert load_hla_loh(tsv) == {"HLA-B*13:02"}
 
 
-def test_consensus_vocabulary_and_blank_status_not_lost(tmp_path):
+def test_consensus_vocabulary_blank_and_single_tool_not_lost(tmp_path):
+    # F3 policy (audit): a single-tool loss claim is not a consensus loss.
     tsv = _write_tsv(
         tmp_path / "consensus2.tsv",
         ["hla_allele", "consensus_status"],
@@ -60,7 +63,7 @@ def test_consensus_vocabulary_and_blank_status_not_lost(tmp_path):
             ["HLA-C*07:01", ""],
         ],
     )
-    assert load_hla_loh(tsv) == {"HLA-A*02:01", "HLA-A*11:01"}
+    assert load_hla_loh(tsv) == {"HLA-A*02:01"}
 
 
 def test_legacy_allele_only_table_still_lists_lost(tmp_path):
@@ -228,3 +231,154 @@ def test_build_presentation_cli_exposes_netchop():
         "--out", "o.tsv", "--netchop", "chop.tsv",
     ])
     assert args.netchop == "chop.tsv"
+
+
+# ---------------------------------------------------------------------------
+# Second audit batch (2026-11-04): HLA A1, QC A3, B3, C1/C3/C5, F5
+# ---------------------------------------------------------------------------
+
+def test_a1_consensus_preserves_ranked_votes_and_tie():
+    from neoag.agent_skills.hla_typing_compare import consensus
+
+    def row(tool, a1, a2):
+        return {"tool": tool, "locus": "A", "lowres1": a1, "lowres2": a2,
+                "highres1": "", "highres2": ""}
+
+    discordant = consensus([
+        row("OptiType", "HLA-A*02:01", "HLA-A*30:01"),
+        row("SpecHLA", "HLA-A*02:06", "HLA-A*30:01"),
+        row("HLA-LA", "HLA-A*02:01", "HLA-A*68:01"),
+    ])
+    row_a = next(r for r in discordant if r["status"] == "DISCORDANT")
+    assert row_a["tie"] == "yes"
+    votes = row_a["ranked_votes"].split(";")
+    assert len(votes) == 3 and all(v.endswith("=1") for v in votes)
+    # Deterministic: alphabetical among ties, so the "best" pick is reproducible.
+    assert row_a["consensus_2field"] == min(v.split("=")[0] for v in votes)
+
+    agree = consensus([
+        row("OptiType", "HLA-A*02:01", "HLA-A*30:01"),
+        row("SpecHLA", "HLA-A*02:01", "HLA-A*30:01"),
+        row("HLA-LA", "HLA-A*02:01", "HLA-A*68:01"),
+    ])
+    row_b = next(r for r in agree if r["status"] == "CONSENSUS")
+    assert row_b["tie"] == "no"
+    assert row_b["ranked_votes"] == "HLA-A*02:01 / HLA-A*30:01=2;HLA-A*02:01 / HLA-A*68:01=1"
+
+
+def test_a3_weight_sensitivity_exposes_weight_driven_ranks():
+    from neoag.presentation import weight_sensitivity_table
+
+    rows = [
+        {"peptide_id": "P1", "peptide": "AAAAAAAAA", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+         "netmhcpan_ba_rank": "1", "netmhcpan_el_rank": "99", "mhcflurry_presentation_score": "",
+         "mhcflurry_processing_score": "", "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""},
+        {"peptide_id": "P2", "peptide": "BBBBBBBBB", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+         "netmhcpan_ba_rank": "99", "netmhcpan_el_rank": "1", "mhcflurry_presentation_score": "",
+         "mhcflurry_processing_score": "", "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""},
+    ]
+    # With the default weights the el weight (0.35) beats ba (0.25); at a +-50%
+    # sweep the ba-up vector flips them - the table must reveal that.
+    out = weight_sensitivity_table(rows, {}, perturb=0.5)
+    assert out and all(r["n_vectors"] == "13" for r in out)
+    assert {r["peptide_id"] for r in out} == {"P1", "P2"}
+    p1 = next(r for r in out if r["peptide_id"] == "P1")
+    assert int(p1["rank_spread"]) >= 1
+    assert p1["verdict"] in {"rank_minor_shift", "rank_unstable"}
+    assert float(p1["score_range"]) > 0
+
+
+def test_b3_unresolved_immunogenicity_downgrades_instead_of_silent_redistribution():
+    from neoag.scoring import compute_peptide_efficacy
+
+    weights = {"immunogenicity": 0.15, "presentation_evidence": 0.25, "binding_evidence": 0.20, "event_score": 0.35}
+    prof = {"score_weights": weights, "scoring": {"immunogenicity_unresolved_multiplier": 0.90},
+            "gates": {"enabled": False}, "ccf_lite": {}}
+    prof100 = {"score_weights": weights, "scoring": {"immunogenicity_unresolved_multiplier": 1.0},
+               "gates": {"enabled": False}, "ccf_lite": {}}
+    pep = {"peptide": "AAAAAAAAA", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+           "binding_rank": "1", "el_rank": "1", "wildtype_peptide": "TTTTTTTTT"}
+    ev = {"event_id": "E1", "event_type": "SNV", "event_confidence": "0.9"}
+    pres = {"peptide": "AAAAAAAAA", "hla_allele": "HLA-A*02:01",
+            "presentation_evidence_score": "0.9", "binding_evidence_score": "0.9",
+            "evidence_completeness": "1.0"}
+    no_immuno = compute_peptide_efficacy(pep, ev, pres, prof)
+    no_immuno_full = compute_peptide_efficacy(pep, ev, pres, prof100)
+    assert no_immuno["immunogenicity_resolved"] == "no"
+    assert float(no_immuno["efficacy_score"]) == round(0.90 * float(no_immuno_full["efficacy_score"]), 4)
+    resolved = compute_peptide_efficacy({**pep, "prime_score": "0.8000"}, ev, pres, prof)
+    resolved_full = compute_peptide_efficacy({**pep, "prime_score": "0.8000"}, ev, pres, prof100)
+    assert resolved["immunogenicity_resolved"] == "yes"
+    assert resolved["efficacy_score"] == resolved_full["efficacy_score"]
+
+
+def _ccf_rows(tmp_path, cnv_rows, events_rows, purity="0.70"):
+    from neoag.ccf_v2 import build_ccf_2
+    from neoag.config import load_profile
+
+    events = tmp_path / "events.tsv"
+    purity_f = tmp_path / "purity.tsv"
+    cnv = tmp_path / "cnv.tsv"
+    write_tsv(events, events_rows)
+    write_tsv(purity_f, [{"purity": purity, "ploidy": "2", "source": "FACETS", "confidence": "high"}])
+    write_tsv(cnv, cnv_rows)
+    return build_ccf_2(events, purity_f, cnv, load_profile("default"), tmp_path / "ccf.tsv")
+
+
+def _event(eid, vaf, depth=100):
+    return {"event_id": eid, "sample_id": "S1", "mutation_source": "SNV",
+            "chrom": "chr9", "pos": "150", "tumor_vaf": vaf,
+            "tumor_depth": str(depth), "tumor_alt_count": str(int(float(vaf) * depth))}
+
+
+def test_c1_diploid_fallback_never_pretends_to_be_well_supported(tmp_path):
+    # No CNV segment overlaps chr9 -> diploid fallback even at clonal-looking VAF.
+    rows = _ccf_rows(tmp_path,
+                     [{"chrom": "chr1", "start": "1", "end": "1000", "total_cn": "3", "major_cn": "2", "minor_cn": "1"}],
+                     [_event("E1", "0.35")])
+    row = rows[0]
+    assert "DIPLOID_FALLBACK" in row["local_cnv_status"]
+    assert row["ccf_confidence"] == "low"
+    assert row["clonality_status"] != "clonal_compatible"
+    assert float(row["clonality_multiplier"]) < 1.0
+
+
+def test_c3_multiplicity_sensitivity_flags_material_candidates(tmp_path):
+    rows = _ccf_rows(
+        tmp_path,
+        [{"chrom": "chr9", "start": "1", "end": "1000", "total_cn": "2", "major_cn": "2", "minor_cn": "0"}],
+        [_event("MAT", "0.25", 200), _event("STB", "0.05", 200)],
+        purity="0.50",
+    )
+    by_id = {r["event_id"]: r for r in rows}
+    assert by_id["MAT"]["multiplicity_sensitivity"].startswith("material:")
+    assert by_id["STB"]["multiplicity_sensitivity"] == "stable"
+
+
+def test_c5_purity_confidence_criteria_are_explicit(tmp_path):
+    from neoag.ccf_v2 import PURITY_CONFIDENCE_CRITERIA, load_purity_info
+
+    purity = tmp_path / "purity.tsv"
+    write_tsv(purity, [{"purity": "0.80", "ploidy": "2"}])
+    info = load_purity_info(purity)
+    assert info["purity_confidence"] == "high"
+    assert info["purity_confidence_criteria"] == PURITY_CONFIDENCE_CRITERIA
+    assert "0.20<=purity<0.35=medium" in PURITY_CONFIDENCE_CRITERIA
+
+
+def test_f5_low_expression_suggests_but_does_not_prove_biallelic_loss():
+    from neoag.appm_v2 import _biallelic_status, _functional_status, _gene_integrity_score, _gene_integrity_status
+
+    status, reason = _biallelic_status("TP53", {"TP53": ["stop_gained"]}, {}, {"TP53": 0.01}, True, 1.0)
+    assert status == "SUSPECTED_BIALLELIC_LOSS"
+    assert "no_second_hit_evidence" in reason
+    assert _functional_status(status) == "caution"
+    integrity = _gene_integrity_status(biallelic_status=status, damaging=True, copy_status="",
+                                       loh_status="", expression_status="low")
+    assert integrity == "suspected_biallelic_loss"
+    assert _gene_integrity_score(integrity) == 0.25
+    # Hard copy-level evidence still gives the hard call.
+    hard, _ = _biallelic_status("TP53", {"TP53": ["stop_gained"]},
+                                {"TP53": {"copy_number_status": "homozygous deletion", "loh_status": ""}},
+                                {"TP53": 8.0}, True, 1.0)
+    assert hard == "BIALLELIC_LOSS"

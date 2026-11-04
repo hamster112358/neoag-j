@@ -188,3 +188,109 @@ def build_presentation_evidence(
             row.update(composite.as_fields())
         write_tsv(out, rows, PRESENTATION_FIELDS)
     return rows
+
+
+WEIGHT_SENSITIVITY_FIELDS = [
+    "peptide_id", "peptide", "hla_allele", "mhc_class", "base_score", "base_rank",
+    "best_rank", "worst_rank", "rank_spread", "score_min", "score_max", "score_range",
+    "verdict", "n_vectors",
+]
+
+
+def weight_sensitivity_table(evidence_rows, profile, perturb: float = 0.25):
+    """Audit item A3: weight-choice sensitivity, computed from saved evidence.
+
+    No predictors are rerun: every component score is already in the
+    presentation evidence table, so the weighted sum is simply recombined under
+    +-perturb weight vectors and the candidates re-ranked.  The result is a
+    per-patient QC table - a candidate whose rank moves only because of the
+    weight choice is not a robust pick.  Default weights come from the profile;
+    the mechanism is exactly the sensitivity rerun the audit suggested, and
+    NetMHCstabpan/NetChop participate with their real (tunable) weights.
+    """
+
+    w = profile.get("presentation_weights", {}) or {}
+    base = {
+        "netmhcpan_ba": float(w.get("netmhcpan_ba", 0.25)),
+        "netmhcpan_el": float(w.get("netmhcpan_el", 0.35)),
+        "mhcflurry_presentation": float(w.get("mhcflurry_presentation", 0.30)),
+        "mhcflurry_processing": float(w.get("mhcflurry_processing", 0.10)),
+        "netchop_processing": float(w.get("netchop_processing", 0.10)),
+        "netmhcstabpan_stability": float(w.get("netmhcstabpan_stability", 0.05)),
+    }
+    vectors = {"base": dict(base)}
+    for key, val in base.items():
+        if val <= 0:
+            continue
+        for factor, tag in ((1.0 + perturb, "up"), (1.0 - perturb, "down")):
+            vec = dict(base)
+            vec[key] = val * factor
+            vectors[f"{key}_{tag}"] = vec
+
+    def score_row(row, vec):
+        is_mhci = str(row.get("mhc_class") or "I").upper() not in {"II", "MHC-II", "CLASSII"}
+        parts = []
+        for col, key, style in (
+            ("netmhcpan_ba_rank", "netmhcpan_ba", "rank"),
+            ("netmhcpan_el_rank", "netmhcpan_el", "rank"),
+            ("mhcflurry_presentation_score", "mhcflurry_presentation", "score"),
+            ("mhcflurry_processing_score", "mhcflurry_processing", "score"),
+            ("netchop_31d_cterm_score", "netchop_processing", "score"),
+            ("netmhcstabpan_rank", "netmhcstabpan_stability", "rank"),
+        ):
+            if key in ("netchop_processing", "netmhcstabpan_stability") and not is_mhci:
+                continue
+            raw = str(row.get(col, "")).strip()
+            if raw == "":
+                continue
+            val = norm_rank(raw) if style == "rank" else clamp(to_float(raw, -1.0))
+            if val is None:
+                continue
+            parts.append((float(val), vec[key]))
+        den = sum(wt for _, wt in parts)
+        if not den:
+            return None
+        return sum(val * wt for val, wt in parts) / den
+
+    scores = {name: [score_row(r, vec) for r in evidence_rows] for name, vec in vectors.items()}
+
+    def dense_ranks(vals):
+        ordered = sorted({v for v in vals if v is not None}, reverse=True)
+        pos = {v: i + 1 for i, v in enumerate(ordered)}
+        return [pos[v] if v is not None else len(ordered) + 1 for v in vals]
+
+    rank_map = {name: dense_ranks(vals) for name, vals in scores.items()}
+    n = len(evidence_rows)
+    minor_band = max(3, int(0.05 * n))
+    out = []
+    for i, row in enumerate(evidence_rows):
+        base_score = scores["base"][i]
+        if base_score is None:
+            continue
+        rs = [rank_map[name][i] for name in vectors]
+        spread = max(rs) - min(rs)
+        svals = [vals[i] for vals in scores.values() if vals[i] is not None]
+        verdict = "rank_stable" if spread == 0 else ("rank_minor_shift" if spread <= minor_band else "rank_unstable")
+        out.append({
+            "peptide_id": row.get("peptide_id", ""),
+            "peptide": row.get("peptide", ""),
+            "hla_allele": row.get("hla_allele", ""),
+            "mhc_class": row.get("mhc_class", ""),
+            "base_score": f"{base_score:.4f}",
+            "base_rank": str(rank_map["base"][i]),
+            "best_rank": str(min(rs)),
+            "worst_rank": str(max(rs)),
+            "rank_spread": str(spread),
+            "score_min": f"{min(svals):.4f}",
+            "score_max": f"{max(svals):.4f}",
+            "score_range": f"{max(svals) - min(svals):.4f}",
+            "verdict": verdict,
+            "n_vectors": str(len(vectors)),
+        })
+    return out
+
+
+def write_weight_sensitivity(evidence_rows, profile, path, perturb: float = 0.25):
+    rows = weight_sensitivity_table(evidence_rows, profile, perturb=perturb)
+    write_tsv(path, rows, WEIGHT_SENSITIVITY_FIELDS)
+    return path

@@ -441,7 +441,10 @@ def load_hla_loh(path: str | Path | None) -> set[str]:
     )
     lost_tokens = {
         "loh", "loss", "lost", "yes", "true", "1",
-        "consensus_lost", "consensus_loh", "single_tool_lost",
+        "consensus_lost", "consensus_loh",
+        # Audit item F3: a single-tool loss claim (SINGLE_TOOL_LOST) is NOT a
+        # consensus loss - one caller alone must not cap MHC integrity. The
+        # status remains visible in the consensus table for review.
     }
     lost: set[str] = set()
     for r in rows:
@@ -525,7 +528,10 @@ def _biallelic_status(gene: str, variants: dict[str, list[str]], cnv: dict[str, 
     if has_dmg and (_loss_status(cn_status) or _loss_status(loh_status)):
         return "BIALLELIC_LOSS", "damaging_variant_plus_loh_or_copy_loss"
     if has_dmg and low_expr:
-        return "BIALLELIC_LOSS", "damaging_variant_plus_expression_loss"
+        # Audit item F5: low RNA expression supports a second hit, it does not
+        # prove one (allelic imbalance, noise, capture, biology). Hard
+        # BIALLELIC_LOSS stays reserved for copy-level evidence.
+        return "SUSPECTED_BIALLELIC_LOSS", "damaging_variant_plus_low_expression_no_second_hit_evidence"
     if has_dmg:
         return "MONOALLELIC_ALTERATION", "damaging_variant_only"
     if _loss_status(cn_status) or _loss_status(loh_status):
@@ -538,7 +544,7 @@ def _biallelic_status(gene: str, variants: dict[str, list[str]], cnv: dict[str, 
 def _functional_status(biallelic: str) -> str:
     if biallelic == "BIALLELIC_LOSS":
         return "defective"
-    if biallelic in {"MONOALLELIC_ALTERATION", "MONOALLELIC_LOSS", "EXPRESSION_LOSS_ONLY"}:
+    if biallelic in {"MONOALLELIC_ALTERATION", "MONOALLELIC_LOSS", "EXPRESSION_LOSS_ONLY", "SUSPECTED_BIALLELIC_LOSS"}:
         return "caution"
     return "intact"
 
@@ -564,6 +570,8 @@ def _gene_integrity_status(
         return "conflicting"
     if biallelic_status == "BIALLELIC_LOSS":
         return "biallelic_loss"
+    if biallelic_status == "SUSPECTED_BIALLELIC_LOSS":
+        return "suspected_biallelic_loss"
     if biallelic_status in {"MONOALLELIC_LOSS", "MONOALLELIC_ALTERATION"}:
         return "monoallelic_loss" if biallelic_status == "MONOALLELIC_LOSS" else "damaging_variant"
     if biallelic_status == "EXPRESSION_LOSS_ONLY" or expression_status == "low":
@@ -588,6 +596,7 @@ def _gene_integrity_score(status: str) -> float:
         "damaging_variant": 0.65,
         "monoallelic_loss": 0.60,
         "low_expression": 0.50,
+        "suspected_biallelic_loss": 0.25,
         "conflicting": 0.50,
         "biallelic_loss": 0.05,
     }.get(status, 1.0)
