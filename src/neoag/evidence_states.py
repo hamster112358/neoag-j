@@ -266,7 +266,16 @@ def derive_rna_support(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dict
     track = event_track(row)
     status = _text(row, "rna_support_status", "expression_evidence_status", "rna_evidence_completeness")
     if "RNA_ALT_SUPPORTED" in status or "RNA_JUNCTION_SUPPORTED" in status:
-        return _result("RNA_CONFIRMED", 3, status)
+        # An upstream status is only confirmation when the numbers behind it hold
+        # up: an unsupported status string (evidence_layer marks alt>0 as
+        # RNA_ALT_SUPPORTED) must not outrank the numeric thresholds below.
+        if track in {"FUSION", "SPLICE"}:
+            if _float(row, "rna_junction_reads", "junction_reads") is not None:
+                pass  # fall through to the junction threshold path
+            else:
+                return _result("RNA_CONFIRMED", 3, status)
+        elif _float(row, "rna_alt_reads") is None and _float(row, "rna_vaf") is None:
+            return _result("RNA_CONFIRMED", 3, status)
     if "RNA_ALT_NOT_DETECTED" in status:
         depth = _float(row, "rna_depth")
         evaluable_depth = float(cfg.get("snv_min_evaluable_depth", 10))

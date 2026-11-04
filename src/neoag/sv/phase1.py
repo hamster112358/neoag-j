@@ -19,8 +19,10 @@ from .evidence import load_expression, load_normal_expression, normal_expr_for_g
 from .wes_capture import CaptureRegions, write_expanded_beds, annotate_cluster_capture
 from .identity import canonical_breakpoint_key, stable_identifier
 from .exact_evidence import (
+    junction_positional_index,
     load_exact_junction_evidence,
     load_expressed_products,
+    match_projected_junction,
     product_meta,
 )
 
@@ -416,6 +418,7 @@ def build_sv_phase1_raw(
     normal_expr = load_normal_expression(normal_expression_tsv)
     normal_ligands = load_normal_ligands(normal_hla_ligands_tsv)
     junction_evidence = load_exact_junction_evidence(rna_junction_tsv, default_build=genome_build)
+    junction_positional = junction_positional_index(junction_evidence)
     expressed_products = load_expressed_products(expressed_products_tsv, default_build=genome_build)
     if wes_mode and not capture_bed:
         raise ValueError("WES SV mode requires capture_bed; capture-unaware WES SV ranking is forbidden")
@@ -455,6 +458,25 @@ def build_sv_phase1_raw(
             rep.chrom2, rep.pos2, rep.strand2,
         )
         exact_rna = junction_evidence.get(adjacency_key)
+        rna_evidence_match = "EXACT_BREAKPOINT" if exact_rna else ""
+        if exact_rna is None:
+            # Audit item SV E1: intronic DNA breakpoints are projected onto the
+            # exon boundaries that bracket them, so a spliced RNA junction can
+            # support the event (still exact coordinate identity, just at the
+            # annotated splice site instead of the DNA break).
+            tx1p, _, _ = ann.best_coding_transcript_near(rep.chrom1, rep.pos1)
+            tx2p, _, _ = ann.best_coding_transcript_near(rep.chrom2, rep.pos2)
+            projected = match_projected_junction(
+                junction_positional,
+                build=genome_build,
+                chrom1=rep.chrom1, pos1=rep.pos1,
+                chrom2=rep.chrom2, pos2=rep.pos2,
+                svtype=rep.svtype,
+                same_gene=bool(provisional_gene1 and provisional_gene1 == provisional_gene2),
+                tx1=tx1p, tx2=tx2p,
+            )
+            if projected:
+                rna_evidence_match, exact_rna = projected
         rna_reads = exact_rna.support_reads if exact_rna and exact_rna.qc_pass else 0
         score_kwargs = {
             "min_tumor_sr": int(sv_rules.get("min_tumor_sr", 1 if wes_mode else 2)),
@@ -475,13 +497,25 @@ def build_sv_phase1_raw(
             meta = product_meta(product)
         else:
             heuristic_protein, meta = reconstruct_cluster_protein(cluster, eid, sample_id, ann, ref)
-            if heuristic_protein:
-                heuristic_protein.reconstruction_confidence = "low"
-                heuristic_protein.reconstruction_method = "DNA_ONLY_HYPOTHESIS:" + heuristic_protein.reconstruction_method
-                heuristic_protein.reconstruction_reason = "ORF_HYPOTHESIS_UNRESOLVED;" + heuristic_protein.reconstruction_reason
-            protein = heuristic_protein if allow_heuristic_proteins else None
-            meta["reconstruction_status"] = "hypothesis_only"
-            meta["reconstruction_reason"] = "ORF_HYPOTHESIS_UNRESOLVED; exact expressed product not supplied"
+            if heuristic_protein and exact_rna is not None and exact_rna.qc_pass:
+                # Audit item SV E2 (path A): a DNA-only ORF hypothesis that an
+                # RNA junction confirms at QC PASS is no longer DNA-only.  It
+                # may proceed to peptide generation, but stays labelled as a
+                # reconstruction hypothesis, not an externally confirmed
+                # product, and the confidence remains medium.
+                heuristic_protein.reconstruction_confidence = "medium"
+                heuristic_protein.reconstruction_method = "RNA_SUPPORTED_DNA_HYPOTHESIS:" + heuristic_protein.reconstruction_method
+                meta["reconstruction_status"] = "rna_supported_hypothesis"
+                meta["reconstruction_reason"] = "RNA_JUNCTION_SUPPORTED_DNA_HYPOTHESIS;" + heuristic_protein.reconstruction_reason
+                protein = heuristic_protein
+            else:
+                if heuristic_protein:
+                    heuristic_protein.reconstruction_confidence = "low"
+                    heuristic_protein.reconstruction_method = "DNA_ONLY_HYPOTHESIS:" + heuristic_protein.reconstruction_method
+                    heuristic_protein.reconstruction_reason = "ORF_HYPOTHESIS_UNRESOLVED;" + heuristic_protein.reconstruction_reason
+                protein = heuristic_protein if allow_heuristic_proteins else None
+                meta["reconstruction_status"] = "hypothesis_only"
+                meta["reconstruction_reason"] = "ORF_HYPOTHESIS_UNRESOLVED; exact expressed product not supplied"
         priority_cap = _wes_priority_cap_from_profile(profile, conf.tier) if wes_mode else ""
         extra = {
             **cap_meta,
@@ -490,14 +524,14 @@ def build_sv_phase1_raw(
             "priority_cap": priority_cap,
             "genome_build": genome_build,
             "adjacency_key": adjacency_key,
-            "rna_evidence_match": "EXACT_BREAKPOINT" if exact_rna else "NO_EXACT_MATCH",
+            "rna_evidence_match": rna_evidence_match or "NO_EXACT_MATCH",
             "rna_evidence_qc": "PASS" if exact_rna and exact_rna.qc_pass else ("FAIL" if exact_rna else "UNASSESSED"),
         }
         svrow = _sv_event_row(cluster, eid, sample_id, meta, conf, protein, rna_reads, extra)
         sv_rows.append(svrow)
         if (
             not protein
-            or meta.get("reconstruction_status") != "confirmed_expressed_product"
+            or meta.get("reconstruction_status") not in {"confirmed_expressed_product", "rna_supported_hypothesis"}
             or not exact_rna
             or not exact_rna.qc_pass
         ):
@@ -512,6 +546,7 @@ def build_sv_phase1_raw(
         raw_events.append(raw_event)
         cands = build_mhc1_peptides(
             [protein], hla_alleles, lengths=peptide_lengths, normal_ligands=normal_ligands,
+            allow_rna_supported=True,
         )
         sidecar_peptides.extend(cands)
         gene_label = raw_event["gene"]
@@ -557,7 +592,7 @@ def build_sv_phase1_raw(
         "strict_sample_names": strict_sample_names,
         "include_nonpass": include_nonpass,
         "allow_heuristic_proteins": allow_heuristic_proteins,
-        "rna_evidence_identity": "exact_canonical_breakpoint_only",
+        "rna_evidence_identity": "exact_canonical_breakpoint_or_projected_exon_boundary",
     }
     if wes_mode:
         prov_payload["evidence_scope"] = "EXOME_CAPTURE_LIMITED"

@@ -66,7 +66,9 @@ def read_easyfuse_table(path: str | Path) -> list[dict[str, str]]:
         if delim is None:
             delim = "\t"
         fh.seek(0)
-        return [dict(row) for row in csv.DictReader(fh, delimiter=delim)]
+        rows = [dict(row) for row in csv.DictReader(fh, delimiter=delim)]
+    backfill_easyfuse_neo_peptide(rows, source=p)
+    return rows
 
 
 def _gene_pair(row: dict[str, str]) -> tuple[str, str]:
@@ -107,6 +109,68 @@ def _neo_peptide_sequence(row: dict[str, str]) -> str:
     if neo in {"", "0", "NA", "na"}:
         return ""
     return neo
+
+
+_AA_LETTERS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+
+def _neo_peptide_from_fusion_protein(row: dict[str, str]) -> tuple[str, float] | None:
+    """Rebuild the EasyFuse neo-peptide window from the columns EasyFuse 2.x keeps.
+
+    EasyFuse >= 2.0 bin/merge_data.py:write_fusion_table() hard-codes its output column
+    list and omits neo_peptide_sequence / neo_peptide_sequence_bp, even though the
+    FusionAnnotater computes both (columns 22-23 of SHORT_ANNOTATION_HEADER) and
+    load_context_seqs() documents them. The merged table therefore never carries a
+    neo-peptide, so every row of a v2 fusions.pass.csv fails require_neo_peptide and
+    the downstream catalog comes out empty.
+
+    The two surviving columns are enough to reproduce the upstream value exactly: the
+    arithmetic below transcribes bin/fusionannotation/src/result_handler.py (start the
+    window 13 aa before the breakpoint; for in-frame fusions truncate it 13 aa after
+    the breakpoint). No sequence is invented - the window is a slice of the fusion
+    protein EasyFuse itself reported.
+    """
+    protein = str(first(row, ["fusion_protein_sequence", "Fusion_protein_sequence"], "")).strip().upper()
+    if not protein or not _AA_LETTERS.issuperset(protein):
+        return None
+    bp = to_float(first(row, ["fusion_protein_sequence_bp", "Fusion_protein_sequence_bp"], "0"), 0.0)
+    if bp <= 0 or bp > len(protein):
+        return None
+    index = int(bp)
+    neo_bp = round(bp, 1) if index - 13 < 0 else round(bp - (index - 13), 1)
+    neo = protein[max(0, index - 13):]
+    if str(first(row, ["frame", "Frame"], "")).strip().lower() == "in_frame":
+        neo = neo[: int(neo_bp) + 13]
+    if not neo:
+        return None
+    return neo, neo_bp
+
+
+def backfill_easyfuse_neo_peptide(rows: list[dict[str, str]], *, source: str | Path = "easyfuse") -> int:
+    """Fill neo_peptide_sequence/_bp on tables where EasyFuse dropped them.
+
+    Rows that already carry a neo-peptide (EasyFuse 1.x tables, repo fixtures) are left
+    untouched; only rows lacking it but carrying a fusion protein are back-filled, and
+    each such row is marked with openneo_neo_peptide_source.
+    """
+    filled = 0
+    for row in rows:
+        if _neo_peptide_sequence(row) or not str(first(row, ["fusion_protein_sequence"], "")).strip():
+            continue
+        derived = _neo_peptide_from_fusion_protein(row)
+        if derived is None:
+            continue
+        row["neo_peptide_sequence"] = derived[0]
+        row["neo_peptide_sequence_bp"] = str(derived[1])
+        row["openneo_neo_peptide_source"] = "derived_from_fusion_protein"
+        filled += 1
+    if filled:
+        warnings.warn(
+            f"{source}: rebuilt neo_peptide_sequence for {filled} EasyFuse row(s) "
+            "(column dropped upstream by merge_data.py in EasyFuse >= 2.0)",
+            stacklevel=2,
+        )
+    return filled
 
 
 def _requant_count_max(row: dict[str, str], metric: str) -> int:

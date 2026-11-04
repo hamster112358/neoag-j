@@ -481,6 +481,10 @@ def generate_rna_fusion_splice_manifest(
                 f"{script('build_normal_junction_index.py')} --input {_q(normal_junctions)} "
                 f"--output {normal_index}"
             )
+    # The junction QC builder refuses to run without a validation source (its own
+    # parser.error).  The consensus table is this stage's own first step output - the same
+    # path the stage declares as its splice_consensus output - so pass it explicitly, as
+    # generate_production_from_results_manifest.py already does.
     splice_norm += (
         f" && PYTHONPATH={_q(root / 'src')} {_q(Path(sys.executable))} "
         f"{script('build_splice_junction_qc_from_star_bam.py')} "
@@ -488,6 +492,7 @@ def generate_rna_fusion_splice_manifest(
         f"--star-sj {{outdir}}/rna/star/SJ.out.tab "
         f"--rna-bam {{outdir}}/rna/star/Aligned.sortedByCoord.out.bam "
         f"--samtools {_q(inputs.get('samtools_executable') or 'samtools')} "
+        f"--splice-consensus {{outdir}}/branches/splice/intermediates/splice_consensus.tsv "
         f"--outdir {{outdir}}/branches/splice/intermediates/junction_qc"
     )
     if normal_index:

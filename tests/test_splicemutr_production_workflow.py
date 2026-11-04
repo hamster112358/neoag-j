@@ -114,6 +114,39 @@ def test_splicemutr_export_streams_gzip_normal_catalog(tmp_path: Path) -> None:
     assert {row["normal_junction_status"] for row in rows} == {"DETECTED_BROAD_NORMAL"}
 
 
+def test_splicemutr_export_leafcutter_convention_panel(tmp_path: Path) -> None:
+    # Production combined tables carry no usable juncs value, so the exporter
+    # builds colon LeafCutter ids (outer exon bounds: intron start-1 / end+1)
+    # from the metadata columns, while the normal panel stores 1-based closed
+    # intron coordinates. A colon candidate must match the 1-bp-wider panel
+    # intron, and must never match a numerically equal but distinct one.
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text(
+        "chr\tstart\tend\tstrand\tjuncs\tpeptide\tpep_junc_loc\ttx_id\tgene\terror\n"
+        "chr1\t111477428\t111477983\t+\t\tACDEFGHIKLMN\t5\tTX1\tGENE1\ttx\n"
+        "chr2\t100\t200\t+\t\tMKFLIVAPSTGEQ\t5\tTX2\tGENE2\ttx\n",
+        encoding="utf-8",
+    )
+    normal = tmp_path / "normal.tsv.gz"
+    with gzip.open(normal, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "junction_id\tchromosome\tstart\tend\tstrand\n"
+            "chr1:111477429-111477982:+\tchr1\t111477429\t111477982\t+\n"
+            "chr2:100-200:+\tchr2\t100\t200\t+\n",
+        )
+    output = tmp_path / "candidates.tsv"
+    subprocess.run([
+        sys.executable, str(ROOT / "scripts/export_splicemutr_candidates.py"),
+        "--metadata", str(metadata), "--sample-id", "T", "--out", str(output),
+        "--normal-junctions", str(normal),
+    ], check=True)
+    rows = list(csv.DictReader(output.open(encoding="utf-8"), delimiter="\t"))
+    by_gene = {row["gene"]: row for row in rows}
+    assert by_gene["GENE1"]["normal_junction_status"] == "DETECTED_BROAD_NORMAL"
+    assert "intron_1based" in by_gene["GENE1"]["normal_background_reason"]
+    assert by_gene["GENE2"]["normal_junction_status"] == "NOT_DETECTED_COVERAGE_UNASSESSED"
+
+
 def test_splicemutr_snakefile_dry_run(tmp_path: Path) -> None:
     snakemake = shutil.which("snakemake")
     if not snakemake:

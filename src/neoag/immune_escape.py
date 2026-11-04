@@ -347,7 +347,9 @@ def build_immune_escape_evidence(
         "mhc_i_escape_status": "HIGH" if b2m else ("MEDIUM" if lost_hla_i or tap_def or nlrc5_def else "LOW"),
         "mhc_ii_escape_status": "MEDIUM" if ciita_def or lost_hla_ii else "LOW",
         "ifng_response_status": "HIGH" if jak1 or jak2 else "LOW",
-        "cytotoxic_killing_resistance_status": "LOW",
+        # No cytotoxic-resistance evidence stream is wired into this module yet;
+        # emitting a fixed "LOW" would be an unearned negative call.
+        "cytotoxic_killing_resistance_status": "NOT_ASSESSED",
         "hla_loh_status": (
             "LOH_DETECTED" if lost_hla else
             "NO_LOH_DETECTED_MULTI_TOOL" if hla_loh_states and all(

@@ -1266,6 +1266,9 @@ def test_rna_fastq_profile_enriches_splice_qc_from_star_and_bam(tmp_path: Path):
     assert "--star-sj {outdir}/rna/star/SJ.out.tab" in splice["command"]
     assert "build_normal_junction_index.py" in splice["command"]
     assert "build_splice_junction_qc_from_star_bam.py" in splice["command"]
+    # The builder parser.errors without a validation source, so the plan must carry the
+    # consensus table this stage's own first step writes.
+    assert " --splice-consensus {outdir}/branches/splice/intermediates/splice_consensus.tsv " in splice["command"]
     assert splice["outputs"]["raw_events"].endswith("junction_qc/raw_events.enriched.tsv")
     assert splice["outputs"]["raw_peptides"].endswith("junction_qc/raw_peptides.enriched.tsv")
     assert splice["outputs"]["junction_read_qc"].endswith("splice_junction_qc.enriched.tsv")

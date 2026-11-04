@@ -7,6 +7,7 @@ import pytest
 from neoag.adapters.easyfuse_adapter import (
     EasyFuseFilterConfig,
     _anchor_size,
+    _neo_peptide_from_fusion_protein,
     _tool_junction_reads,
     build_easyfuse_candidate_union,
     easyfuse_row_to_event,
@@ -189,3 +190,66 @@ def test_evidence_layer_uses_fusion_evidence(tmp_path):
     rna_rows = __import__("neoag.utils", fromlist=["read_tsv"]).read_tsv(evidence["rna_junction_evidence"])
     ews = [r for r in rna_rows if "EWSR1" in r.get("gene", "")]
     assert ews and int(ews[0]["junction_reads"]) >= 12
+
+
+def test_easyfuse2_neo_peptide_rebuilt_from_fusion_protein():
+    """EasyFuse >= 2.0 merge_data.py drops neo_peptide_sequence; the window must be rebuilt.
+
+    Each fixture row is replayed through the rebuild path the way EasyFuse 2.x delivers it
+    (fusion protein + breakpoint, no neo-peptide columns) and must reproduce the upstream
+    value exactly, including the in-frame truncation 13 aa past the breakpoint that
+    out-frame and neo-frame rows do not get.
+    """
+    rows = read_easyfuse_table(FIXTURE_V2)
+    assert len(rows) == 3
+    for row in rows:
+        upstream_neo = row["neo_peptide_sequence"]
+        upstream_bp = float(row["neo_peptide_sequence_bp"])
+        protein = row["fusion_peptide"]
+        derived = _neo_peptide_from_fusion_protein({
+            "fusion_protein_sequence": protein,
+            "fusion_protein_sequence_bp": str(protein.index(upstream_neo) + upstream_bp),
+            "frame": row["frame"],
+        })
+        assert derived is not None, row["Fusion_Gene"]
+        assert derived[0] == upstream_neo, row["Fusion_Gene"]
+        assert abs(derived[1] - upstream_bp) < 1e-9, row["Fusion_Gene"]
+
+
+def test_easyfuse2_table_without_neo_peptide_still_yields_events(tmp_path):
+    """A merged EasyFuse 2.x table (no neo-peptide column) must not come back empty."""
+    src = read_easyfuse_table(FIXTURE_V2)[0]
+    protein = src["fusion_peptide"]
+    neo_bp = float(src["neo_peptide_sequence_bp"])
+    junction_bp = protein.index(src["neo_peptide_sequence"]) + neo_bp
+    header = [
+        "BPID", "Fusion_Gene", "Breakpoint1", "Breakpoint2", "type", "frame",
+        "fusion_protein_sequence", "fusion_protein_sequence_bp",
+        "starfusion_detected", "ft_junc_cnt", "ft_span_cnt", "ft_anch_cnt",
+        "prediction_prob", "prediction_class",
+    ]
+    values = [
+        src["BPID"], src["Fusion_Gene"], src["Breakpoint1"], src["Breakpoint2"], src["type"],
+        src["frame"], protein, str(junction_bp),
+        # The counts only need to clear the adapter read-depth floor.
+        "1", "42", "18", "31",
+        src["prediction_prob"], src["prediction_class"],
+    ]
+    table = tmp_path / "fusions.pass.csv"
+    table.write_text(";".join(header) + chr(10) + ";".join(values) + chr(10), encoding="utf-8")
+
+    rows = read_easyfuse_table(table)
+    assert rows[0]["neo_peptide_sequence"] == src["neo_peptide_sequence"]
+    assert rows[0]["openneo_neo_peptide_source"] == "derived_from_fusion_protein"
+    ok, reason = filter_easyfuse_row(rows[0])
+    assert ok and reason == "pass"
+    parsed = parse_easyfuse(table, "S1", "default")
+    assert len(parsed["events"]) == 1
+    assert parsed["catalog_rows"]
+
+
+def test_easyfuse_table_with_neo_peptide_left_untouched():
+    """Tables that already carry the column (EasyFuse 1.x, fixtures) are never rewritten."""
+    rows = read_easyfuse_table(FIXTURE_V2)
+    assert all(not r.get("openneo_neo_peptide_source") for r in rows)
+    assert all(r["neo_peptide_sequence"] for r in rows)

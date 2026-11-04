@@ -39,7 +39,7 @@ CCF_FIELDS = [
     "ccf_interval_method", "ccf_interpretation", "ccf_formula_assumptions",
     "local_cnv_status", "normal_alt_count", "normal_depth", "normal_vaf", "normal_alt_vaf", "normal_contamination_status",
     "mutation_multiplicity_source",
-    "probability_ccf_gt_0_8", "probability_ccf_lt_0_3",
+    "interval_fraction_ccf_above_0_8", "interval_fraction_ccf_below_0_3",
     # Backward-compatible columns consumed by older score code
     "ccf_estimate", "ccf_status", "clonality_status", "clonality_confidence", "clonality_multiplier",
     "ccf_method", "ccf_confidence", "ccf_warning", "mutation_multiplicity_assumption",
@@ -406,13 +406,15 @@ def _has_tumor_allele_evidence(e: Mapping[str, Any]) -> bool:
     return bool(vaf and (to_float(vaf, 0.0) > 0.0 or depth))
 
 
-def _probability_from_interval(ccf_best: float | None, lo: float | None, hi: float | None, threshold: float, direction: str) -> str:
+def _interval_fraction_over_threshold(ccf_best: float | None, lo: float | None, hi: float | None, threshold: float, direction: str) -> str:
+    # Honest semantics: this is the fraction of the CCF confidence interval lying on
+    # one side of a threshold - a coarse interval summary, not a calibrated
+    # probability of clonality. Without a usable interval nothing can be said, so
+    # the value stays unassessed instead of a fabricated 0.0000/1.0000 certainty.
     if ccf_best is None:
         return ""
     if lo is None or hi is None or hi <= lo:
-        if direction == "gt":
-            return "1.0000" if ccf_best > threshold else "0.0000"
-        return "1.0000" if ccf_best < threshold else "0.0000"
+        return ""
     if direction == "gt":
         if lo >= threshold:
             p = 1.0
@@ -974,8 +976,8 @@ def build_ccf_2(
             "normal_alt_vaf": "" if normal_vaf is None else f"{normal_vaf:.4f}",
             "normal_contamination_status": normal_status,
             "mutation_multiplicity_source": mult_source,
-            "probability_ccf_gt_0_8": _probability_from_interval(ccf_best, ci_low, ci_high, 0.8, "gt"),
-            "probability_ccf_lt_0_3": _probability_from_interval(ccf_best, ci_low, ci_high, 0.3, "lt"),
+            "interval_fraction_ccf_above_0_8": _interval_fraction_over_threshold(ccf_best, ci_low, ci_high, 0.8, "gt"),
+            "interval_fraction_ccf_below_0_3": _interval_fraction_over_threshold(ccf_best, ci_low, ci_high, 0.3, "lt"),
             "ccf_estimate": "NA" if ccf_best is None else f"{ccf_best:.4f}",
             "ccf_status": status,
             "clonality_status": status,

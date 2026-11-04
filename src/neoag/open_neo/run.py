@@ -311,7 +311,7 @@ def _run_standard(args: dict[str, Any], routing: RoutingResult, layout: RunLayou
         effective_inputs["sv_raw_peptides"] = str(merged_sv / "raw_peptides.tsv")
     config = write_run_config(
         layout.manifests / "run.open_neo.generated.toml",
-        {**effective_inputs, "enabled_tools": args.get("enabled_tools") or ["netmhcpan", "mhcflurry"], "immunogenicity_stub": args.get("immunogenicity_stub", args.get("stub", False))},
+        {**effective_inputs, "enabled_tools": args.get("enabled_tools") or [t.strip() for t in os.environ.get("NEOAG_OPEN_NEO_ENABLED_TOOLS", "").split(",") if t.strip()] or ["netmhcpan", "mhcflurry"], "immunogenicity_stub": args.get("immunogenicity_stub", args.get("stub", False))},
         [asdict(r) for r in routing.routes],
         outdir=layout.pipeline / "result",
         stub=bool(args.get("stub", False)),

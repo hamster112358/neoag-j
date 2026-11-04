@@ -91,14 +91,20 @@ def build_mhc1_peptides(
     lengths: tuple[int, ...] = (8, 9, 10, 11),
     normal_ligands: set[str] | None = None,
     reference_peptides: set[str] | None = None,
+    allow_rna_supported: bool = False,
 ) -> list[PeptideCandidate]:
     normal_ligands = normal_ligands or set()
     reference_peptides = reference_peptides or set()
     out: list[PeptideCandidate] = []
     seen: set[tuple[str, str, str, int]] = set()
     for prot in proteins:
-        if prot.reconstruction_confidence != "high" or not prot.reconstruction_method.startswith("external_expressed_transcript:"):
-            # DNA-only heuristic products are useful hypotheses, not peptide-generation inputs.
+        method = prot.reconstruction_method or ""
+        external = prot.reconstruction_confidence == "high" and method.startswith("external_expressed_transcript:")
+        rna_supported = allow_rna_supported and method.startswith("RNA_SUPPORTED_DNA_HYPOTHESIS:")
+        if not (external or rna_supported):
+            # Unvalidated DNA-only heuristic products stay as hypotheses.  Only
+            # external expressed-transcript products, or DNA hypotheses whose
+            # junction passed RNA QC (promoted by phase1), build peptides.
             continue
         seq = (prot.protein_sequence or "").strip().upper().replace("*", "")
         wt = (prot.wt_protein_sequence or "").strip().upper().replace("*", "")

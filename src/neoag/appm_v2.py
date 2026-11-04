@@ -434,11 +434,30 @@ def load_cnv_gene_status(path: str | Path | None) -> dict[str, dict[str, str]]:
 def load_hla_loh(path: str | Path | None) -> set[str]:
     if not _path_exists(path):
         return set()
+    rows = read_tsv(path)
+    status_keys = ["loh_status", "LOH", "loh", "consensus_status", "status", "loss", "Loss"]
+    has_status_column = any(
+        key in (row.keys() if hasattr(row, "keys") else ()) for row in rows for key in status_keys
+    )
+    lost_tokens = {
+        "loh", "loss", "lost", "yes", "true", "1",
+        "consensus_lost", "consensus_loh", "single_tool_lost",
+    }
     lost: set[str] = set()
-    for r in read_tsv(path):
+    for r in rows:
         allele = first(r, ["hla_allele", "allele", "HLA", "LossAllele", "loss_allele"], "")
-        status = first(r, ["loh_status", "LOH", "status", "loss", "Loss"], "")
-        if allele and (not status or status.lower() in {"loh", "loss", "lost", "yes", "true", "1"}):
+        if not allele:
+            continue
+        status = first(r, status_keys, "")
+        if has_status_column:
+            # A table that carries a status column is judged by its status: only an
+            # explicit loss token marks the allele lost. Consensus tables
+            # (consensus_status: Retained / Discordant / Lost) land here, and a row
+            # with a missing status value is no longer counted as lost.
+            if status.lower() in lost_tokens:
+                lost.add(normalize_hla_allele(allele))
+        else:
+            # Legacy allele-only tables list exactly the lost alleles.
             lost.add(normalize_hla_allele(allele))
     return lost
 

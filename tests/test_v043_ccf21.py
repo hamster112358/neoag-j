@@ -26,7 +26,7 @@ def test_ccf21_writes_input_qc_and_confidence_fields(tmp_path):
     assert row["multiplicity_candidates"]
     assert row["multiplicity_confidence"] in {"high", "medium", "low", "ambiguous"}
     assert row["clonality_confidence"] in {"high", "medium", "low", "unresolved"}
-    assert row["probability_ccf_gt_0_8"] != ""
+    assert row["interval_fraction_ccf_above_0_8"] != ""
     qc = read_tsv(out.parent / "ccf_input_qc.tsv")[0]
     assert qc["ccf_ready_status"] in {"ready", "approximate"}
     assert qc["major_minor_cn_available"] == "yes"

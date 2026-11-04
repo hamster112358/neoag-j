@@ -1241,19 +1241,40 @@ def _production_run_readiness(args: dict[str, Any], project_root: Path, tier: st
         "Preseed/patch EasyFuse STAR_INDEX and STAR_CUSTOM conda envs so the STAR version that generates a transient index is compatible with the STAR version that reads it.",
     ))
 
-    easyfuse_requant_module_text = _read_text_if_small((easyfuse_root / "modules/05_requantification.nf") if easyfuse_root else Path())
+    # EasyFuse 1.x ran requantification through a single STAR_CUSTOM module that re-read the
+    # transient STAR index; EasyFuse 2.2 quantifies with bp_quant (modules/bpquant/*) and has
+    # no STAR_CUSTOM process at all.  Discover the module the same way
+    # scripts/patch_easyfuse_requant_star_index_cleanup.sh does, so a bp_quant layout is
+    # reported as "cleanup patch not required" instead of a false blocker.
+    easyfuse_requant_module = None
+    easyfuse_requant_module_text = ""
+    if easyfuse_root:
+        for candidate in sorted((easyfuse_root / "modules").glob("*requantification*.nf")):
+            candidate_text = _read_text_if_small(candidate)
+            if "process STAR_CUSTOM" in candidate_text:
+                easyfuse_requant_module, easyfuse_requant_module_text = candidate, candidate_text
+                break
+    star_custom_cleanup_required = easyfuse_requant_module is not None
     easyfuse_star_index_cleanup_ok = (
-        "genomeType" in easyfuse_requant_module_text
-        and "genomeTransform" in easyfuse_requant_module_text
-        and "genomeParameters.txt" in easyfuse_requant_module_text
-        and easyfuse_requant_module_text.count("genomeParameters.txt") >= 2
-        and "patch_easyfuse_requant_star_index_cleanup.sh" in easyfuse_runner_text
-    )
+        (not star_custom_cleanup_required)
+        or (
+            "genomeType" in easyfuse_requant_module_text
+            and "genomeTransform" in easyfuse_requant_module_text
+            and "genomeParameters.txt" in easyfuse_requant_module_text
+            and easyfuse_requant_module_text.count("genomeParameters.txt") >= 2
+        )
+    ) and "patch_easyfuse_requant_star_index_cleanup.sh" in easyfuse_runner_text
     rows.append(_production_row(
         "rna_fusion", "easyfuse_requant_star_index_parameter_cleanup",
         "OK" if easyfuse_star_index_cleanup_ok else "BLOCKED",
         "INFO" if easyfuse_star_index_cleanup_ok else "BLOCKER",
-        str((easyfuse_root / "modules/05_requantification.nf") if easyfuse_root else "EasyFuse root not found"),
+        (
+            f"module={easyfuse_requant_module or 'none'}; "
+            f"star_custom_present={star_custom_cleanup_required}; "
+            f"EasyFuse root={easyfuse_root or 'not found'}"
+            + ("" if star_custom_cleanup_required else
+               "; EasyFuse 2.2 quantifies with bp_quant, so no STAR index cleanup patch is required")
+        ),
         "Patch EasyFuse STAR_INDEX to remove STAR-version-specific genomeParameters entries such as genomeType and genomeTransform* before STAR_CUSTOM consumes the transient index.",
     ))
 

@@ -76,6 +76,7 @@ def build_presentation_evidence(
     w_mhcf = float(w.get("mhcflurry_presentation", 0.30))
     w_proc = float(w.get("mhcflurry_processing", 0.10))
     w_chop = float(w.get("netchop_processing", 0.10))
+    w_stab = float(w.get("netmhcstabpan_stability", 0.05))
     rows = []
     for p in peptides:
         hla = normalize_hla_allele(str(p.get("hla_allele") or ""))
@@ -110,6 +111,13 @@ def build_presentation_evidence(
         weighted_evidence = [(ba_s,w_ba),(el_s,w_el),(pres_s,w_mhcf),(proc_s,w_proc)]
         if is_mhci:
             weighted_evidence.append((chop_s, w_chop))
+            # NetMHCstabpan rank (percentile, lower = more stable) was read, matched
+            # and written through this table but never reached the score. It enters as
+            # a small signal: stability is conditional on binding, so it corroborates
+            # rather than drives; weight is profile-tunable (audit items A2/A3).
+            stab_rank = s.get("netmhcstabpan_rank", "")
+            stab_s = norm_rank(stab_rank) if stab_rank != "" else None
+            weighted_evidence.append((stab_s, w_stab))
         for val, wt in weighted_evidence:
             if val is not None:
                 num += val * wt; den += wt

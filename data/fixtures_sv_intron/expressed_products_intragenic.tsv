@@ -1,0 +1,2 @@
+genome_build	chrom1	pos1	strand1	chrom2	pos2	strand2	gene1	gene2	transcript1	transcript2	protein_sequence	wildtype_protein_sequence	junction_aa_position	in_frame	orf_status	source_tool	source_record_id
+GRCh38	chr1	250	.	chr1	500	.	GENE1	GENE1	TX1	TX1	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAARRRRRRRRRRRRRRRRRRRRRRRRRRRRRR	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAAAAAAAAAAAAAAAAAAAAAAAAAAAAA	30	no	CONFIRMED	FixTool	FIXTURE_P1

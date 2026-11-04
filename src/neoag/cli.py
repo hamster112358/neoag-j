@@ -120,6 +120,7 @@ def cmd_build_presentation(args):
     build_presentation_evidence(
         args.raw_peptides, args.netmhcpan, args.mhcflurry,
         load_profile(args.profile), args.out, args.netmhcstabpan,
+        netchop=getattr(args, "netchop", None),
     )
     print("Built PresentationEvidence.")
 
@@ -1143,7 +1144,7 @@ def build_parser():
     pm = sub.add_parser("parse-mhcflurry")
     pm.add_argument("--sample-id", default="SAMPLE001"); pm.add_argument("--input", required=True); pm.add_argument("--out", required=True); pm.set_defaults(func=cmd_parse_mhcflurry)
     bp = sub.add_parser("build-presentation-evidence")
-    bp.add_argument("--raw-peptides", required=True); bp.add_argument("--netmhcpan"); bp.add_argument("--mhcflurry"); bp.add_argument("--netmhcstabpan"); bp.add_argument("--profile", default="default"); bp.add_argument("--out", required=True); bp.set_defaults(func=cmd_build_presentation)
+    bp.add_argument("--raw-peptides", required=True); bp.add_argument("--netmhcpan"); bp.add_argument("--mhcflurry"); bp.add_argument("--netmhcstabpan"); bp.add_argument("--netchop"); bp.add_argument("--profile", default="default"); bp.add_argument("--out", required=True); bp.set_defaults(func=cmd_build_presentation)
     ap = sub.add_parser("appm-lite")
     ap.add_argument("--sample-id", default="SAMPLE001"); ap.add_argument("--vep-tsv"); ap.add_argument("--expression"); ap.add_argument("--hla-loh"); ap.add_argument("--cnv"); ap.add_argument("--raw-peptides"); ap.add_argument("--ccf"); ap.add_argument("--profile", default="default"); ap.add_argument("--outdir", required=True); ap.set_defaults(func=cmd_appm)
     ap2 = sub.add_parser("appm-2", help="Build APPM 2.0 gene/pathway/peptide evidence sidecars")
