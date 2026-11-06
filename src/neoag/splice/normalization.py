@@ -333,12 +333,40 @@ def _event_source_row(
     primary_tools: set[str],
     normal_status: str,
     normal_cohort_status: str,
+    gene_index: dict[str, list[tuple[int, int, str, str]]] | None = None,
 ) -> dict[str, str]:
     record = item.record
     junction = item.resolution.junction
-    gene = record.gene.strip() or (
-        f"{junction.chrom}:{junction.intron_start_1based}" if junction else f"{record.source_tool}:row{record.source_row_number}"
-    )
+    gene = record.gene.strip()
+    gene_symbol_source = "source_provided" if gene else ""
+    if not gene:
+        # Annotation-only naming: the junction is already exactly resolved;
+        # containment of the whole intron in a gene interval adds no evidence
+        # and is never nearest-locus inference.  Anything less stays the
+        # honest coordinate fallback.
+        symbol, basis = ("", "")
+        if junction is not None and gene_index is not None:
+            from ..adapters.event_catalog import lookup_gene_symbol
+
+            symbol, basis = lookup_gene_symbol(
+                gene_index,
+                junction.chrom,
+                junction.intron_start_1based,
+                junction.intron_end_1based,
+                junction.strand,
+                containment_only=True,
+            )
+        if symbol:
+            gene = symbol
+            gene_symbol_source = f"coordinate_lookup_{basis}"
+        elif junction is not None:
+            gene = f"{junction.chrom}:{junction.intron_start_1based}"
+            gene_symbol_source = (
+                "coordinate_lookup_no_containing_gene" if gene_index is not None else "coordinate_fallback_no_reference"
+            )
+        else:
+            gene = f"{record.source_tool}:row{record.source_row_number}"
+            gene_symbol_source = "coordinate_fallback_unresolved_junction"
     verified, primary_sources = _entity_primary_support(item, registry, primary_tools)
     if junction is not None and primary_sources:
         confidence = "0.85" if len(registry.entities[junction.junction_id].source_tools) >= 2 else "0.70"
@@ -355,6 +383,7 @@ def _event_source_row(
         "mutation_source": "Other",
         "peptide_consequence": "splice_junction",
         "gene": gene,
+        "gene_symbol_source": gene_symbol_source,
         "event_name": record.source_junction_id or item.event_id,
         # Caller coordinate is retained for compatibility. Canonical coordinate
         # fields below are authoritative for any cross-source join.
@@ -807,8 +836,12 @@ def normalize_splice_sources(
         source_tool_version=primary.version,
         strict=strict,
     )
+    gene_index = None
     if annotation_gtf:
         primary_records = resolve_gtf_junction_strands(primary_records, annotation_gtf)
+        from ..adapters.event_catalog import load_gene_interval_index
+
+        gene_index = load_gene_interval_index(annotation_gtf)
     for record in primary_records:
         resolution = registry.add(record)
         normalized.append(
@@ -932,6 +965,7 @@ def normalize_splice_sources(
                 primary_tools=primary_tools,
                 normal_status=status,
                 normal_cohort_status=normal_cohort_status,
+                gene_index=gene_index,
             )
         )
 
@@ -1232,6 +1266,15 @@ def normalize_splice_sources(
             "junction_strand_annotation": {
                 "gtf": str(annotation_gtf or ""),
                 "policy": "exact same-transcript exon boundaries; unique strand only",
+            },
+            "gene_symbol_annotation": {
+                "gtf": str(annotation_gtf or ""),
+                "policy": (
+                    "annotation-only naming of exactly resolved junctions; a symbol is "
+                    "assigned only when one gene interval fully contains the canonical "
+                    "intron (no nearest-locus or partial-overlap inference); never moves "
+                    "reads or evidence; basis recorded per event in gene_symbol_source"
+                ),
             },
             "inputs": [
                 {"path": str(path), "sha256": file_sha256(path)}

@@ -90,17 +90,110 @@ def parse_fusion_catalog(
     return list(events.values())
 
 
+COORDINATE_GENE_RE = re.compile(r"(?:chr)?[0-9XYM]+:\d+(?:[-:]\d+)?", re.IGNORECASE)
+
+
 def _splice_gene_name_from_record(record) -> str:
     gene = str(record.gene or "").strip()
     if gene.upper() in {"", "NA", "N/A", "."}:
         gene = ""
     source_id = str(record.source_junction_id or "").strip()
     ensg_match = re.search(r"ENSG\d+", source_id)
-    if (not gene or re.fullmatch(r"(?:chr)?[0-9XYM]+:\d+(?:[-:]\d+)?", gene, re.IGNORECASE)) and ensg_match:
+    if (not gene or COORDINATE_GENE_RE.fullmatch(gene)) and ensg_match:
         gene = ensg_match.group(0)
     if not gene and record.source_chrom:
         gene = f"{record.source_chrom}:{record.source_start}"
     return gene
+
+
+def _splice_gene_name_source(record, gene: str) -> str:
+    own = str(record.gene or "").strip()
+    if own and own.upper() not in {"", "NA", "N/A", "."} and not COORDINATE_GENE_RE.fullmatch(own):
+        return "source_provided"
+    if gene.startswith("ENSG"):
+        return "source_provided_ensg_id"
+    return ""
+
+
+# gene interval index built lazily per (path, mtime): chrom -> sorted (start, end, strand, symbol)
+_GENE_INTERVAL_CACHE: dict[tuple[str, float], dict[str, list[tuple[int, int, str, str]]]] = {}
+
+
+def load_gene_interval_index(gtf_path: str | Path) -> dict[str, list[tuple[int, int, str, str]]]:
+    """Parse gene rows of a GTF/GF.GZ into ``chrom -> [(start, end, strand, symbol)]``."""
+    path = Path(gtf_path)
+    key = (str(path), path.stat().st_mtime)
+    cached = _GENE_INTERVAL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    opener = __import__("gzip").open if path.suffix == ".gz" else open
+    per_chrom: dict[str, list[tuple[int, int, str, str]]] = {}
+    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 9 or fields[2] != "gene":
+                continue
+            chrom = fields[0][3:] if fields[0].startswith("chr") else fields[0]
+            try:
+                start, end = int(fields[3]), int(fields[4])
+            except ValueError:
+                continue
+            match = re.search(r'gene_name "([^"]+)"', fields[8])
+            if not match:
+                match = re.search(r"gene_name ([^;]+);", fields[8])
+            symbol = match.group(1).strip() if match else ""
+            if not symbol:
+                continue
+            per_chrom.setdefault(chrom, []).append((start, end, fields[6], symbol))
+    for intervals in per_chrom.values():
+        intervals.sort()
+    _GENE_INTERVAL_CACHE[key] = per_chrom
+    return per_chrom
+
+
+def lookup_gene_symbol(
+    index: dict[str, list[tuple[int, int, str, str]]],
+    chrom: str,
+    start: int,
+    end: int,
+    strand: str = "",
+    *,
+    containment_only: bool = False,
+) -> tuple[str, str]:
+    """Return ``(symbol, basis)`` for the gene best covering ``chrom:start-end``.
+
+    basis: ``contained`` when one gene interval holds the whole intron
+    (strand-matched preferred), ``overlap`` for the smallest partial overlap,
+    or ``("", "")`` when nothing overlaps. Deterministic: containment and
+    strand match first, then smaller interval, then lexicographic symbol.
+    ``containment_only`` (used by the strict splice-normalization path, whose
+    invariants forbid nearest-locus-style inference) never returns an
+    ``overlap`` label: partial overlaps are left unnamed.
+    """
+    plain = chrom[3:] if chrom.startswith("chr") else chrom
+    candidates = index.get(plain) or []
+    best_contained: tuple[int, int, str] | None = None
+    best_overlap: tuple[int, int, str] | None = None
+    for g_start, g_end, g_strand, symbol in candidates:
+        if g_end < start:
+            continue
+        if g_start > end:
+            break
+        contained = g_start <= start and end <= g_end
+        strand_bonus = 0 if (strand and g_strand == strand) else 1
+        key = (strand_bonus, g_end - g_start, symbol)
+        if contained:
+            if best_contained is None or key < best_contained:
+                best_contained = key
+        elif not containment_only and (best_overlap is None or key < best_overlap):
+            best_overlap = key
+    if best_contained is not None:
+        return best_contained[2], "contained"
+    if best_overlap is not None:
+        return best_overlap[2], "overlap"
+    return "", ""
 
 
 def parse_splice_catalog(
@@ -111,6 +204,7 @@ def parse_splice_catalog(
     genome_build: str = "GRCh38",
     coordinate_system: str = "auto",
     source_tool: str = "RegTools",
+    gene_gtf: str | Path | None = None,
 ) -> list[dict[str, str]]:
     """Ingest a splice-junction catalog with canonical, auditable coordinates.
 
@@ -135,8 +229,22 @@ def parse_splice_catalog(
         junction = record.junction
         event_id = junction.junction_id if junction else unresolved_event_id(record)
         gene = _splice_gene_name_from_record(record)
+        gene_symbol_source = _splice_gene_name_source(record, gene)
         if not gene:
             gene = f"{source_tool}:row{record.source_row_number}"
+        if not gene_symbol_source and gene_gtf and junction is not None:
+            symbol, basis = lookup_gene_symbol(
+                load_gene_interval_index(gene_gtf),
+                junction.chrom,
+                junction.intron_start_1based,
+                junction.intron_end_1based,
+                junction.strand,
+            )
+            if symbol:
+                gene = symbol
+            gene_symbol_source = f"coordinate_lookup_{basis}" if symbol else "coordinate_lookup_no_overlap"
+        elif not gene_symbol_source:
+            gene_symbol_source = "coordinate_fallback_no_reference"
 
         ev = _base_event(
             sample_id=sample_id,
@@ -159,6 +267,7 @@ def parse_splice_catalog(
 
         ev.update(
             {
+                "gene_symbol_source": gene_symbol_source,
                 "source_junction_id": record.source_junction_id,
                 "junction_coordinate_system": record.source_coordinate_system,
                 "junction_resolution_status": record.resolution_status,

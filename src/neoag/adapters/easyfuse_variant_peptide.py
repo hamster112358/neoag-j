@@ -54,6 +54,22 @@ FILTER_QC_FIELDS = [
     "frame",
 ]
 
+COORDINATE_QC_FIELDS = [
+    "sample_id",
+    "row_index",
+    "event_id",
+    "fusion_gene",
+    "neo_peptide_length",
+    "neo_peptide_sequence_bp",
+    "fusion_protein_length",
+    "fusion_protein_sequence_bp",
+    "peptide_context",
+    "peptide_context_bp",
+    "context_status",
+    "context_detail",
+    "junction_window_rows",
+]
+
 COLLAPSE_QC_FIELDS = [
     "sample_id",
     "event_id",
@@ -83,6 +99,9 @@ SUMMARY_QC_FIELDS = [
     "unique_events",
     "selected_isoforms",
     "catalog_peptide_rows",
+    "peptide_context_fusion_protein_rows",
+    "peptide_context_neo_fallback_rows",
+    "peptide_context_invalid_rows",
     "generation_method",
 ]
 
@@ -105,6 +124,7 @@ class EasyFuseCatalogResult:
     fusion_evidence: list[dict[str, str]] = field(default_factory=list)
     filter_qc: list[dict[str, str]] = field(default_factory=list)
     collapse_qc: list[dict[str, str]] = field(default_factory=list)
+    coordinate_qc: list[dict[str, str]] = field(default_factory=list)
     summary_qc: dict[str, str] = field(default_factory=dict)
 
 
@@ -157,13 +177,81 @@ def build_fusion_centered_minigene(
     return f"{seq_f}|{center}|{seq_b}"
 
 
+def select_fusion_peptide_context(row: dict[str, str]) -> dict[str, Any]:
+    """Choose the sequence and junction coordinate to enumerate windows on.
+
+    Each coordinate space must be validated against its own sequence before
+    any peptide is generated:
+
+    1. ``fusion_protein_sequence`` + ``fusion_protein_sequence_bp`` (preferred).
+    2. Fallback: ``neo_peptide_sequence`` + ``neo_peptide_sequence_bp``, only
+       when the neo breakpoint is explicitly present and valid for the neo
+       sequence length.
+    3. Neither validated -> status ``CONTEXT_INVALID``: no windows may be
+       generated from mismatched coordinate spaces; the row is flagged in the
+       coordinate QC table instead.
+    """
+    neo = _neo_peptide_sequence(row)
+    fusion_protein = re.sub(
+        r"[^ACDEFGHIKLMNPQRSTVWY]", "",
+        first(row, ["fusion_protein_sequence"], "").upper(),
+    )
+    fp_bp_raw = first(row, ["fusion_protein_sequence_bp", "fusion_protein_bp"], "")
+    neo_bp_raw = first(row, ["neo_peptide_sequence_bp"], "")
+
+    def _bp_int(raw: str) -> int | None:
+        if not str(raw).strip():
+            return None
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return None
+
+    fp_bp = _bp_int(fp_bp_raw)
+    neo_bp = _bp_int(neo_bp_raw)
+    if fusion_protein and fp_bp is not None and 0 < fp_bp < len(fusion_protein):
+        return {
+            "sequence": fusion_protein,
+            "context": "fusion_protein",
+            "bp_pos": fp_bp,
+            "status": "CONTEXT_FUSION_PROTEIN",
+            "detail": (
+                f"fusion_protein_sequence_bp={fp_bp_raw} valid for "
+                f"fusion_protein length {len(fusion_protein)}"
+            ),
+        }
+    if neo and neo_bp is not None and 0 < neo_bp < len(neo):
+        return {
+            "sequence": neo,
+            "context": "neo_peptide",
+            "bp_pos": neo_bp,
+            "status": "CONTEXT_NEO_FALLBACK",
+            "detail": (
+                f"no valid fusion protein coordinate (fusion_protein length "
+                f"{len(fusion_protein)}, fusion_protein_sequence_bp={fp_bp_raw or 'missing'}); "
+                f"neo_peptide_sequence_bp={neo_bp_raw} valid for neo length {len(neo)}"
+            ),
+        }
+    return {
+        "sequence": "",
+        "context": "",
+        "bp_pos": 0,
+        "status": "CONTEXT_INVALID",
+        "detail": (
+            f"no coordinate validated: fusion_protein length {len(fusion_protein)} "
+            f"bp={fp_bp_raw or 'missing'}; neo length {len(neo)} "
+            f"bp={neo_bp_raw or 'missing'}"
+        ),
+    }
+
+
 def sliding_fusion_neo_peptides(
     neo_sequence: str,
     lengths: tuple[int, ...],
     *,
     bp_pos: int = 0,
 ) -> list[dict[str, str]]:
-    """8–11 aa windows on EasyFuse neo_peptide_sequence."""
+    """8–11 aa windows on the selected fusion peptide context sequence."""
     neo = str(neo_sequence or "").strip().upper()
     if not neo:
         return []
@@ -303,15 +391,11 @@ def easyfuse_row_to_variant_peptide_rows(
     peptide_cfg: EasyFusePeptideConfig | None = None,
 ) -> list[dict[str, str]]:
     peptide_cfg = peptide_cfg or EasyFusePeptideConfig()
-    neo = _neo_peptide_sequence(row)
-    if not neo:
+    ctx = select_fusion_peptide_context(row)
+    if ctx["status"] == "CONTEXT_INVALID":
         return []
-    bp_pos = int(to_float(first(row, ["neo_peptide_sequence_bp"], "0"), 0.0))
-    fusion_protein = re.sub(
-        r"[^ACDEFGHIKLMNPQRSTVWY]", "",
-        first(row, ["fusion_protein_sequence"], "").upper(),
-    )
-    peptide_context = fusion_protein if 0 < bp_pos < len(fusion_protein) else neo
+    bp_pos = int(ctx["bp_pos"])
+    peptide_context = str(ctx["sequence"])
     g1, g2 = _gene_pair(row)
     gene = _gene_label(g1, g2)
     chrom, pos = _breakpoint_chrom_pos(first(row, ["Breakpoint1", "breakpoint1"], ""))
@@ -370,6 +454,9 @@ def easyfuse_row_to_variant_peptide_rows(
             "internal_tools": event.get("internal_tools", ""),
             "internal_high_confidence_reason": event.get("internal_high_confidence_reason", ""),
             "peptide_source": "easyfuse",
+            "peptide_context": ctx["context"],
+            "peptide_context_bp": str(bp_pos),
+            "peptide_context_status": ctx["status"],
             "peptide_label": (
                 f"GENE={gene}|FUSION={fusion_gene}|EF={eid}"
                 f"|NEO={win['mutant_peptide']}|BP={bp_pos}"
@@ -494,18 +581,39 @@ def build_easyfuse_catalog(
                     )
                 )
 
+    coordinate_qc: list[dict[str, str]] = []
+    context_counts = {"CONTEXT_FUSION_PROTEIN": 0, "CONTEXT_NEO_FALLBACK": 0, "CONTEXT_INVALID": 0}
     for row_index, row, event in selected_rows:
         events[event["event_id"]] = event
-        catalog_rows.extend(
-            easyfuse_row_to_variant_peptide_rows(
-                row,
-                event,
-                sample_id=sample_id,
-                lengths=lengths,
-                row_index=row_index,
-                peptide_cfg=peptide_cfg,
-            )
+        peptide_rows = easyfuse_row_to_variant_peptide_rows(
+            row,
+            event,
+            sample_id=sample_id,
+            lengths=lengths,
+            row_index=row_index,
+            peptide_cfg=peptide_cfg,
         )
+        ctx = select_fusion_peptide_context(row)
+        context_counts[ctx["status"]] = context_counts.get(ctx["status"], 0) + 1
+        coordinate_qc.append({
+            "sample_id": sample_id,
+            "row_index": str(row_index),
+            "event_id": event["event_id"],
+            "fusion_gene": first(row, ["Fusion_Gene", "fusion_gene"], ""),
+            "neo_peptide_length": str(len(_neo_peptide_sequence(row))),
+            "neo_peptide_sequence_bp": first(row, ["neo_peptide_sequence_bp"], ""),
+            "fusion_protein_length": str(len(re.sub(
+                r"[^ACDEFGHIKLMNPQRSTVWY]", "",
+                first(row, ["fusion_protein_sequence"], "").upper(),
+            ))),
+            "fusion_protein_sequence_bp": first(row, ["fusion_protein_sequence_bp", "fusion_protein_bp"], ""),
+            "peptide_context": ctx["context"],
+            "peptide_context_bp": str(ctx["bp_pos"]),
+            "context_status": ctx["status"],
+            "context_detail": ctx["detail"],
+            "junction_window_rows": str(len(peptide_rows)),
+        })
+        catalog_rows.extend(peptide_rows)
 
     summary_qc = {
         "sample_id": sample_id,
@@ -519,6 +627,9 @@ def build_easyfuse_catalog(
         "unique_events": str(len(by_event)),
         "selected_isoforms": str(len(selected_rows)),
         "catalog_peptide_rows": str(len(catalog_rows)),
+        "peptide_context_fusion_protein_rows": str(context_counts.get("CONTEXT_FUSION_PROTEIN", 0)),
+        "peptide_context_neo_fallback_rows": str(context_counts.get("CONTEXT_NEO_FALLBACK", 0)),
+        "peptide_context_invalid_rows": str(context_counts.get("CONTEXT_INVALID", 0)),
         "generation_method": generation_method,
     }
 
@@ -528,6 +639,7 @@ def build_easyfuse_catalog(
         fusion_evidence=fusion_evidence,
         filter_qc=filter_qc,
         collapse_qc=collapse_qc,
+        coordinate_qc=coordinate_qc,
         summary_qc=summary_qc,
     )
 
@@ -543,10 +655,12 @@ def write_easyfuse_qc_tables(
     paths = {
         "filter_qc": str(out / f"{prefix}_filter_qc.tsv"),
         "collapse_qc": str(out / f"{prefix}_collapse_qc.tsv"),
+        "coordinate_qc": str(out / f"{prefix}_coordinate_qc.tsv"),
         "summary_qc": str(out / f"{prefix}_summary_qc.tsv"),
     }
     write_tsv(paths["filter_qc"], result.filter_qc, FILTER_QC_FIELDS)
     write_tsv(paths["collapse_qc"], result.collapse_qc, COLLAPSE_QC_FIELDS)
+    write_tsv(paths["coordinate_qc"], result.coordinate_qc, COORDINATE_QC_FIELDS)
     write_tsv(paths["summary_qc"], [result.summary_qc], SUMMARY_QC_FIELDS)
     return paths
 

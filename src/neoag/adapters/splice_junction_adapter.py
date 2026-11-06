@@ -362,12 +362,14 @@ def merge_splice_into_catalog(
     )
 
     canonical_existing, id_map = _canonicalize_splice_events(events, index)
+    gene_gtf = inputs.get("splice_gene_gtf") or inputs.get("splice_gtf")
     splice_events = parse_splice_catalog(
         splice_path,
         sample_id,
         profile_name,
         genome_build=build,
         coordinate_system=coordinate_system,
+        gene_gtf=str(gene_gtf) if gene_gtf else None,
     )
     merged_events, event_provenance, event_conflicts = merge_rows_preserving_provenance(
         canonical_existing + splice_events,
