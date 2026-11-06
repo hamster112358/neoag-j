@@ -77,6 +77,19 @@ def build_presentation_evidence(
     w_proc = float(w.get("mhcflurry_processing", 0.10))
     w_chop = float(w.get("netchop_processing", 0.10))
     w_stab = float(w.get("netmhcstabpan_stability", 0.05))
+    # Audit follow-up 2026-11-06 (binding aggregation): the binding evidence
+    # score historically took max(normalized NetMHCpan BA, normalized
+    # MHCflurry affinity), which trusts whichever predictor is most optimistic
+    # (audit "APPM integration" note; presentation-scoring investigation 6.2).
+    # The aggregation is now a profile knob; the default stays "max" so every
+    # existing run reproduces byte-identically, and mean/min are available for
+    # A/B without code changes. |BA - MHCflurry| is exported either way as a
+    # disagreement quality feature.
+    binding_agg = str(w.get("binding_aggregation", "max")).strip().lower()
+    if binding_agg not in {"max", "mean", "min"}:
+        raise ValueError(
+            f"presentation_weights.binding_aggregation must be max|mean|min, got {binding_agg!r}"
+        )
     rows = []
     for p in peptides:
         hla = normalize_hla_allele(str(p.get("hla_allele") or ""))
@@ -105,7 +118,20 @@ def build_presentation_evidence(
         chop_raw = c.get("netchop_31d_cterm_score") or c.get("netchop_31d_max_score", "")
         chop_s = clamp(to_float(chop_raw, -1)) if chop_raw != "" else None
         binding_parts = [x for x in [ba_s, pct_s] if x is not None]
-        binding = max(binding_parts) if binding_parts else norm_rank(p.get("binding_rank", 99))
+        if binding_parts:
+            if binding_agg == "mean":
+                binding = sum(binding_parts) / len(binding_parts)
+            elif binding_agg == "min":
+                binding = min(binding_parts)
+            else:
+                binding = max(binding_parts)
+        else:
+            binding = norm_rank(p.get("binding_rank", 99))
+        # Quality feature requested by the scoring investigation (6.2): how far
+        # apart the two binding predictors disagree, in normalized-score units.
+        binding_disagreement = (
+            f"{abs(ba_s - pct_s):.4f}" if ba_s is not None and pct_s is not None else ""
+        )
         num = den = 0.0
         is_mhci = str(p.get("mhc_class") or "I").upper() not in {"II", "MHC-II", "CLASSII"}
         weighted_evidence = [(ba_s,w_ba),(el_s,w_el),(pres_s,w_mhcf),(proc_s,w_proc)]
@@ -163,6 +189,7 @@ def build_presentation_evidence(
             "prime_wt_rank": evidence_value("prime_wt_rank"),
             "bigmhc_im_wt_score": evidence_value("bigmhc_im_wt_score"),
             "binding_evidence_score": f"{binding:.4f}",
+            "binding_predictor_disagreement": binding_disagreement,
             "presentation_evidence_score": f"{presentation:.4f}",
             "evidence_completeness": f"{complete:.4f}",
             "presentation_evidence_grade": grade(binding, presentation, complete),

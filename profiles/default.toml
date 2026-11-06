@@ -42,6 +42,9 @@ netmhcpan_el = 0.35
 mhcflurry_presentation = 0.30
 mhcflurry_processing = 0.10
 netmhcstabpan_stability = 0.05
+# How the two binding predictors combine into binding_evidence_score:
+# max (default, optimistic - unchanged behaviour) | mean | min (conservative).
+binding_aggregation = "max"
 [score_weights]
 event_score = 0.35
 binding_evidence = 0.20

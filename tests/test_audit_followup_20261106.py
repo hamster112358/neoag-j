@@ -227,3 +227,93 @@ def test_unknown_sensitivity_mode_is_rejected():
 
     with pytest.raises(ValueError, match="unknown sensitivity mode"):
         weight_sensitivity_table(_sens_rows(3), {}, mode="everything")
+
+
+# --- APPM integration note / scoring investigation 6.2: binding aggregation
+# becomes a profile knob, and predictor disagreement is exported. The default
+# must stay the historical max() so existing runs reproduce byte-identically.
+
+def _binding_evidence(tmp_path, agg=None):
+    from neoag.config import load_profile
+    from neoag.presentation import build_presentation_evidence
+    from neoag.utils import read_tsv
+
+    hla = "HLA-A*02:01"
+    raw = tmp_path / "raw.tsv"
+    write_tsv(raw, [{
+        "peptide_id": "P1", "event_id": "E1", "peptide": "AAGIGILTV",
+        "hla_allele": hla, "mhc_class": "I",
+    }])
+    net = tmp_path / "net.tsv"
+    write_tsv(net, [{"peptide": "AAGIGILTV", "hla_allele": hla,
+                     "netmhcpan_ba_rank": "0.6", "netmhcpan_el_rank": "0.8"}])
+    mhc = tmp_path / "mhc.tsv"
+    write_tsv(mhc, [{"peptide": "AAGIGILTV", "hla_allele": hla,
+                     "mhcflurry_affinity_percentile": "3.0",
+                     "mhcflurry_processing_score": "0.7",
+                     "mhcflurry_presentation_score": "0.8"}])
+    if agg is None:
+        profile = load_profile("default")
+    else:
+        path = tmp_path / "profile.toml"
+        path.write_text(
+            "[presentation_weights]\n"
+            "netmhcpan_ba = 0.25\nnetmhcpan_el = 0.35\n"
+            "mhcflurry_presentation = 0.30\nmhcflurry_processing = 0.10\n"
+            "netchop_processing = 0.10\nnetmhcstabpan_stability = 0.05\n"
+            f'binding_aggregation = "{agg}"\n',
+            encoding="utf-8",
+        )
+        profile = load_profile(path)
+    out = tmp_path / "pres.tsv"
+    build_presentation_evidence(raw, net, mhc, profile, out)
+    return read_tsv(out)[0]
+
+
+def test_binding_evidence_default_stays_max(tmp_path):
+    row = _binding_evidence(tmp_path)
+    # BA rank 0.6 -> 1-0.6/10 = 0.94; MHCflurry percentile 3.0 -> 0.70.
+    assert row["binding_evidence_score"] == "0.9400"
+    assert row["binding_predictor_disagreement"] == "0.2400"
+    # The shipped default profile explicitly pins the historical behaviour.
+    from neoag.config import load_profile
+    assert load_profile("default")["presentation_weights"]["binding_aggregation"] == "max"
+
+
+def test_binding_aggregation_knob_mean_and_min(tmp_path):
+    mean = _binding_evidence(tmp_path / "mean", agg="mean")
+    mn = _binding_evidence(tmp_path / "min", agg="min")
+    assert mean["binding_evidence_score"] == "0.8200"
+    assert mn["binding_evidence_score"] == "0.7000"
+    # Disagreement is reported identically for every aggregation.
+    assert mean["binding_predictor_disagreement"] == mn["binding_predictor_disagreement"] == "0.2400"
+
+
+def test_binding_disagreement_blank_with_one_predictor(tmp_path):
+    from neoag.config import load_profile
+    from neoag.presentation import build_presentation_evidence
+    from neoag.utils import read_tsv
+
+    hla = "HLA-A*02:01"
+    raw = tmp_path / "raw.tsv"
+    write_tsv(raw, [{"peptide_id": "P1", "peptide": "AAGIGILTV",
+                     "hla_allele": hla, "mhc_class": "I"}])
+    net = tmp_path / "net.tsv"
+    write_tsv(net, [{"peptide": "AAGIGILTV", "hla_allele": hla,
+                     "netmhcpan_ba_rank": "0.6", "netmhcpan_el_rank": "0.8"}])
+    out = tmp_path / "pres.tsv"
+    build_presentation_evidence(raw, net, None, load_profile("default"), out)
+    row = read_tsv(out)[0]
+    assert row["binding_evidence_score"] == "0.9400"
+    assert row["binding_predictor_disagreement"] == ""
+
+
+def test_unknown_binding_aggregation_is_rejected(tmp_path):
+    import pytest
+    with pytest.raises(ValueError, match="binding_aggregation"):
+        _binding_evidence(tmp_path, agg="optimistic")
+
+
+def test_disagreement_column_in_presentation_schema():
+    from neoag.schemas import PRESENTATION_FIELDS
+    assert "binding_predictor_disagreement" in PRESENTATION_FIELDS

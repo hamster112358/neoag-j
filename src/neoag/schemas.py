@@ -125,7 +125,7 @@ PEPTIDE_FIELDS = [
     "mhcflurry_affinity_percentile","mhcflurry_processing_score","mhcflurry_presentation_score",
     "mhcflurry_mt_affinity_percentile","mhcflurry_mt_processing_score","mhcflurry_mt_presentation_score",
     "mhcflurry_wt_affinity_percentile","mhcflurry_wt_processing_score","mhcflurry_wt_presentation_score",
-    "binding_evidence_score","presentation_evidence_score","presentation_evidence_grade",
+    "binding_evidence_score","binding_predictor_disagreement","presentation_evidence_score","presentation_evidence_grade",
     "iedb_immunogenicity_score","immunogenicity_resolved",
     "prime_score","prime_rank","bigmhc_im_score","deepimmuno_score",
     "prime_wt_score","prime_wt_rank","bigmhc_im_wt_score",
@@ -192,7 +192,7 @@ PRESENTATION_FIELDS = [
     "netmhcpan_allele_support_status","mhcflurry_allele_support_status",
     "netmhcstabpan_allele_support_status","predictor_allele_support_status",
     "allele_extrapolation_status",
-    "binding_evidence_score","presentation_evidence_score",
+    "binding_evidence_score","binding_predictor_disagreement","presentation_evidence_score",
     "evidence_completeness","presentation_evidence_grade"
 ]
 
