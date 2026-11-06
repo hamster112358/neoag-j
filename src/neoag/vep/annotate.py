@@ -6,6 +6,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from ..utils import open_text_maybe_gz
+
 
 def load_vep_annotate_config(path: str | Path) -> dict[str, Any]:
     return tomllib.loads(Path(path).read_text(encoding="utf-8"))
@@ -52,6 +54,25 @@ def normalize_vep_cache_dir(cache_dir: str | Path | None) -> Path | None:
     if path.parent.name == "homo_sapiens":
         return path.parent.parent
     return path
+
+
+def csq_plugin_columns(vcf_path: str | Path) -> dict[str, bool]:
+    """Which protein-context plugin columns the CSQ Format really declares.
+
+    Review B1-04: adding --plugin only when a plugins dir exists proves the
+    flag was passed, not that VEP loaded the plugins and emitted their
+    columns.  This reads the produced VCF header.
+    """
+    wanted = {"WildtypeProtein": False, "FrameshiftSequence": False}
+    with open_text_maybe_gz(vcf_path) as fh:
+        for line in fh:
+            if line.startswith("##INFO=<ID=CSQ"):
+                for name in wanted:
+                    wanted[name] = name in line
+                break
+            if line.startswith("#CHROM"):
+                break
+    return wanted
 
 
 def build_vep_pvacseq_command(
@@ -139,4 +160,17 @@ def run_vep_pvacseq_annotate(
     subprocess.run(cmd, cwd=workdir or None, check=True)
     if index_vcf and str(out).endswith(".gz"):
         subprocess.run(["tabix", "-f", "-p", "vcf", str(out)], check=False)
-    return {"annotated_vcf": str(out), "command": " ".join(cmd)}
+    info = {"annotated_vcf": str(out), "command": " ".join(cmd)}
+    columns = csq_plugin_columns(out)
+    info["vep_plugin_columns"] = ";".join(
+        f"{name}={'yes' if present else 'no'}" for name, present in columns.items()
+    )
+    if plugins_dir:
+        missing = sorted(name for name, present in columns.items() if not present)
+        if missing:
+            raise RuntimeError(
+                "VEP was run with --plugin Wildtype/Frameshift but the output CSQ does not "
+                f"declare {', '.join(missing)}; the plugin failed to load and MT/WT protein "
+                f"context would be unavailable (review B1-04): {out}"
+            )
+    return info

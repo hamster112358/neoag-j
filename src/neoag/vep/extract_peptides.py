@@ -75,6 +75,27 @@ MULTI_AA_FRAMESHIFT = "frameshift"
 MULTI_AA_COMPLEX = "complex"
 
 # Categories excluded when exclude_multi_aa=True
+# Consequences that annotate a transcript region without changing more than
+# one amino acid themselves.  A compound term such as
+# "missense_variant&splice_region_variant" must NOT be classified as a
+# complex multi-residue change just because it lists two terms (review B2-05).
+MODIFIER_CONSEQUENCES = frozenset({
+    "splice_region_variant",
+    "intron_variant",
+    "synonymous_variant",
+    "stop_retained_variant",
+    "start_retained_variant",
+    "5_prime_UTR_variant",
+    "3_prime_UTR_variant",
+    "non_coding_transcript_exon_variant",
+    "non_coding_transcript_variant",
+    "upstream_gene_variant",
+    "downstream_gene_variant",
+    "coding_sequence_variant",
+    "mature_miRNA_variant",
+    "NMD_transcript_variant",
+})
+
 MULTI_AA_EXCLUDED_FLAGS = frozenset({
     MULTI_AA_SUBSTITUTION,
     MULTI_AA_INFRAME,
@@ -113,6 +134,7 @@ OUTPUT_FIELDS = [
     "mutation_position_in_peptide",
     "mutant_peptide",
     "wildtype_peptide",
+    "wt_peptide_status",
     "minigene",
     "minigene_nt",
     "in_normal_proteome",
@@ -219,14 +241,26 @@ def _open_vcf(path: Path):
 
 
 def _resolve_tumor_sample_index(header: list[str], tumor_sample_name: str | None) -> int | None:
-    """Return tumor sample column index, or None when VCF has no FORMAT/samples."""
+    """Return tumor sample column index, or None when VCF has no FORMAT/samples.
+
+    Review B2-04: no order-based guessing.  The old fallback returned column
+    10 for any multi-sample VCF whose requested name was absent, silently
+    reinterpreting (for example) matched-normal reads as tumor support.  A
+    single sample column is unambiguous; several columns without a matching
+    name is a configuration error and raises.
+    """
     if len(header) <= 9:
         return None
-    if tumor_sample_name and tumor_sample_name in header:
+    samples = header[9:]
+    if tumor_sample_name and tumor_sample_name in samples:
         return header.index(tumor_sample_name)
-    if len(header) > 10:
-        return 10
-    return 9
+    if len(samples) == 1:
+        return 9
+    raise ValueError(
+        "multi-sample VCF requires an explicit tumor sample name: "
+        f"requested {tumor_sample_name!r}, found sample columns {samples}. "
+        "Set inputs.tumor_sample_name (or --tumor-sample-name) to one of them."
+    )
 
 
 def _resolve_normal_sample_index(
@@ -350,13 +384,15 @@ def _is_protein_altering(cons_field: str, *, consequence_filter: str | None = No
     return bool(cons & PEPTIDE_CONSEQUENCES)
 
 
-def _csq_rank(parts: list[str], idx: dict[str, int]) -> tuple[int, int, int]:
+def _csq_rank(parts: list[str], idx: dict[str, int]) -> tuple[int, int]:
+    # Review B2-07: the third slot was a constant 0 (dead sort key) and has
+    # been removed.  Ties fall back to stable CSQ entry order, which is
+    # deterministic for a fixed VCF (pinned VEP version and input).
     mane = _field(parts, idx.get("MANE_SELECT", -1))
     canonical = _field(parts, idx.get("CANONICAL", -1))
     return (
         0 if mane in {"MANE_Select", "MANE"} else 1,
         0 if canonical == "YES" else 1,
-        0,
     )
 
 
@@ -366,7 +402,7 @@ def pick_csq_transcript(
     *,
     consequence_filter: str | None = None,
 ) -> list[str] | None:
-    candidates: list[tuple[tuple[int, int, int], list[str]]] = []
+    candidates: list[tuple[tuple[int, int], list[str]]] = []
     for parts in csq_entries:
         cons = _field(parts, idx["Consequence"])
         if not _is_protein_altering(cons, consequence_filter=consequence_filter):
@@ -575,8 +611,13 @@ def classify_multi_aa_flag(
     amino_acids: str,
     protein_position_raw: str,
 ) -> str:
-    """Classify whether one VEP record affects multiple amino acids."""
-    cons = _consequences(consequence)
+    """Classify whether one VEP record affects multiple amino acids.
+
+    Review B2-05: complexity is based on the actual protein delta, not the
+    number of consequence terms — modifier annotations (splice_region etc.)
+    riding along with a single missense call must not make it COMPLEX.
+    """
+    cons = {c for c in _consequences(consequence) if c not in MODIFIER_CONSEQUENCES}
     if len(cons) > 1:
         return MULTI_AA_COMPLEX
     if "frameshift_variant" in cons:
@@ -676,24 +717,17 @@ def build_mutant_protein(
         return mut, pos_start, pos_end
 
     if not wt:
-        # If VEP plugin protein context is absent, synthesize a minimal
-        # backbone from Amino_acids so missense/inframe calls can still yield
-        # candidate k-mers. This is a fallback, not a replacement for plugin
-        # backed full protein context.
-        if amino_acids and "/" in amino_acids and pos_start:
-            ref_token, alt_token = amino_acids.split("/", 1)
-            ref_aa = _clean_aa_token(ref_token)
-            alt_aa = _clean_aa_token(alt_token)
-            if ref_aa and alt_aa:
-                synthetic_len = 42
-                wt = ref_aa * synthetic_len
-                pos_start = synthetic_len // 2
-                pos_end = pos_start
-        if not wt:
-            if frameshift_sequence:
-                mut = _clean_protein(frameshift_sequence)
-                return mut, pos_start, pos_end
-            return "", None, None
+        # Review B2-01: the old fallback fabricated a wildtype protein as
+        # ref_aa * 42, so every mutant window got a fictional WT twin and all
+        # MT/WT binding, specificity and safety comparisons ran against
+        # invented sequence.  With no plugin WT context there is no honest
+        # protein to slide: the frameshift protein from VEP (real predicted
+        # sequence, not fabricated) still works, otherwise the caller
+        # records the drop and downstream sees WT_UNAVAILABLE.
+        if frameshift_sequence:
+            mut = _clean_protein(frameshift_sequence)
+            return mut, pos_start, pos_end
+        return "", None, None
 
     pos0 = pos_start - 1
     if pos0 < 0 or pos0 >= len(wt):
@@ -846,9 +880,12 @@ def extract_variant_peptides_from_vcf(
     variants_seen = 0
     variants_with_peptides = 0
     variants_skipped_multi_aa = 0
+    variants_dropped_no_protein_context = 0
     peptides_filtered_normal_proteome = 0
     peptide_counter = 0
     flag_counts: dict[str, int] = {}
+    filter_counts: dict[str, int] = {}
+    variants_no_peptides_by_consequence: dict[str, int] = {}
 
     with _open_vcf(path) as fh:
         for line in fh:
@@ -879,30 +916,12 @@ def extract_variant_peptides_from_vcf(
             if len(parts) < 8:
                 continue
             chrom, pos, _vid, ref, alt, _qual, filt = parts[:7]
+            # Review B2-06: record every FILTER value, PASS-only or not, so
+            # the acceptance funnel is auditable instead of silent.
+            filt_key = filt if filt else "."
+            filter_counts[filt_key] = filter_counts.get(filt_key, 0) + 1
             if pass_only and filt != "PASS":
                 continue
-
-            vaf = ""
-            tumor_depth = ""
-            tumor_alt_count = ""
-            normal_alt_vaf = ""
-            normal_depth = ""
-            normal_alt_count = ""
-            rna_vaf = ""
-            rna_alt_reads = ""
-            rna_depth = ""
-            if tumor_sample_idx is not None and len(parts) > tumor_sample_idx:
-                vaf, tumor_depth, tumor_alt_count = _parse_allele_metrics_from_format(
-                    parts[8], parts[tumor_sample_idx]
-                )
-            if normal_sample_idx is not None and len(parts) > normal_sample_idx:
-                normal_alt_vaf, normal_depth, normal_alt_count = _parse_allele_metrics_from_format(
-                    parts[8], parts[normal_sample_idx]
-                )
-            if rna_sample_idx is not None and len(parts) > rna_sample_idx:
-                rna_vaf, rna_depth, rna_alt_reads = _parse_allele_metrics_from_format(
-                    parts[8], parts[rna_sample_idx]
-                )
 
             info = parts[7]
             csq_raw = ""
@@ -920,6 +939,39 @@ def extract_variant_peptides_from_vcf(
             )
             if not picked:
                 continue
+
+            # Review B2-02: tie FORMAT metrics to the ALT allele the picked
+            # CSQ entry describes.  At a multiallelic site the peptide may
+            # come from ALT[1]; AD/DP/VAF must be read at that index, not
+            # silently at ALT[0].
+            alt_list = [a.strip() for a in alt.split(",")]
+            alt_index = 0
+            if len(alt_list) > 1:
+                csq_allele = _field(picked, csq_idx.get("Allele", 0))
+                if csq_allele in alt_list:
+                    alt_index = alt_list.index(csq_allele)
+
+            vaf = ""
+            tumor_depth = ""
+            tumor_alt_count = ""
+            normal_alt_vaf = ""
+            normal_depth = ""
+            normal_alt_count = ""
+            rna_vaf = ""
+            rna_alt_reads = ""
+            rna_depth = ""
+            if tumor_sample_idx is not None and len(parts) > tumor_sample_idx:
+                vaf, tumor_depth, tumor_alt_count = _parse_allele_metrics_from_format(
+                    parts[8], parts[tumor_sample_idx], alt_index=alt_index
+                )
+            if normal_sample_idx is not None and len(parts) > normal_sample_idx:
+                normal_alt_vaf, normal_depth, normal_alt_count = _parse_allele_metrics_from_format(
+                    parts[8], parts[normal_sample_idx], alt_index=alt_index
+                )
+            if rna_sample_idx is not None and len(parts) > rna_sample_idx:
+                rna_vaf, rna_depth, rna_alt_reads = _parse_allele_metrics_from_format(
+                    parts[8], parts[rna_sample_idx], alt_index=alt_index
+                )
 
             variants_seen += 1
             gene = _field(picked, csq_idx["SYMBOL"])
@@ -951,6 +1003,7 @@ def extract_variant_peptides_from_vcf(
                 frameshift_sequence=fs_protein,
             )
             if not mut_protein:
+                variants_dropped_no_protein_context += 1
                 continue
 
             fs_mode = sliding_full_mutant_mode(consequence, multi_aa_flag)
@@ -965,6 +1018,12 @@ def extract_variant_peptides_from_vcf(
                 )
             )
             if not variant_peps:
+                # Coverage fact, not an error (review B2-03): a pure
+                # stop_gained produces no novel junction peptide by
+                # construction; record it instead of staying silent.
+                variants_no_peptides_by_consequence[consequence] = (
+                    variants_no_peptides_by_consequence.get(consequence, 0) + 1
+                )
                 continue
 
             peptide_centered_minigene = multi_aa_flag in {
@@ -1025,6 +1084,10 @@ def extract_variant_peptides_from_vcf(
                     "protein_position": protein_position_raw,
                     "amino_acids": amino_acids,
                     "multi_aa_flag": multi_aa_flag,
+                    # Review B2-01: WT-dependent judgments (MT/WT binding,
+                    # specificity, safety) must see why no WT twin exists
+                    # rather than infer it from an empty field.
+                    "wt_peptide_status": "WT_AVAILABLE" if pep["wildtype_peptide"] else "WT_UNAVAILABLE",
                     "minigene": minigene,
                     "minigene_nt": minigene_nt,
                     "in_normal_proteome": in_normal,
@@ -1062,6 +1125,12 @@ def extract_variant_peptides_from_vcf(
         "variants_parsed": variants_seen,
         "variants_with_peptides": variants_with_peptides,
         "variants_skipped_multi_aa": variants_skipped_multi_aa,
+        "variants_dropped_no_protein_context": variants_dropped_no_protein_context,
+        "filter_status_counts": dict(sorted(filter_counts.items())),
+        "variants_no_peptides_by_consequence": dict(sorted(variants_no_peptides_by_consequence.items())),
+        "csq_wildtype_column": "yes" if csq_idx and csq_idx.get("WildtypeProtein", -1) >= 0 else "no",
+        "csq_frameshift_column": "yes" if csq_idx and csq_idx.get("FrameshiftSequence", -1) >= 0 else "no",
+        "tumor_sample_column": (header_cols[tumor_sample_idx] if tumor_sample_idx is not None and tumor_sample_idx < len(header_cols) else "none"),
         "peptide_rows": len(rows),
         "unique_mutant_peptides": len({r["mutant_peptide"] for r in rows}),
         "multi_aa_flag_counts": flag_counts,

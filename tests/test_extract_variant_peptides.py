@@ -50,7 +50,11 @@ def test_build_mutant_protein_missense():
     assert a0 == 3 and a1 == 3
 
 
-def test_build_mutant_protein_missense_without_plugin_context():
+def test_build_mutant_protein_missense_without_plugin_context_is_dropped():
+    # Review B2-01 regression fixture: the old code fabricated a wildtype
+    # protein as K * 42 centred at 21, so every mutant window had a fictional
+    # WT twin.  Without plugin WT context there is no honest protein, and the
+    # variant must yield nothing (the caller counts the drop).
     mut, a0, a1 = build_mutant_protein(
         "missense_variant",
         "",
@@ -58,9 +62,22 @@ def test_build_mutant_protein_missense_without_plugin_context():
         amino_acids="K/N",
         frameshift_sequence="",
     )
-    assert mut
-    assert "N" in mut
-    assert a0 == 21 and a1 == 21
+    assert mut == ""
+    assert a0 is None and a1 is None
+
+
+def test_build_mutant_protein_frameshift_without_wt_still_uses_vep_protein():
+    # FrameshiftSequence is real VEP-predicted sequence, not fabricated, so
+    # it remains usable when the WT plugin column is empty.
+    mut, a0, a1 = build_mutant_protein(
+        "frameshift_variant",
+        "",
+        protein_position_raw="10",
+        amino_acids="K/MA*",
+        frameshift_sequence="MAASAA",
+    )
+    assert mut == "MAASAA"
+    assert a0 == 10
 
 
 def test_pick_csq_transcript_accepts_amino_acids_without_plugin_context():

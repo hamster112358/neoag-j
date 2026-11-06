@@ -184,6 +184,10 @@ def resolve_variant_peptide_options(cfg: dict[str, Any], *, root: Path | None = 
         ),
         "exclude_multi_aa": bool(inputs.get("variant_peptide_exclude_multi_aa")),
         "single_aa_only": bool(inputs.get("variant_peptide_single_aa_only")),
+        # Review B2-06: PASS-only stays the production default, but it is an
+        # explicit, profile-visible setting that adapters forward — not a
+        # hard-coded drop the caller cannot see or override intentionally.
+        "pass_only": bool(inputs.get("variant_peptide_pass_only", True)),
         "normal_proteome_fasta": str(normal_fasta) if normal_fasta else None,
         "filter_normal_proteome": bool(filter_normal),
         "annotate_normal_proteome_only": annotate_only,
@@ -318,6 +322,7 @@ def run_variant_peptide_upstream(
             variant_tsv,
             lengths=opts["lengths"],
             sample_id=sample_id,
+            pass_only=opts["pass_only"],
             exclude_multi_aa=opts["exclude_multi_aa"],
             single_aa_only=opts["single_aa_only"],
             mini_len=opts["mini_len"],

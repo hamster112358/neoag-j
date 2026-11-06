@@ -55,15 +55,35 @@ def _open_vcf_text(path: Path):
 
 
 def vcf_has_csq_annotations(path: str | Path) -> bool:
-    """Return true when the VCF carries a VEP CSQ INFO definition."""
+    """True when the VCF declares the CSQ INFO field AND sampled records
+    actually carry a CSQ payload (review B1-05).
+
+    A header line only proves the schema was declared, not that the alleles
+    were annotated.  The first 500 data records are sampled; a VCF that
+    declares CSQ on every record produced none is treated as unannotated so
+    the auto-annotation path runs again.
+    """
     p = Path(path)
     if not p.is_file():
         return False
+    declared = False
+    sampled = 0
     with _open_vcf_text(p) as fh:
         for line in fh:
             if line.startswith("##INFO=<ID=CSQ"):
-                return True
-            if line.startswith("#CHROM"):
+                declared = True
+                continue
+            if line.startswith("#"):
+                continue
+            if not declared:
+                return False
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 8:
+                for item in parts[7].split(";"):
+                    if item.startswith("CSQ=") and len(item) > 4:
+                        return True
+            sampled += 1
+            if sampled >= 500:
                 return False
     return False
 
@@ -134,7 +154,11 @@ def _auto_annotate_variants_vcf(
     )
     if not vcf_has_csq_annotations(out_vcf):
         raise ValueError(f"Automatic VEP annotation did not produce CSQ annotations in {out_vcf}")
-    return out_vcf, {"vep_annotated_vcf": str(out_vcf), "vep_annotate_command": result.get("command", "")}
+    return out_vcf, {
+        "vep_annotated_vcf": str(out_vcf),
+        "vep_annotate_command": result.get("command", ""),
+        "vep_plugin_columns": result.get("vep_plugin_columns", ""),
+    }
 
 
 def build_context(cfg: dict, outdir: Path) -> RunContext:

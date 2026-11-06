@@ -7,10 +7,14 @@ from neoag.tools.registry import RunContext
 
 def test_vcf_has_csq_annotations_plain_file_with_gz_suffix(tmp_path):
     vcf = tmp_path / "annotated.vcf.gz"
+    # Review B1-05: a CSQ header alone no longer counts — the sampled record
+    # must actually carry a CSQ payload.  The point of this fixture is that a
+    # plain file with a .gz suffix is still read.
     vcf.write_text(
         '##fileformat=VCFv4.2\n'
         '##INFO=<ID=CSQ,Number=.,Type=String,Description="Format: Allele|Consequence">\n'
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        "chr1\t100\t.\tA\tT\t.\tPASS\tCSQ=T|missense_variant\n",
         encoding="utf-8",
     )
 
