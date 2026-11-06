@@ -128,6 +128,7 @@ PEPTIDE_FIELDS = [
     "mhcflurry_wt_affinity_percentile","mhcflurry_wt_processing_score","mhcflurry_wt_presentation_score",
     "binding_evidence_score","binding_predictor_disagreement","presentation_evidence_score","presentation_evidence_grade",
     "iedb_immunogenicity_score","immunogenicity_resolved",
+    "iedb_immunogenicity_local_estimate","iedb_immunogenicity_wt_local_estimate",
     "prime_score","prime_rank","bigmhc_im_score","deepimmuno_score",
     "prime_wt_score","prime_wt_rank","bigmhc_im_wt_score",
     "immunogenicity_composite_score","immunogenicity_source",
@@ -426,13 +427,19 @@ APPM_SUMMARY_FIELDS = [
 NETMHCPAN_EVIDENCE_FIELDS = [
     "sample_id", "peptide", "hla_allele", "peptide_hla_key",
     "netmhcpan_ba_score", "netmhcpan_ba_rank", "netmhcpan_el_score", "netmhcpan_el_rank",
+    # Review C1-11: the allele-support fact known at predict time (trained
+    # allele vs pseudoallele extrapolation vs unassessed mode) is recorded here
+    # so the declared presentation columns finally have a producer.
+    "netmhcpan_allele_support_status",
     "source_file",
 ] + EVIDENCE_PROVENANCE_FIELDS
 
 MHCFLURRY_EVIDENCE_FIELDS = [
     "sample_id", "peptide", "hla_allele", "peptide_hla_key",
     "mhcflurry_affinity", "mhcflurry_affinity_percentile",
-    "mhcflurry_processing_score", "mhcflurry_presentation_score", "source_file",
+    "mhcflurry_processing_score", "mhcflurry_presentation_score",
+    "mhcflurry_allele_support_status",
+    "source_file",
 ] + EVIDENCE_PROVENANCE_FIELDS
 
 NETMHCSTABPAN_EVIDENCE_FIELDS = [
@@ -453,7 +460,12 @@ DEEPIMMUNO_EVIDENCE_FIELDS = [
 ] + EVIDENCE_PROVENANCE_FIELDS
 
 IEDB_IMMUNOGENICITY_FIELDS = [
-    "sample_id", "peptide", "hla_allele", "iedb_immunogenicity_score", "source_file",
+    "sample_id", "peptide", "hla_allele", "iedb_immunogenicity_score",
+    # Review C1-05: a peptide the local scale cannot read (non-standard
+    # residue) is written blank WITH the reason, never as a crash or a
+    # silently coerced score.
+    "iedb_assessment_status",
+    "source_file",
 ] + EVIDENCE_PROVENANCE_FIELDS
 
 PURITY_EVIDENCE_FIELDS = ["sample_id", "purity"] + EVIDENCE_PROVENANCE_FIELDS

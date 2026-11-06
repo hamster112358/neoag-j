@@ -1,5 +1,8 @@
 from __future__ import annotations
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 from contextlib import contextmanager
@@ -767,6 +770,20 @@ def netmhcpan_soft_fail_enabled() -> bool:
     return os.environ.get("NEOAG_NETMHCPAN_SOFT_FAIL", "").strip().lower() in {"1", "true", "yes"}
 
 
+# Review C1-11: in allele mode NetMHCpan prints an explicit notice whenever
+# the requested allele is not among its trained alleles and a pseudoallele
+# matrix is substituted instead (the wording differs between 4.1/4.2 builds,
+# so match the term loosely). No such notice means the allele was used
+# directly; that is the strongest claim the tool's own output supports.
+_PSEUDOALLELLE_NOTICE_RE = re.compile(r"pseudo\s*-?\s*allele", re.IGNORECASE)
+
+
+def _netmhcpan_allele_support(stdout: str, stderr: str) -> str:
+    if _PSEUDOALLELLE_NOTICE_RE.search(f"{stdout}\n{stderr}"):
+        return "PSEUDOALLELE_EXTRAPOLATED"
+    return "TRAINED_ALLELE"
+
+
 def _run_netmhcpan_local(
     pairs: list[tuple[str, str]],
     out_xls: Path,
@@ -806,6 +823,12 @@ def _run_netmhcpan_local(
                 f"NetMHCpan 4.2 produced no binding rows for chunk {chunk_idx} "
                 f"({len(chunk)} peptide/HLA pairs).\nstdout tail:\n{proc.stdout[-2000:]}"
             )
+        # Review C1-11: -pmhc scores every allele with the single pan
+        # specificity model, and the PEPLIST output gives no per-allele
+        # trained/pseudoallele statement, so allele support is honestly
+        # recorded as unassessed instead of silently omitted.
+        for row in rows:
+            row["AlleleSupport"] = "ALLELE_SUPPORT_UNASSESSED"
         all_rows.extend(rows)
         print(f"netmhcpan local: {min(start_idx + chunk_size, len(pairs))}/{len(pairs)}", flush=True)
     write_netmhcpan_standard_xls(out_xls, all_rows)
@@ -880,6 +903,12 @@ def _run_netmhcpan_local_by_allele(
                     f"NetMHCpan allele-mode produced no rows for {hla} chunk "
                     f"{chunk_idx}; stdout tail:\n{proc.stdout[-2000:]}"
                 )
+            # Review C1-11: per-allele mode lets the tool's own output say
+            # whether this allele was trained or extrapolated; record that
+            # fact per row so it survives into the evidence table.
+            allele_support = _netmhcpan_allele_support(proc.stdout, proc.stderr)
+            for row in rows:
+                row["AlleleSupport"] = allele_support
             all_rows.extend(rows)
             completed += len(chunk)
             print(f"netmhcpan local allele-mode: {completed}/{total}", flush=True)
@@ -1578,6 +1607,57 @@ RUNNERS = {
 }
 
 
+REUSABLE_TOOLS = {"netmhcpan", "mhcflurry", "netmhcstabpan", "prime", "bigmhc_im", "deepimmuno"}
+
+
+def _tool_input_fingerprint(ctx: RunContext, name: str) -> dict[str, str]:
+    """What must not change for a stored tool output to stay valid (C1-06).
+
+    The peptide table bytes carry both the peptide set and the HLA notation,
+    so hashing the file covers the input side; predictor version covers the
+    software side; runner mode, stub flag and NetMHCpan backend cover the
+    configuration side. A file-exists check alone silently applied stale
+    predictions to changed peptides, new alleles or upgraded models.
+    """
+    from ..evidence_provenance import detect_tool_version
+
+    digest = hashlib.sha256()
+    peptides = getattr(ctx, "raw_peptides", None)
+    if peptides:
+        pep_path = Path(peptides)
+        if pep_path.is_file():
+            digest.update(pep_path.read_bytes())
+    return {
+        "tool": name,
+        "peptide_input_sha256": digest.hexdigest(),
+        "tool_version": str(detect_tool_version(name) or ""),
+        "runner_mode": str(_effective_mode(name).value),
+        "stub": "true" if ctx.stub else "false",
+        "netmhcpan_backend": resolve_netmhcpan_backend() if name == "netmhcpan" else "",
+    }
+
+
+def _tool_fingerprint_path(out_path: Path) -> Path:
+    return out_path.with_name(out_path.name + ".inputs.json")
+
+
+def _tool_fingerprint_matches(out_path: Path, fingerprint: dict[str, str]) -> bool:
+    """Stored sidecar must agree on every field; absent sidecar = no reuse."""
+    try:
+        stored = json.loads(_tool_fingerprint_path(out_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    return all(str(stored.get(key, "")) == value for key, value in fingerprint.items())
+
+
+def _write_tool_fingerprint(out_path: Path, fingerprint: dict[str, str]) -> None:
+    _tool_fingerprint_path(out_path).write_text(
+        json.dumps(fingerprint, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def run_tool(name: str, ctx: RunContext, output: str | Path) -> Path:
     if name not in RUNNERS:
         raise KeyError(f"No runner for tool '{name}'. Known: {sorted(RUNNERS)}")
@@ -1586,14 +1666,17 @@ def run_tool(name: str, ctx: RunContext, output: str | Path) -> Path:
 
     out_path = Path(output)
     force_rerun = os.environ.get("NEOAG_FORCE_TOOL_RERUN", "").strip().lower() in {"1", "true", "yes"}
-    if (
-        not force_rerun
-        and out_path.is_file()
-        and out_path.stat().st_size > 0
-        and name in {"netmhcpan", "mhcflurry", "netmhcstabpan", "prime", "bigmhc_im", "deepimmuno"}
-    ):
-        print(f"[runner] {name}: reuse existing {out_path}", flush=True)
-        return out_path.resolve()
+    reusable = name in REUSABLE_TOOLS
+    fingerprint = _tool_input_fingerprint(ctx, name) if reusable else None
+    if reusable and not force_rerun and out_path.is_file() and out_path.stat().st_size > 0:
+        if _tool_fingerprint_matches(out_path, fingerprint):
+            print(f"[runner] {name}: reuse existing {out_path} (input fingerprint matched)", flush=True)
+            return out_path.resolve()
+        print(
+            f"[runner] {name}: existing {out_path} does not carry this run's input fingerprint; "
+            "re-running instead of reusing (review C1-06)",
+            flush=True,
+        )
 
     mode = _effective_mode(name)
     if mode == RunnerMode.DOCKER:
@@ -1610,4 +1693,7 @@ def run_tool(name: str, ctx: RunContext, output: str | Path) -> Path:
             print(f"[runner] {name}: no docker image; falling back to conda", flush=True)
 
     with _tool_context(name):
-        return RUNNERS[name](ctx, Path(output))
+        result = RUNNERS[name](ctx, Path(output))
+    if reusable:
+        _write_tool_fingerprint(Path(result), fingerprint)
+    return result

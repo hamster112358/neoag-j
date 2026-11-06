@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,10 @@ BIGMHC_IM_ANNOTATION_FIELDS = (
 IEDB_ANNOTATION_FIELDS = (
     "iedb_immunogenicity_score",
     "iedb_immunogenicity_wt_score",
+    # Review C1-03: heuristic estimates live in their own columns, never in
+    # the tool-named iedb_immunogenicity_score column.
+    "iedb_immunogenicity_local_estimate",
+    "iedb_immunogenicity_wt_local_estimate",
 )
 
 BINDING_ANNOTATION_FIELDS = NETMHCPAN_ANNOTATION_FIELDS + MHCFLURRY_ANNOTATION_FIELDS
@@ -397,24 +402,44 @@ def _lookup_bigmhc_im(
     return rec.get("bigmhc_im_score", "")
 
 
+def _iedb_annotation_local_estimate_enabled() -> bool:
+    # Review C1-03: the anchor-mask/immunoscale heuristic must never be
+    # written into the tool-named evidence column by default. It is opt-in
+    # per run and its output only ever lands in *_local_estimate columns.
+    return os.environ.get("NEOAG_IEDB_ANNOTATION_LOCAL_ESTIMATE", "").strip().lower() in {
+        "1", "true", "yes",
+    }
+
+
 def _lookup_iedb_immunogenicity(
     peptide: str,
     allele: str,
     index: dict[tuple[str, str], dict[str, str]] | None,
-) -> str:
+) -> tuple[str, str]:
+    """Return (evidence_score, local_estimate) for one peptide/HLA pair.
+
+    Review C1-03: only the per-run IEDB evidence table may fill
+    iedb_immunogenicity_score; a missing pair is blank, not a disguised
+    heuristic. Review C1-05: the heuristic path goes through
+    predict_immunogenicity_checked, so one non-standard residue blanks its
+    own pair instead of raising KeyError through IMMUNOSCALE[aa].
+    """
     pep = peptide.strip().upper()
     hla = _normalize_hla(allele)
     if not pep or not hla:
-        return ""
+        return "", ""
     if index:
         rec = index.get((pep, hla))
         if rec:
             score = str(rec.get("iedb_immunogenicity_score", "")).strip()
             if score:
-                return score
-    from .iedb_immunogenicity import predict_immunogenicity
+                return score, ""
+    if not _iedb_annotation_local_estimate_enabled():
+        return "", ""
+    from .iedb_immunogenicity import predict_immunogenicity_checked
 
-    return f"{predict_immunogenicity(pep, hla):.5f}"
+    score, _status = predict_immunogenicity_checked(pep, hla)
+    return "", (f"{score:.5f}" if score is not None else "")
 
 
 def apply_extra_tool_annotations(
@@ -439,8 +464,8 @@ def apply_extra_tool_annotations(
         out["netmhcstabpan_wt_score"] = wt_stab.get("netmhcstabpan_score", "") if wt_stab else ""
         out["netmhcstabpan_wt_rank"] = wt_stab.get("netmhcstabpan_rank", "") if wt_stab else ""
     else:
-        out["netmhcstabpan_wt_score"] = "NA"
-        out["netmhcstabpan_wt_rank"] = "NA"
+        out["netmhcstabpan_wt_score"] = ""
+        out["netmhcstabpan_wt_rank"] = ""
 
     prime_score, prime_rank = _lookup_prime(
         mt_peptide,
@@ -460,23 +485,33 @@ def apply_extra_tool_annotations(
         out["prime_wt_score"] = prime_wt_score
         out["prime_wt_rank"] = prime_wt_rank
     else:
-        out["prime_wt_score"] = "NA"
-        out["prime_wt_rank"] = "NA"
+        out["prime_wt_score"] = ""
+        out["prime_wt_rank"] = ""
 
     out["bigmhc_im_score"] = _lookup_bigmhc_im(mt_peptide, allele, bigmhc_im_index)
     if wt and allele:
         out["bigmhc_im_wt_score"] = _lookup_bigmhc_im(wt, allele, bigmhc_im_index)
     else:
-        out["bigmhc_im_wt_score"] = "NA"
-    out["iedb_immunogenicity_score"] = _lookup_iedb_immunogenicity(
+        out["bigmhc_im_wt_score"] = ""
+    # Review C1-04: every missingness path here is "" (the one representation
+    # the rest of the pipeline understands); the old "NA" strings were
+    # non-empty, so comprehensive_evidence's first-non-empty precedence let
+    # them block a real value coming from another source.
+    iedb_mt_score, iedb_mt_estimate = _lookup_iedb_immunogenicity(
         mt_peptide,
         allele,
         iedb_immunogenicity_index,
     )
-    out["iedb_immunogenicity_wt_score"] = (
-        _lookup_iedb_immunogenicity(wt, allele, iedb_immunogenicity_index)
-        if wt and allele else "NA"
-    )
+    if wt and allele:
+        iedb_wt_score, iedb_wt_estimate = _lookup_iedb_immunogenicity(
+            wt, allele, iedb_immunogenicity_index,
+        )
+    else:
+        iedb_wt_score, iedb_wt_estimate = "", ""
+    out["iedb_immunogenicity_score"] = iedb_mt_score
+    out["iedb_immunogenicity_wt_score"] = iedb_wt_score
+    out["iedb_immunogenicity_local_estimate"] = iedb_mt_estimate
+    out["iedb_immunogenicity_wt_local_estimate"] = iedb_wt_estimate
 
     for col in TOOL_ANNOTATION_FIELDS:
         out.setdefault(col, "")
@@ -558,8 +593,11 @@ def annotate_variant_peptide_row(
         )
         bind_hla = bind_hla or ""
     out["hla_allele"] = bind_hla or row_hla or ""
-    if not out["hla_allele"] and hla_alleles and mt_peptide:
-        out["hla_allele"] = _normalize_hla(hla_alleles[0])
+    # Review C1-08: when no predictor produced a score for any requested
+    # allele, the restricting HLA is UNKNOWN - assigning hla_alleles[0] here
+    # fabricated a binding-allele label that downstream attribution then
+    # trusted. The requested pool stays recorded, untouched, in
+    # sample_hla_alleles (set above).
     if mt_pred:
         out["netmhcpan_mt_ic50"] = mt_pred.get("netmhcpan_ba_score", "")
         out["netmhcpan_mt_rank_ba"] = mt_pred.get("netmhcpan_ba_rank", "")

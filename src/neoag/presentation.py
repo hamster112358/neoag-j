@@ -1,9 +1,46 @@
 from __future__ import annotations
+import math
 from pathlib import Path
-from .utils import read_tsv, write_tsv, to_float, norm_rank, clamp, safe_id
+from .utils import MISSING, read_tsv, write_tsv, to_float, norm_rank, clamp, safe_id
 from .schemas import PRESENTATION_FIELDS
 from .evidence_provenance import ProvenanceRecord, ProvenanceRegistry, provenance_derived, attach_provenance
 from .adapters.peptide_input import normalize_hla_allele
+
+
+def _persist_number(raw) -> str:
+    """Review C1-02/C1-09: persist measured values only - absence is "".
+
+    The old to_float(x, 99.0/0.0) writes turned "no prediction for this pair"
+    into the strings 99.0 / 0.0, which every flat-TSV reader downstream
+    (evidence states, consensus tie-breaks, reports) could not tell apart
+    from a genuinely worst or best measurement. Scoring already treats "" as
+    missing; the persisted column now agrees with what was scored.
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text or text in MISSING:
+        return ""
+    value = to_float(text, float("nan"))
+    if math.isnan(value):
+        return ""
+    return str(value)
+
+
+def _allele_support_rollup(*statuses: str) -> str:
+    """Most pessimistic per-tool allele-support statement, "" if none assessed.
+
+    Review C1-11 vocabulary: TRAINED_ALLELE (predictor used the requested
+    allele's own model) < MODEL_COVERAGE_UNASSESSED (tool ran but its
+    per-allele coverage is not recorded) < PSEUDOALLELE_EXTRAPOLATED (the
+    tool said the allele was replaced by a pseudoallele matrix).
+    """
+    present = [status for status in statuses if status]
+    if not present:
+        return ""
+    if "PSEUDOALLELE_EXTRAPOLATED" in present:
+        return "PSEUDOALLELE_EXTRAPOLATED"
+    if all(status == "TRAINED_ALLELE" for status in present):
+        return "TRAINED_ALLELE"
+    return "MODEL_COVERAGE_UNASSESSED"
 
 def by_key(rows):
     result = {}
@@ -137,6 +174,28 @@ def build_presentation_evidence(
         binding_disagreement = (
             f"{abs(ba_s - pct_s):.4f}" if ba_s is not None and pct_s is not None else ""
         )
+        # Review C1-11: the allele-support facts that the producers record
+        # (NetMHCpan mode detection in the runner; per-tool coverage marks in
+        # the parsers) are copied onto the presentation row; evidence that
+        # predates the producers says UNASSESSED, never a guessed "trained".
+        net_support = (
+            str(n.get("netmhcpan_allele_support_status") or "").strip()
+            or ("ALLELE_SUPPORT_UNASSESSED" if n else "")
+        )
+        mhc_support = (
+            str(m.get("mhcflurry_allele_support_status") or "").strip()
+            or ("MODEL_COVERAGE_UNASSESSED" if m else "")
+        )
+        stab_support = (
+            str(s.get("netmhcstabpan_allele_support_status") or "").strip()
+            or ("MODEL_COVERAGE_UNASSESSED" if s else "")
+        )
+        if net_support == "PSEUDOALLELE_EXTRAPOLATED":
+            extrapolation = "EXTRAPOLATED"
+        elif net_support == "TRAINED_ALLELE":
+            extrapolation = "NOT_EXTRAPOLATED"
+        else:
+            extrapolation = "UNASSESSED"
         num = den = 0.0
         is_mhci = str(p.get("mhc_class") or "I").upper() not in {"II", "MHC-II", "CLASSII"}
         weighted_evidence = [(ba_s,w_ba),(el_s,w_el),(pres_s,w_mhcf),(proc_s,w_proc)]
@@ -169,30 +228,37 @@ def build_presentation_evidence(
             "wildtype_peptide": wt_peptide,
             "hla_allele": p.get("hla_allele",""),
             "mhc_class": p.get("mhc_class",""),
-            "netmhcpan_ba_rank": str(to_float(ba, 99.0)),
-            "netmhcpan_el_rank": str(to_float(el, 99.0)),
+            "netmhcpan_ba_rank": _persist_number(ba),
+            "netmhcpan_el_rank": _persist_number(el),
             "netmhcpan_mt_rank_ba": evidence_value("netmhcpan_mt_rank_ba", ba),
             "netmhcpan_mt_rank_el": evidence_value("netmhcpan_mt_rank_el", el),
             "netmhcpan_wt_rank_ba": wt_n.get("netmhcpan_ba_rank") or evidence_value("netmhcpan_wt_rank_ba"),
             "netmhcpan_wt_rank_el": wt_n.get("netmhcpan_el_rank") or evidence_value("netmhcpan_wt_rank_el"),
-            "netmhcstabpan_score": str(to_float(s.get("netmhcstabpan_score"), 0.0)) if s else "",
-            "netmhcstabpan_rank": str(to_float(s.get("netmhcstabpan_rank"), 99.0)) if s else "",
-            "netmhcstabpan_wt_score": str(to_float(wt_s.get("netmhcstabpan_score"), 0.0)) if wt_s else "",
-            "netmhcstabpan_wt_rank": str(to_float(wt_s.get("netmhcstabpan_rank"), 99.0)) if wt_s else "",
+            "netmhcstabpan_score": _persist_number(s.get("netmhcstabpan_score")),
+            "netmhcstabpan_rank": _persist_number(s.get("netmhcstabpan_rank")),
+            "netmhcstabpan_wt_score": _persist_number(wt_s.get("netmhcstabpan_score")),
+            "netmhcstabpan_wt_rank": _persist_number(wt_s.get("netmhcstabpan_rank")),
             "netchop_31d_max_score": c.get("netchop_31d_max_score", ""),
             "netchop_31d_mean_score": c.get("netchop_31d_mean_score", ""),
             "netchop_31d_cterm_score": c.get("netchop_31d_cterm_score", ""),
             "netchop_31d_cleavage_sites": c.get("netchop_31d_cleavage_sites", ""),
             "netchop_processing_status": c.get("netchop_processing_status", "ASSESSED" if c else "UNASSESSED"),
-            "mhcflurry_affinity_percentile": str(to_float(pct, 99.0)),
-            "mhcflurry_processing_score": str(to_float(proc, 0.0)),
-            "mhcflurry_presentation_score": str(to_float(pres, 0.0)),
+            "mhcflurry_affinity_percentile": _persist_number(pct),
+            "mhcflurry_processing_score": _persist_number(proc),
+            "mhcflurry_presentation_score": _persist_number(pres),
             "mhcflurry_wt_affinity_percentile": wt_m.get("mhcflurry_affinity_percentile") or evidence_value("mhcflurry_wt_affinity_percentile"),
             "mhcflurry_wt_processing_score": wt_m.get("mhcflurry_processing_score") or evidence_value("mhcflurry_wt_processing_score"),
             "mhcflurry_wt_presentation_score": wt_m.get("mhcflurry_presentation_score") or evidence_value("mhcflurry_wt_presentation_score"),
             "prime_wt_score": evidence_value("prime_wt_score"),
             "prime_wt_rank": evidence_value("prime_wt_rank"),
             "bigmhc_im_wt_score": evidence_value("bigmhc_im_wt_score"),
+            "netmhcpan_allele_support_status": net_support,
+            "mhcflurry_allele_support_status": mhc_support,
+            "netmhcstabpan_allele_support_status": stab_support,
+            "predictor_allele_support_status": _allele_support_rollup(
+                net_support, mhc_support, stab_support,
+            ),
+            "allele_extrapolation_status": extrapolation,
             "binding_evidence_score": f"{binding:.4f}",
             "binding_predictor_disagreement": binding_disagreement,
             "presentation_evidence_score": f"{presentation:.4f}",

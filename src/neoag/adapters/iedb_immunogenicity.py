@@ -80,6 +80,33 @@ IMMUNOSCALE: dict[str, float] = {
 }
 IMMUNOWEIGHT_BASE = [0.00, 0.00, 0.10, 0.31, 0.30, 0.29, 0.26, 0.18, 0.00]
 
+# Review C1-05: the IMMUNOSCALE above is the complete alphabet this
+# deterministic heuristic can read. Peptides from SV/fusion ORFs can contain
+# non-standard residues (X/U/B/Z/* and friends); those must never crash a
+# whole annotation batch nor be silently coerced into a standard residue.
+SUPPORTED_RESIDUES = frozenset(IMMUNOSCALE)
+
+
+def nonstandard_residues(peptide: str) -> str:
+    """Sorted unique residues the immunoscale has no value for ("" if clean)."""
+    bad = {aa for aa in str(peptide or "").strip().upper() if aa not in SUPPORTED_RESIDUES}
+    return "".join(sorted(bad))
+
+
+def predict_immunogenicity_checked(peptide: str, hla: str) -> tuple[float | None, str]:
+    """(score, status) without ever raising for an unreadable peptide.
+
+    score is None when the heuristic cannot assess the pair; status records
+    why, so a blank score is distinguishable from a measured poor score.
+    """
+    pep = str(peptide or "").strip().upper()
+    if not pep:
+        return None, "UNASSESSED_EMPTY_PEPTIDE"
+    bad = nonstandard_residues(pep)
+    if bad:
+        return None, f"UNASSESSED_NONSTANDARD_RESIDUE:{bad}"
+    return predict_immunogenicity(pep, hla), "ASSESSED"
+
 
 def iedb_allele_key(hla: str) -> str:
     s = hla.strip().upper()
@@ -98,8 +125,18 @@ def _mask_positions(hla: str) -> list[int]:
 
 
 def predict_immunogenicity(peptide: str, hla: str) -> float:
-    """Return IEDB immunogenicity score (>0 favors response)."""
+    """Return IEDB immunogenicity score (>0 favors response).
+
+    Raises a clean ValueError for residues the scale cannot read; callers
+    processing mixed-quality peptides should use predict_immunogenicity_checked.
+    """
     peptide = peptide.strip().upper()
+    bad = nonstandard_residues(peptide)
+    if bad:
+        raise ValueError(
+            f"IEDB immunogenicity scale has no value for residue(s) {bad!r} "
+            f"in {peptide!r}; use predict_immunogenicity_checked to score the batch"
+        )
     mask_num = _mask_positions(hla)
     if -1 in mask_num:
         mask_num = [m if m >= 0 else len(peptide) - 1 for m in mask_num]
@@ -122,10 +159,14 @@ def predict_immunogenicity(peptide: str, hla: str) -> float:
 def predict_pairs(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for peptide, hla in pairs:
+        # Review C1-05: one non-standard residue must blank its own row and
+        # carry the reason, never abort the batch ("one X kills the run").
+        score, status = predict_immunogenicity_checked(peptide, hla)
         rows.append({
             "peptide": peptide,
             "hla_allele": hla,
-            "iedb_immunogenicity_score": f"{predict_immunogenicity(peptide, hla):.5f}",
+            "iedb_immunogenicity_score": f"{score:.5f}" if score is not None else "",
+            "iedb_assessment_status": status,
             "iedb_allele_key": iedb_allele_key(hla),
             "iedb_mask_known": "yes" if iedb_allele_key(hla) in ALLELE_MASK else "no",
         })

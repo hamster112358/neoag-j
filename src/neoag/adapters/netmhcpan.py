@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..utils import split_ws_or_tab, to_float, safe_id
+from ..utils import MISSING, split_ws_or_tab, to_float, safe_id
 from ..schemas import NETMHCPAN_EVIDENCE_FIELDS
 from ..evidence_provenance import (
     ProvenanceRecord,
@@ -12,8 +12,13 @@ from ..evidence_provenance import (
     MODE_PASSTHROUGH,
 )
 
+# The ninth column is neoag-written bookkeeping (review C1-11): NetMHCpan
+# itself never emits it, but the tool runner records per-row whether the
+# allele was trained or replaced by a pseudoallele, and that fact must
+# survive the xls -> evidence-TSV hop.
 STANDARD_XLS_HEADER = [
     "Pos", "Peptide", "HLA", "Score_EL", "%Rank_EL", "Score_BA", "%Rank_BA", "BindLevel",
+    "AlleleSupport",
 ]
 
 
@@ -83,8 +88,25 @@ def write_netmhcpan_standard_xls(path: str | Path, rows: list[dict[str, str]]) -
             row.get("Score_BA", ""),
             row.get("%Rank_BA", ""),
             row.get("BindLevel", ""),
+            row.get("AlleleSupport", ""),
         ]))
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rank_or_blank(*candidates: str) -> str:
+    """Review C1-02: an absent metric stays "" - never the old 99/0 sentinel.
+
+    A real file column that exists but is empty is missing data; the old
+    "99"/"0" defaults made it indistinguishable from a worst/best measurement
+    and those sentinels then leaked into ranking and tie-breaks (D1/D3).
+    """
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if text and text not in MISSING:
+            value = to_float(text, float("nan"))
+            if value == value:  # keep only values that actually parse
+                return str(value)
+    return ""
 
 
 def parse_netmhcpan(path: str | Path, sample_id: str = "") -> list[dict[str, str]]:
@@ -106,18 +128,31 @@ def parse_netmhcpan(path: str | Path, sample_id: str = "") -> list[dict[str, str
             allele = _hla_with_star(allele)
             if not peptide or not allele:
                 continue
-            ba_rank = rec.get("%Rank_BA") or rec.get("Rank_BA") or rec.get("BA_Rank") or rec.get("BA_rank") or rec.get("Rank") or "99"
-            el_rank = rec.get("%Rank_EL") or rec.get("Rank_EL") or rec.get("EL_Rank") or rec.get("EL_rank") or rec.get("Rank") or "99"
-            ba_score = rec.get("Score_BA") or rec.get("BA_score") or rec.get("Score") or "0"
             rows.append({
                 "sample_id": sample_id,
                 "peptide": peptide,
                 "hla_allele": allele,
                 "peptide_hla_key": safe_id(f"{peptide}_{allele}"),
-                "netmhcpan_ba_score": str(to_float(ba_score, 0.0)),
-                "netmhcpan_ba_rank": str(to_float(ba_rank, 99.0)),
-                "netmhcpan_el_score": str(to_float(rec.get("Score_EL") or rec.get("Score"), 0.0)),
-                "netmhcpan_el_rank": str(to_float(el_rank, 99.0)),
+                "netmhcpan_ba_score": _rank_or_blank(
+                    rec.get("Score_BA"), rec.get("BA_score"), rec.get("Score"),
+                ),
+                "netmhcpan_ba_rank": _rank_or_blank(
+                    rec.get("%Rank_BA"), rec.get("Rank_BA"), rec.get("BA_Rank"),
+                    rec.get("BA_rank"), rec.get("Rank"),
+                ),
+                "netmhcpan_el_score": _rank_or_blank(
+                    rec.get("Score_EL"), rec.get("Score"),
+                ),
+                "netmhcpan_el_rank": _rank_or_blank(
+                    rec.get("%Rank_EL"), rec.get("Rank_EL"), rec.get("EL_Rank"),
+                    rec.get("EL_rank"), rec.get("Rank"),
+                ),
+                # Written by write_netmhcpan_standard_xls for neoag tool runs;
+                # absent (-> "") for third-party tables, where presentation
+                # then records the support as unassessed rather than guessing.
+                "netmhcpan_allele_support_status": str(
+                    rec.get("AlleleSupport") or rec.get("allele_support") or ""
+                ).strip(),
                 "source_file": str(p),
             })
     return rows

@@ -103,7 +103,21 @@ def test_annotate_variant_peptide_rows_adds_stabpan_prime_bigmhc(tmp_path):
     assert out[0]["netmhcstabpan_score"] == "1.5"
     assert out[0]["prime_score"] == "0.42"
     assert out[0]["bigmhc_im_score"] == "0.8123"
-    assert out[0]["iedb_immunogenicity_score"]
+    # Review C1-03: no IEDB evidence table was supplied, so the tool-named
+    # column stays blank; the local heuristic no longer masquerades as IEDB
+    # output by default.
+    assert out[0]["iedb_immunogenicity_score"] == ""
+    assert out[0]["iedb_immunogenicity_local_estimate"] == ""
+
+
+def test_iedb_annotation_local_estimate_is_opt_in_and_separate(tmp_path, monkeypatch):
+    # Review C1-03: explicitly enabled, the heuristic is still kept OUT of
+    # the tool-named evidence column - it lands in *_local_estimate.
+    monkeypatch.setenv("NEOAG_IEDB_ANNOTATION_LOCAL_ESTIMATE", "1")
+    rows = [{"mutant_peptide": "CDENGHIK", "wildtype_peptide": "", "hla_allele": "HLA-A*02:06"}]
+    out = annotate_variant_peptide_rows(rows, ["HLA-A*02:06"])
+    assert out[0]["iedb_immunogenicity_score"] == ""
+    assert out[0]["iedb_immunogenicity_local_estimate"] != ""
 
 
 def test_annotate_variant_peptide_rows_adds_iedb_from_evidence_tsv(tmp_path):
@@ -247,7 +261,10 @@ def test_annotate_variant_peptide_row_adds_wt_external_tool_scores():
     assert out["bigmhc_im_wt_score"] == "0.1"
 
 
-def test_annotate_variant_peptide_row_sets_wt_tool_scores_na_for_fusion_without_wt():
+def test_annotate_variant_peptide_row_blanks_wt_tool_scores_for_fusion_without_wt():
+    # Review C1-04: missing WT metrics are "" (one missingness
+    # representation); "NA" was non-empty and could block a real value
+    # from another source in first-non-empty merge precedence.
     row = {
         "mutant_peptide": "FUSIYPEP",
         "wildtype_peptide": "",
@@ -256,6 +273,8 @@ def test_annotate_variant_peptide_row_sets_wt_tool_scores_na_for_fusion_without_
     }
     out = annotate_variant_peptide_row(row, ["HLA-A*02:06"])
     assert out["peptide_source"] == "easyfuse"
-    assert out["prime_wt_score"] == "NA"
-    assert out["prime_wt_rank"] == "NA"
-    assert out["bigmhc_im_wt_score"] == "NA"
+    assert out["prime_wt_score"] == ""
+    assert out["prime_wt_rank"] == ""
+    assert out["bigmhc_im_wt_score"] == ""
+    assert out["netmhcstabpan_wt_score"] == ""
+    assert out["netmhcstabpan_wt_rank"] == ""
