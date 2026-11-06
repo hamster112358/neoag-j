@@ -1,51 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping
 
-
-@dataclass(frozen=True)
-class EvidenceState:
-    """Availability/consistency state, separate from biological favorability."""
-
-    name: str
-    score_modifier: float
-
-
-STATES = {
-    "SUPPORTED": EvidenceState("SUPPORTED", 1.0),
-    "PARTIAL": EvidenceState("PARTIAL", 0.75),
-    "MISSING": EvidenceState("MISSING", 0.0),
-    "CONFLICT": EvidenceState("CONFLICT", 0.5),
-}
+from .status_words import contains_positive
 
 MISSING_TOKENS = ("UNASSESSED", "MISSING", "NOT_AVAILABLE", "NOT ASSESSED", "UNRESOLVED", "NO_EVIDENCE")
 CONFLICT_TOKENS = ("CONFLICT", "DISCORDANT", "INCONSISTENT")
 PARTIAL_TOKENS = ("PARTIAL", "CAUTION", "REVIEW", "LOW_CONFIDENCE", "LOW EVIDENCE")
-SUPPORTED_TOKENS = ("PASS", "SUPPORTED", "ASSESSED", "INTACT", "COMPLETE", "HIGH_CONFIDENCE")
-
-
-def evidence_state(value: str | None, *, numeric_present: bool = False) -> str:
-    """Classify availability; FAIL/REJECT are assessed negative evidence."""
-
-    text = str(value or "").strip().upper()
-    if any(token in text for token in CONFLICT_TOKENS):
-        return "CONFLICT"
-    if any(token in text for token in MISSING_TOKENS):
-        return "MISSING"
-    if any(token in text for token in PARTIAL_TOKENS):
-        return "PARTIAL"
-    if text in {"A", "B"}:
-        return "SUPPORTED"
-    if text == "C":
-        return "PARTIAL"
-    if text in {"D", "FAIL", "REJECT", "ESCAPE_REJECT"}:
-        return "SUPPORTED"
-    if any(token in text for token in SUPPORTED_TOKENS):
-        return "SUPPORTED"
-    if text:
-        return "PARTIAL"
-    return "SUPPORTED" if numeric_present else "MISSING"
+# Review D1-05: the dead evidence_state() classifier (and its STATES table /
+# SUPPORTED_TOKENS list) was deleted; every live derive_* function below is
+# the only vocabulary consumer and now matches positive tokens through
+# contains_positive() so negated tokens ("NOT_PASSED", "NOT_ALT_SUPPORTED")
+# cannot flip a verdict.
 
 
 def _section(rules: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -221,16 +187,16 @@ def derive_event_authenticity(row: Mapping[str, Any], rules: Mapping[str, Any]) 
     if "SOURCE_PASS_NOT_REPRODUCED_BY_PILEUP" in cross or any(token in cross for token in CONFLICT_TOKENS):
         return _result("EVENT_CONFLICT", 0, f"discordant event evidence: {cross}", conflict=True)
     normal_junction_assessed = normal_junction and not any(token in normal_junction for token in ("UNASSESSED", "MISSING", "NOT_AVAILABLE", "NOT_DETECTED"))
-    if "NORMAL_SUPPORT_REVIEW" in cross or normal_junction_assessed and any(token in normal_junction for token in ("DETECTED", "EXACT_MATCH", "SUPPORTED_IN_NORMAL")):
+    if "NORMAL_SUPPORT_REVIEW" in cross or normal_junction_assessed and any(contains_positive(normal_junction, token) for token in ("DETECTED", "EXACT_MATCH", "SUPPORTED_IN_NORMAL")):
         if normal_junction_assessed:
             return _result("EVENT_ARTIFACT_RISK", 0, f"normal junction detected: {normal_junction}", hard_fail=True, hard_code="HARD_NORMAL_JUNCTION")
         return _result("EVENT_ARTIFACT_RISK", 0, f"normal-background review: {cross or normal_junction}")
-    if any(token in filter_status for token in ("FAIL", "REJECT", "ARTIFACT")):
+    if any(contains_positive(filter_status, token) for token in ("FAIL", "REJECT", "ARTIFACT")):
         return _result("EVENT_ARTIFACT_RISK", 0, f"filter_status={filter_status}", hard_fail=True, hard_code="HARD_EVENT_ARTIFACT")
     normal_alt = _float(row, "normal_alt_count")
     normal_vaf = _float(row, "normal_alt_vaf")
     normal_status = _text(row, "matched_normal_status", "normal_support_status")
-    if (normal_alt is not None and normal_alt >= 2 and normal_vaf is not None and normal_vaf >= 0.01) or "ALT_SUPPORTED" in normal_status:
+    if (normal_alt is not None and normal_alt >= 2 and normal_vaf is not None and normal_vaf >= 0.01) or contains_positive(normal_status, "ALT_SUPPORTED"):
         return _result("EVENT_ARTIFACT_RISK", 0, f"matched-normal ALT support: count={normal_alt}; VAF={normal_vaf}; status={normal_status}", hard_fail=True, hard_code="HARD_MATCHED_NORMAL_SUPPORT")
     if "CROSS_PLATFORM_PASS_CONCORDANT" in cross:
         return _result("EVENT_CONFIRMED", 3, cross)
@@ -254,7 +220,7 @@ def derive_event_authenticity(row: Mapping[str, Any], rules: Mapping[str, Any]) 
             return _result("EVENT_STRONG", 2, f"junction reads={reads:g}; callers={caller_count}; frame={frame or 'unassessed'}")
         if reads is not None:
             return _result("EVENT_PARTIAL", 1, f"junction reads={reads:g} below {minimum:g}")
-    if "PASS" in cross or "CONCORDANT" in cross or "HIGH_CONFIDENCE" in phasing:
+    if contains_positive(cross, "PASS") or contains_positive(cross, "CONCORDANT") or contains_positive(phasing, "HIGH_CONFIDENCE"):
         return _result("EVENT_STRONG", 2, f"cross-platform/phasing support: {cross or phasing}")
     if cross or phasing:
         return _result("EVENT_PARTIAL", 1, f"event evidence requires review: {cross or phasing}")
@@ -265,7 +231,7 @@ def derive_rna_support(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dict
     cfg = _section(rules, "rna")
     track = event_track(row)
     status = _text(row, "rna_support_status", "expression_evidence_status", "rna_evidence_completeness")
-    if "RNA_ALT_SUPPORTED" in status or "RNA_JUNCTION_SUPPORTED" in status:
+    if contains_positive(status, "RNA_ALT_SUPPORTED") or contains_positive(status, "RNA_JUNCTION_SUPPORTED"):
         # An upstream status is only confirmation when the numbers behind it hold
         # up: an unsupported status string (evidence_layer marks alt>0 as
         # RNA_ALT_SUPPORTED) must not outrank the numeric thresholds below.
@@ -431,7 +397,7 @@ def derive_mutant_specificity(row: Mapping[str, Any], rules: Mapping[str, Any]) 
         return _result("MT_WT_SIMILAR", 1, status or gate)
     if "MARGINAL_MT_ADVANTAGE" in status or "MARGINAL_MT_ADVANTAGE" in gate:
         return _result("MARGINAL_MT_ADVANTAGE", 1, status or gate)
-    if "MT_SPECIFIC" in status or "MT_SPECIFIC" in gate or "PASS" in gate or "MT_BETTER" in gate:
+    if contains_positive(status, "MT_SPECIFIC") or contains_positive(gate, "MT_SPECIFIC") or contains_positive(gate, "PASS") or contains_positive(gate, "MT_BETTER"):
         return _result("MT_SPECIFIC", 3, status or gate)
     if "UNASSESSED" in gate or not gate:
         if mutant and not wildtype and explicit_novel:
@@ -491,7 +457,7 @@ def derive_hla_appm_state(row: Mapping[str, Any], rules: Mapping[str, Any]) -> d
     if lost in {"YES", "TRUE", "1"}:
         return _result("RESTRICTING_HLA_LOST", 0, f"restricting HLA confirmed lost: {lost}", hard_fail=True, hard_code="HARD_RESTRICTING_HLA_LOST")
     action = _text(row, "appm_action")
-    if "ESCAPE_REJECT" in status or any(token in action for token in ("REJECT", "BLOCK")):
+    if contains_positive(status, "ESCAPE_REJECT") or any(contains_positive(action, token) for token in ("REJECT", "BLOCK")):
         return _result("MAJOR_APPM_DEFECT", 0, f"major APPM defect: {status}; action={action}")
     loh_status = _text(row, "hla_loh_status")
     if not lost and (not loh_status or "UNASSESSED" in loh_status):
@@ -519,9 +485,9 @@ def derive_safety_state(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dic
     if exact:
         return _result("SAFETY_REJECT", 0, "reference proteome exact match", hard_fail=True, hard_code="HARD_REFERENCE_PROTEOME_MATCH")
     normal_junction = _text(row, "normal_junction_assessment_status", "event_normal_junction_assessment_status")
-    if not any(token in normal_junction for token in ("NOT_DETECTED", "UNASSESSED", "MISSING")) and any(token in normal_junction for token in ("DETECTED", "EXACT_MATCH", "SUPPORTED_IN_NORMAL")):
+    if not any(token in normal_junction for token in ("UNASSESSED", "MISSING")) and any(contains_positive(normal_junction, token) for token in ("DETECTED", "EXACT_MATCH", "SUPPORTED_IN_NORMAL")):
         return _result("SAFETY_REJECT", 0, f"normal junction clearly detected: {normal_junction}", hard_fail=True, hard_code="HARD_NORMAL_JUNCTION")
-    if any(token in status for token in ("UNSAFE", "FAIL", "REJECT", "BLOCKED")):
+    if any(contains_positive(status, token) for token in ("UNSAFE", "FAIL", "REJECT", "BLOCKED")):
         return _result("SAFETY_REJECT", 0, status, hard_fail=True, hard_code="HARD_SAFETY_REJECT")
     if not status:
         return _result("SAFETY_PARTIAL", 1, "safety evidence unavailable", assessed=False)
@@ -537,7 +503,7 @@ def derive_safety_state(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dic
         return _result("SAFETY_HIGH_RISK", 0, status)
     if any(token in status for token in ("CAUTION", "REVIEW")):
         return _result("SAFETY_REVIEW", 1, status)
-    if "PASS" in status and not any(token in status for token in PARTIAL_TOKENS):
+    if contains_positive(status, "PASS") and not any(token in status for token in PARTIAL_TOKENS):
         return _result("SAFETY_PASS", 3, status)
     if any(token in status for token in PARTIAL_TOKENS):
         return _result("SAFETY_PARTIAL", 1, status)

@@ -18,7 +18,6 @@ from neoag.evidence_states import (
     derive_presentation_consensus,
     derive_rna_support,
     derive_safety_state,
-    evidence_state,
 )
 from neoag.pareto import nondominated_fronts
 from neoag.model_layers import rna_evidence_metrics
@@ -53,12 +52,6 @@ def complete_row(peptide_id="P1"):
         "appm_evidence_completeness": "HIGH",
         "restricting_hla_lost": "false",
     }
-
-
-def test_evidence_state_separates_assessed_failure_from_conflict():
-    assert evidence_state("FAIL") == "SUPPORTED"
-    assert evidence_state("CONFLICT") == "CONFLICT"
-    assert evidence_state("UNASSESSED") == "MISSING"
 
 
 def test_complete_and_missing_consensus_states():

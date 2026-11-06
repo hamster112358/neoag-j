@@ -27,6 +27,7 @@ from .evidence_states import (
     derive_mutant_specificity,
     derive_rna_support,
 )
+from .status_words import contains_positive, starts_negated
 from .utils import read_tsv, write_tsv
 
 
@@ -197,7 +198,6 @@ _TRUE = {"TRUE", "YES", "Y", "1", "PASS", "SUPPORTED", "CONFIRMED", "VALID", "CO
 _FALSE = {"FALSE", "NO", "N", "0", "FAIL", "FAILED", "INVALID", "ABSENT", "REJECT", "REFUTED"}
 _CONFLICT_TOKENS = ("CONFLICT", "DISCORDANT", "INCONSISTENT", "MISMATCH")
 _LOW_POWER_TOKENS = ("LOW_COVERAGE", "LOW COVERAGE", "LOW_POWER", "LOW POWER", "INSUFFICIENT_COVERAGE", "INSUFFICIENT READ", "LOW_CONFIDENCE")
-_NEGATIVE_TOKENS = ("NOT_DETECTED", "NO_SUPPORT", "NEGATIVE", "ABSENT", "UNSUPPORTED")
 _INVALID_TOKENS = ("INVALID", "ARTIFACT", "WRONG", "IMPOSSIBLE", "REFUTED", "FAILED", "REJECT")
 _PASS_TOKENS = ("PASS", "SUPPORTED", "CONFIRMED", "VALID", "COMPLETE", "CONCORDANT", "HIGH_CONFIDENCE", "HIGH CONFIDENCE", "IN_FRAME", "IN-FRAME")
 
@@ -233,14 +233,17 @@ def _number(row: Mapping[str, Any], *fields: str) -> float | None:
 
 
 def _truthy(row: Mapping[str, Any], *fields: str) -> bool | None:
+    # Negation first (review B5-01): "NOT_SUPPORTED" contains "SUPPORTED" and
+    # "NOT_PASSED" contains "PASS", so the old positive-first order returned
+    # True for explicit negatives.  See .status_words for the matcher rules.
     for field in fields:
         value = _raw(row, field).upper()
         if value in _EMPTY:
             continue
+        if value in _FALSE or starts_negated(value) or any(token in value for token in ("UNSUPPORTED", "FAILED", "INVALID")):
+            return False
         if value in _TRUE or any(token in value for token in ("SUPPORTED", "CONFIRMED", "PASS")):
             return True
-        if value in _FALSE or any(token in value for token in ("NOT_SUPPORTED", "NOT SUPPORTED", "FAILED", "INVALID")):
-            return False
     return None
 
 
@@ -269,32 +272,6 @@ def _assessment(
         fatal_if_negative=fatal_if_negative,
         fatal_if_conflict=fatal_if_conflict,
     )
-
-
-def _status_from_text(
-    text: str,
-    *,
-    supported_code: str,
-    negative_code: str,
-    unassessed_code: str,
-    conflict_code: str,
-    low_power_code: str,
-    invalid_is_negative: bool = True,
-) -> tuple[str, str]:
-    upper = text.upper().strip()
-    if not upper:
-        return UNASSESSED, unassessed_code
-    if any(token in upper for token in _CONFLICT_TOKENS):
-        return CONFLICT, conflict_code
-    if any(token in upper for token in _LOW_POWER_TOKENS):
-        return INDETERMINATE_LOW_POWER, low_power_code
-    if any(token in upper for token in _INVALID_TOKENS):
-        return (NEGATIVE if invalid_is_negative else CONFLICT), negative_code
-    if any(token in upper for token in _NEGATIVE_TOKENS):
-        return NEGATIVE, negative_code
-    if any(token in upper for token in _PASS_TOKENS):
-        return SUPPORTED, supported_code
-    return UNASSESSED, unassessed_code
 
 
 def source_chain_track(row: Mapping[str, Any]) -> str:
@@ -383,13 +360,13 @@ def _somatic_status_requirement(row: Mapping[str, Any], rules: Mapping[str, Any]
     del rules
     fields = _present(row, "matched_normal_status", "normal_support_status", "normal_depth", "normal_alt_count", "normal_alt_vaf", "germline_route_status")
     route = _text(row, "germline_route_status", "candidate_origin_route")
-    if "GERMLINE" in route and any(token in route for token in ("REVIEWED", "SEPARATE", "APPROVED")):
+    if "GERMLINE" in route and any(contains_positive(route, token) for token in ("REVIEWED", "SEPARATE", "APPROVED")):
         return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", SUPPORTED, "SC_GERMLINE_ROUTE_EXPLICIT", route, fields)
     status = _text(row, "matched_normal_status", "normal_support_status")
     normal_depth = _number(row, "normal_depth")
     normal_alt = _number(row, "normal_alt_count")
     normal_vaf = _number(row, "normal_alt_vaf")
-    if "ALT_SUPPORTED" in status or (normal_alt is not None and normal_alt >= 2 and (normal_vaf or 0) >= 0.01):
+    if contains_positive(status, "ALT_SUPPORTED") or (normal_alt is not None and normal_alt >= 2 and (normal_vaf or 0) >= 0.01):
         return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", NEGATIVE, "SC_MATCHED_NORMAL_ALT_SUPPORTED", f"matched-normal support: status={status}; depth={normal_depth}; ALT={normal_alt}; VAF={normal_vaf}", fields, fatal_if_negative=True)
     if any(token in status for token in _CONFLICT_TOKENS):
         return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", CONFLICT, "SC_NORMAL_STATUS_CONFLICT", status, fields, fatal_if_conflict=True)
@@ -399,7 +376,7 @@ def _somatic_status_requirement(row: Mapping[str, Any], rules: Mapping[str, Any]
             return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", INDETERMINATE_LOW_POWER, "SC_NORMAL_LOW_COVERAGE", f"normal depth={normal_depth:g} below {min_depth}", fields)
         if (normal_alt or 0) == 0:
             return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", SUPPORTED, "SC_MATCHED_NORMAL_NEGATIVE", f"normal depth={normal_depth:g}; ALT={normal_alt or 0:g}", fields)
-    if any(token in status for token in ("SOMATIC", "NORMAL_NEGATIVE", "TUMOR_ONLY_PASS", "PASS")):
+    if any(contains_positive(status, token) for token in ("SOMATIC", "NORMAL_NEGATIVE", "TUMOR_ONLY_PASS", "PASS")):
         return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", SUPPORTED, "SC_SOMATIC_STATUS_SUPPORTED", status, fields)
     return _assessment("somatic_or_germline_route", "Somatic status or explicit germline route", UNASSESSED, "SC_SOMATIC_STATUS_UNASSESSED", "Matched-normal or germline-route evidence unavailable", fields)
 
@@ -411,7 +388,7 @@ def _rna_or_direct_requirement(row: Mapping[str, Any], rules: Mapping[str, Any],
         "protein_evidence_status", "proteomics_status", "ligandome_evidence_status", "peptide_mass_spec_status",
     )
     protein = _text(row, "protein_evidence_status", "proteomics_status", "ligandome_evidence_status", "peptide_mass_spec_status")
-    if any(token in protein for token in _PASS_TOKENS):
+    if any(contains_positive(protein, token) for token in _PASS_TOKENS):
         return _assessment("rna_or_direct_evidence", "RNA mutant/junction or direct protein/peptide evidence", SUPPORTED, "SC_DIRECT_PROTEIN_OR_PEPTIDE_SUPPORTED", protein, fields)
     if any(token in protein for token in _CONFLICT_TOKENS):
         return _assessment("rna_or_direct_evidence", "RNA mutant/junction or direct protein/peptide evidence", CONFLICT, "SC_DIRECT_EVIDENCE_CONFLICT", protein, fields)
@@ -445,7 +422,7 @@ def _phasing_requirement(row: Mapping[str, Any]) -> RequirementAssessment:
         return _assessment("read_backed_phasing", "Read-backed phasing for proximal variants", NEGATIVE, "SC_PHASING_DISPROVES_PEPTIDE", text, fields, fatal_if_negative=True)
     if any(token in text for token in _CONFLICT_TOKENS):
         return _assessment("read_backed_phasing", "Read-backed phasing for proximal variants", CONFLICT, "SC_PHASING_CONFLICT", text, fields, fatal_if_conflict=True)
-    if any(token in text for token in ("PHASED", "CIS", "HIGH_CONFIDENCE", "SUPPORTED")):
+    if any(contains_positive(text, token) for token in ("PHASED", "CIS", "HIGH_CONFIDENCE", "SUPPORTED")):
         return _assessment("read_backed_phasing", "Read-backed phasing for proximal variants", SUPPORTED, "SC_READ_BACKED_PHASING_SUPPORTED", text, fields, fatal_if_negative=True)
     if any(token in text for token in _LOW_POWER_TOKENS):
         return _assessment("read_backed_phasing", "Read-backed phasing for proximal variants", INDETERMINATE_LOW_POWER, "SC_PHASING_LOW_POWER", text, fields, fatal_if_negative=True)
@@ -542,7 +519,7 @@ def _orthogonal_confirmation(row: Mapping[str, Any], *, track: str, rna_requirem
             continue
         if any(token in field_text for token in explicit_not_performed_tokens):
             continue
-        if any(token in field_text for token in _PASS_TOKENS):
+        if any(contains_positive(field_text, token) for token in _PASS_TOKENS):
             sources.append(label)
 
     cross = _text(row, "cross_platform_status", "comparison_status")
