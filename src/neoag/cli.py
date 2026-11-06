@@ -122,18 +122,27 @@ def cmd_build_presentation(args):
         load_profile(args.profile), args.out, args.netmhcstabpan,
         netchop=getattr(args, "netchop", None),
     )
-    if getattr(args, "weight_sensitivity", False):
-        from pathlib import Path
-        from .presentation import write_weight_sensitivity, SENSITIVITY_DEFAULT_PERTURB, SENSITIVITY_DEFAULT_TOP_K
-        sens = Path(args.out).with_name("presentation_weight_sensitivity.tsv")
-        perturb = float(getattr(args, "sensitivity_perturb", SENSITIVITY_DEFAULT_PERTURB) or SENSITIVITY_DEFAULT_PERTURB)
-        top_k = int(getattr(args, "sensitivity_top_k", SENSITIVITY_DEFAULT_TOP_K) or SENSITIVITY_DEFAULT_TOP_K)
-        write_weight_sensitivity(
-            rows, load_profile(args.profile), sens,
-            perturb=perturb, top_k=top_k,
-        )
-        print(f"Weight sensitivity QC table (local +-perturbation, perturb={perturb}, top_k={top_k}): {sens}")
     print("Built PresentationEvidence.")
+
+
+def cmd_weight_sensitivity(args):
+    """Regional Dirichlet weight sensitivity over the FINAL peptide ranking."""
+    from .sensitivity import write_weight_sensitivity
+    from .utils import read_tsv
+    peptides = read_tsv(args.ranked_peptides)
+    path, chains_path = write_weight_sensitivity(
+        peptides, load_profile(args.profile), args.out,
+        samples=args.samples, concentration=args.concentration,
+        top_k=args.top_k, seed=args.seed,
+    )
+    with path.open("r", encoding="utf-8") as fh:
+        reported = max(sum(1 for _ in fh) - 1, 0)
+    print(
+        f"Weight sensitivity QC (regional Dirichlet around the profile default): "
+        f"samples={args.samples}, concentration={args.concentration}, top_k={args.top_k}, "
+        f"seed={args.seed}; {reported} reported rows -> {path}; "
+        f"per-chain diagnostic -> {chains_path}"
+    )
 
 def cmd_appm(args):
     build_appm_lite(args.sample_id, args.vep_tsv, args.expression, args.hla_loh, load_profile(args.profile), args.outdir, cnv_tsv=getattr(args, "cnv", None), raw_peptides=getattr(args, "raw_peptides", None), ccf_tsv=getattr(args, "ccf", None))
@@ -1155,7 +1164,15 @@ def build_parser():
     pm = sub.add_parser("parse-mhcflurry")
     pm.add_argument("--sample-id", default="SAMPLE001"); pm.add_argument("--input", required=True); pm.add_argument("--out", required=True); pm.set_defaults(func=cmd_parse_mhcflurry)
     bp = sub.add_parser("build-presentation-evidence")
-    bp.add_argument("--raw-peptides", required=True); bp.add_argument("--netmhcpan"); bp.add_argument("--mhcflurry"); bp.add_argument("--netmhcstabpan"); bp.add_argument("--netchop"); bp.add_argument("--profile", default="default"); bp.add_argument("--out", required=True); bp.add_argument("--weight-sensitivity", action="store_true", help="Write presentation_weight_sensitivity.tsv: re-rank saved evidence under local +-perturbed weight vectors (per-patient QC, audit A3; operator design 2026-11-06)"); bp.add_argument("--sensitivity-perturb", type=float, default=0.5, help="Weight perturbation +-fraction for each active component (default 0.5 = weights stretched to half/1.5x)"); bp.add_argument("--sensitivity-top-k", type=int, default=10, help="Top-K window for consistency / top-selection (default 10)"); bp.set_defaults(func=cmd_build_presentation)
+    bp.add_argument("--raw-peptides", required=True); bp.add_argument("--netmhcpan"); bp.add_argument("--mhcflurry"); bp.add_argument("--netmhcstabpan"); bp.add_argument("--netchop"); bp.add_argument("--profile", default="default"); bp.add_argument("--out", required=True); bp.set_defaults(func=cmd_build_presentation)
+    ws = sub.add_parser("weight-sensitivity", help="Re-rank the FINAL peptide ranking under a regional Dirichlet weight distribution seeded at the profile defaults (per-patient stability QC, audit A3; operator design 2026-11-06)")
+    ws.add_argument("--ranked-peptides", required=True, help="scored ranked_peptides.tsv (needs l3_* chain columns + immunology_composite_score + efficacy_score)")
+    ws.add_argument("--profile", default="default"); ws.add_argument("--out", required=True, help="weight_sensitivity.tsv; the per-chain diagnostic is written alongside as <stem>_chains.tsv")
+    ws.add_argument("--samples", type=int, default=600, help="Dirichlet draws from the weight region (default 600, plus the default vector itself as anchor)")
+    ws.add_argument("--concentration", type=float, default=3.0, help="Dirichlet concentration: lower draws the region wider around the default weights (default 3.0)")
+    ws.add_argument("--top-k", dest="top_k", type=int, default=50, help="Reporting/acceptability window K (default 50): table rows cover the default top-K and the median top-K; consistency = share of draws with rank <= K")
+    ws.add_argument("--seed", type=int, default=20261106, help="RNG seed; same seed reproduces every draw exactly")
+    ws.set_defaults(func=cmd_weight_sensitivity)
     ap = sub.add_parser("appm-lite")
     ap.add_argument("--sample-id", default="SAMPLE001"); ap.add_argument("--vep-tsv"); ap.add_argument("--expression"); ap.add_argument("--hla-loh"); ap.add_argument("--cnv"); ap.add_argument("--raw-peptides"); ap.add_argument("--ccf"); ap.add_argument("--profile", default="default"); ap.add_argument("--outdir", required=True); ap.set_defaults(func=cmd_appm)
     ap2 = sub.add_parser("appm-2", help="Build APPM 2.0 gene/pathway/peptide evidence sidecars")

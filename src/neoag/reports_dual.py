@@ -1317,6 +1317,7 @@ class ReportBundle:
     tool_versions: dict[str, dict[str, str]] = field(default_factory=dict)
     disease_knowledge: dict[str, Any] = field(default_factory=dict)
     weight_sensitivity: list[dict[str, str]] = field(default_factory=list)
+    weight_sensitivity_chains: list[dict[str, str]] = field(default_factory=list)
 
 
 def _load_disease_knowledge(
@@ -2018,14 +2019,19 @@ def load_report_bundle(
         for key, value in recovered_appm_completeness[0].items():
             if value not in (None, ""):
                 effective_appm_summary.setdefault(key, value)
-    # Optional weight-sensitivity QC table (written next to the presentation
-    # evidence when --weight-sensitivity was run); renders the two-table
-    # default-vs-sensitivity ranking in the technical report when present.
+    # Optional weight-sensitivity QC table (written by the weight-sensitivity
+    # command, usually next to scoring/ranked_peptides.tsv); renders the
+    # two-table default-vs-stability ranking plus the per-chain contribution
+    # diagnostic in the technical report when present.
     weight_sensitivity_rows = _read_optional(case_file(
-        "presentation_weight_sensitivity.tsv",
-        "presentation/presentation_weight_sensitivity.tsv",
-        "scoring/presentation_weight_sensitivity.tsv",
-        "final/parsed/presentation_weight_sensitivity.tsv",
+        "weight_sensitivity.tsv",
+        "scoring/weight_sensitivity.tsv",
+        "final/parsed/weight_sensitivity.tsv",
+    ))
+    weight_sensitivity_chain_rows = _read_optional(case_file(
+        "weight_sensitivity_chains.tsv",
+        "scoring/weight_sensitivity_chains.tsv",
+        "final/parsed/weight_sensitivity_chains.tsv",
     ))
     return ReportBundle(
         profile=profile,
@@ -2033,6 +2039,7 @@ def load_report_bundle(
         peptides=enriched_peptides,
         appm_summary=effective_appm_summary,
         weight_sensitivity=weight_sensitivity_rows,
+        weight_sensitivity_chains=weight_sensitivity_chain_rows,
         validation_rows=validation_rows or [],
         sample_id=sample_id or str(prov.get("sample_id") or (peptides[0].get("sample_id") if peptides else "")),
         entry_mode=entry_mode or str(prov.get("entry_mode") or ""),
@@ -7169,37 +7176,48 @@ def make_technical_report(path: str | Path, bundle: ReportBundle) -> None:
     out.append("</div>")
 
     if bundle.weight_sensitivity:
-        from .presentation import SENSITIVITY_FORMULA
+        from .sensitivity import SENSITIVITY_FORMULA
         sens = bundle.weight_sensitivity
         meta = sens[0]
         try:
-            k = int(meta.get("top_k") or 10)
+            k = int(meta.get("top_k") or 50)
         except ValueError:
-            k = 10
-        out.append("<div class='section'><h2>Weight Sensitivity (local perturbation)</h2>")
+            k = 50
+        out.append("<div class='section'><h2>Weight Sensitivity (regional Dirichlet)</h2>")
         out.append(
-            f"<p>The presentation evidence was re-ranked under {esc(meta.get('n_vectors', '?'))} weight "
-            f"vectors: the profile default plus, for each of the {esc(meta.get('n_components', '?'))} active "
-            f"components, that component scaled by (1&plusmn;{esc(meta.get('perturb', '?'))}). "
+            f"<p>The final peptide ranking was re-scored under {esc(meta.get('n_draws', '?'))} weight "
+            f"vectors: the profile default plus {esc(meta.get('n_draws', '?'))} draws from a Dirichlet "
+            f"distribution seeded at that default over the {esc(meta.get('n_chains', '?'))} Layer-3 evidence "
+            f"chains (concentration {esc(meta.get('concentration', '?'))}, seed {esc(meta.get('seed', '?'))}). "
+            f"Every candidate was re-ranked against all {esc(meta.get('n_scorable', '?'))} scorable candidates; "
+            f"the two tables below show the default top-{k} and the median top-{k}. "
             f"<b>Table 1</b> is the ranking under the default weights; <b>Table 2</b> is the ranking after the "
-            f"sensitivity test (adjusted_score = base_score &times; consistency &times; dominance_factor). "
-            f"Rows with top_selection=yes are in the default top-{k} and remain inside it under every "
-            f"perturbation - those are the candidates with consistent top-selection. Candidates whose score "
-            f"is driven by a single component are penalized by the dominance factor. Stability under this "
+            f"sensitivity test (adjusted_score = expected_score &times; dominance_factor &times; rank_stability). "
+            f"Rows with top_selection=yes are in the default top-{k} and remain inside it under every draw - "
+            f"those are the candidates with consistent top-selection. Candidates whose score is driven by a "
+            f"single chain, or whose rank moves widely across the region, are penalized. Stability under this "
             f"test is robustness to the weight choice, not accuracy.</p>"
         )
+        if bundle.weight_sensitivity_chains:
+            out.append("<h3>Evidence-chain contribution under the default weights</h3>")
+            out.append("<p>mean_share is the average fraction of the composite each chain carries across the "
+                       "reported candidates under the default weights (a dominance diagnostic; shares sum to 1).</p>")
+            out.append(_table(bundle.weight_sensitivity_chains, [
+                "chain", "default_weight", "mean_share", "n_candidates",
+            ]))
         table1 = sorted(sens, key=lambda r: int(r.get("base_rank") or 0))[:50]
-        out.append("<h3>Table 1: ranking under the default weights</h3>")
+        out.append(f"<h3>Table 1: default-weight ranking (top-{k} window)</h3>")
         out.append(_table(table1, [
-            "base_rank", "peptide_id", "peptide", "hla_allele", "mhc_class",
-            "base_score", "expected_rank", "rank_spread", "verdict",
+            "base_rank", "peptide_id", "peptide", "gene", "hla_allele", "mhc_class",
+            "base_score", "median_rank", "rank_iqr", "worst_rank", "verdict",
+            "consistency", "top_selection",
         ]))
         table2 = sorted(sens, key=lambda r: int(r.get("adjusted_rank") or 0))[:50]
-        out.append("<h3>Table 2: ranking after the sensitivity test</h3>")
+        out.append(f"<h3>Table 2: stability-adjusted ranking (top-{k} window)</h3>")
         out.append(_table(table2, [
-            "adjusted_rank", "base_rank", "peptide_id", "peptide", "hla_allele",
-            "base_score", "consistency", "dominance", "effective_components",
-            "dominance_factor", "adjusted_score", "top_selection",
+            "adjusted_rank", "base_rank", "peptide_id", "peptide", "gene", "hla_allele",
+            "base_score", "expected_score", "consistency", "dominance", "effective_chains",
+            "dominance_factor", "rank_stability", "adjusted_score", "top_selection",
         ]))
         out.append(
             "<p class='mono' style='white-space:pre-wrap; font-size:0.85em'>"

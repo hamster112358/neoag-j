@@ -7,8 +7,9 @@ Each test maps to one uploaded document:
                                      pass-through into the ranked tables
   HLA fix.docx                    -> allele-level consensus as a parallel,
                                      review-only branch (pair table unchanged)
-  sensitivity test on ranking.docx-> weight-sensitivity modes baseline/global/
-                                     regional (SMAA acceptability, Dirichlet)
+  sensitivity test on ranking.docx-> regional Dirichlet weight sensitivity on
+                                     the FINAL ranking (operator correction:
+                                     one mode, seeded at the default weights)
 """
 
 from types import SimpleNamespace
@@ -159,130 +160,231 @@ def test_allele_level_agrees_with_pair_level_when_tools_concur():
     ]
 
 
-# --- sensitivity test on ranking: baseline / global / regional modes --------
+# --- sensitivity test on ranking: ONE regional mode (Dirichlet seeded at the
+# default vector, operator correction 2026-11-06: "start from a seed of
+# default, and use Dirichlet distribution to select the value for each
+# weights"; wider region + more draws = the expanded range; run on the FINAL
+# ranking's evidence chains; reporting window covers at least the top 50).
 
-def _sens_rows(count=20):
+def _final_rows(count=20):
+    """Final-ranking-shaped rows: l3_* chain columns + composite + efficacy."""
+    from neoag.model_layers import default_l3_weights, l3_dimension_field
+
+    weights = default_l3_weights({})
+    total = sum(weights.values())
+    names = list(weights)
     rows = []
     for i in range(count):
-        rows.append({
+        values = {}
+        for idx, name in enumerate(names):
+            # Deterministic per-row/per-chain variation so weight draws can
+            # reorder candidates, over a range that stays inside [0.05, 0.95].
+            values[name] = 0.90 - 0.013 * i + 0.05 * (((i * 23 + idx * 7) % 17) / 16.0 - 0.5)
+            values[name] = max(0.05, min(0.95, values[name]))
+        composite = sum(weights[n] * values[n] for n in weights) / total
+        row = {
             "peptide_id": f"P{i}", "peptide": "A" * 9, "hla_allele": "HLA-A*02:01",
-            "mhc_class": "I",
-            "netmhcpan_ba_rank": f"{0.1 + i * 0.3:.2f}",
-            "netmhcpan_el_rank": f"{0.2 + i * 0.25:.2f}",
-            "mhcflurry_presentation_score": f"{0.9 - i * 0.03:.3f}",
-            "mhcflurry_processing_score": f"{0.7 - i * 0.02:.3f}",
-            "netchop_31d_cterm_score": f"{0.8 - i * 0.025:.3f}",
-            "netmhcstabpan_rank": f"{1.0 + i * 0.5:.2f}",
-        })
+            "mhc_class": "I", "gene": f"GENE{i}",
+            "immunology_composite_score": f"{composite:.4f}",
+            "efficacy_score": f"{composite * 0.8:.4f}",  # 0.8 = modifier chain M
+        }
+        for name in names:
+            row[l3_dimension_field(name)] = f"{values[name]:.4f}"
+        rows.append(row)
     return rows
 
 
-# --- 2026-11-06 operator round: sensitivity is ONE local mode; component
-# count comes from the profile/spec, perturbation is wider, single-driver
-# candidates are penalized, and the table feeds a two-part selection.
+def test_chains_and_draw_counts_derive_from_the_profile():
+    from neoag.model_layers import default_l3_weights
+    from neoag.sensitivity import (
+        SENSITIVITY_DEFAULT_SAMPLES, weight_sensitivity_table,
+    )
+
+    window, chains = weight_sensitivity_table(_final_rows(5), {})
+    # Chain count/names come from default_l3_weights at run time, and the
+    # table SAYS them instead of the reader inferring a number.
+    assert sorted(c["chain"] for c in chains) == sorted(default_l3_weights({}))
+    assert len(chains) == len(default_l3_weights({}))
+    assert window[0]["n_chains"] == str(len(default_l3_weights({})))
+    assert window[0]["n_draws"] == str(SENSITIVITY_DEFAULT_SAMPLES + 1)
+
+    thinned_weights = {k: (0.0 if k == "expression" else v)
+                       for k, v in default_l3_weights({}).items()}
+    window, chains = weight_sensitivity_table(
+        _final_rows(5), {"l3_weights": thinned_weights})
+    # Zeroing one weight must shrink the ACTIVE chain count by one (the
+    # diagnostic keeps the zeroed row with weight 0.0000).
+    assert window[0]["n_chains"] == str(len(thinned_weights) - 1)
+    assert next(c for c in chains if c["chain"] == "expression")["default_weight"] == "0.0000"
 
 
-def test_local_vectors_track_active_components_not_a_hardcoded_count():
-    from neoag.presentation import weight_sensitivity_table
-
-    rows = _sens_rows(5)
-    default = weight_sensitivity_table(rows, {})
-    # Default profile activates six weights -> 1 + 2*6 vectors, and the table
-    # SAYS the component count instead of the reader inferring it.
-    assert default[0]["n_components"] == "6"
-    assert default[0]["n_vectors"] == "13"
-
-    thinned = weight_sensitivity_table(rows, {"presentation_weights": {
-        "netmhcpan_ba": 0.25, "netmhcpan_el": 0.0,
-        "mhcflurry_presentation": 0.30, "mhcflurry_processing": 0.0,
-        "netchop_processing": 0.10, "netmhcstabpan_stability": 0.0,
-    }})
-    # Zeroing three weights must shrink the analysis to 1 + 2*3 = 7 vectors.
-    assert thinned[0]["n_components"] == "3"
-    assert thinned[0]["n_vectors"] == "7"
-
-
-def test_default_perturbation_is_the_widened_range():
-    from neoag.presentation import weight_sensitivity_table, SENSITIVITY_DEFAULT_PERTURB
+def test_regional_dirichlet_is_the_only_mode_with_a_wide_default_region():
+    import contextlib
     import inspect
+    import io
 
-    assert SENSITIVITY_DEFAULT_PERTURB == 0.5
+    import neoag.presentation as presentation
+    from neoag.cli import build_parser
+    from neoag.sensitivity import (
+        SENSITIVITY_DEFAULT_CONCENTRATION, SENSITIVITY_DEFAULT_SAMPLES,
+        SENSITIVITY_DEFAULT_TOP_K, weight_sensitivity_table,
+    )
+
+    # One mode: the parameters are region width + draw count + window + seed.
+    # There is no perturb parameter and no mode switch anywhere.
     sig = inspect.signature(weight_sensitivity_table)
-    assert sig.parameters["perturb"].default == 0.5
-    # The removed mode machinery must be gone, not merely hidden.
-    assert "mode" not in sig.parameters and "samples" not in sig.parameters
-    row = weight_sensitivity_table(_sens_rows(3), {})[0]
-    assert row["perturb"] == "0.50"
+    assert {"samples", "concentration", "top_k", "seed"} <= set(sig.parameters)
+    assert "perturb" not in sig.parameters and "mode" not in sig.parameters
+    assert (SENSITIVITY_DEFAULT_SAMPLES, SENSITIVITY_DEFAULT_CONCENTRATION,
+            SENSITIVITY_DEFAULT_TOP_K) == (600, 3.0, 50)
+    # The superseded local mode is gone from the code, not merely hidden.
+    assert not hasattr(presentation, "weight_sensitivity_table")
+    assert not hasattr(presentation, "SENSITIVITY_FORMULA")
+    buf = io.StringIO()
+    with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
+        build_parser().parse_args(["build-presentation-evidence", "--help"])
+    assert "--sensitivity-perturb" not in buf.getvalue()
+    # The dedicated command owns the analysis now.
+    buf2 = io.StringIO()
+    with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf2):
+        build_parser().parse_args(["weight-sensitivity", "--help"])
+    assert "--samples" in buf2.getvalue() and "--concentration" in buf2.getvalue()
 
 
-def test_single_driver_candidate_is_penalized_by_the_dominance_factor():
-    from neoag.presentation import weight_sensitivity_table
+def test_dirichlet_region_is_seeded_unbiased_and_deterministic():
+    from neoag.sensitivity import dirichlet_weight_vectors, sensitivity_chains
 
-    shared = {"peptide": "A" * 9, "hla_allele": "HLA-A*02:01", "mhc_class": "I",
-              "mhcflurry_presentation_score": "", "mhcflurry_processing_score": "",
-              "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""}
-    balanced = {"peptide_id": "BAL", **shared,
-                "netmhcpan_ba_rank": "0.0", "netmhcpan_el_rank": "0.0"}
-    single = {"peptide_id": "ONE", **shared,
-              "netmhcpan_ba_rank": "", "netmhcpan_el_rank": "",
-              "netchop_31d_cterm_score": "1.0"}
-    # Both score 1.0 under the base weights...
-    out = {r["peptide_id"]: r for r in weight_sensitivity_table([balanced, single], {}, top_k=2)}
-    assert out["BAL"]["base_score"] == "1.0000" and out["ONE"]["base_score"] == "1.0000"
-    # ...but the single-driver candidate carries half the adjusted score.
-    assert float(out["BAL"]["effective_components"]) > 1.9
-    assert out["ONE"]["effective_components"] == "1.00"
-    assert float(out["BAL"]["dominance_factor"]) > 0.95
+    base = {name: wt for name, _, wt in sensitivity_chains({})}
+    total = sum(base.values())
+    vectors = dirichlet_weight_vectors(base, 1500, 3.0, 7)
+    assert vectors[0] == base  # the default vector is the anchor/seed
+    for vec in vectors:
+        assert abs(sum(vec.values()) - total) < 1e-9
+        assert all(vec[name] >= 0.0 for name in vec)
+    # Unbiased: the mean of every drawn weight sits at its default.
+    for name, wt in base.items():
+        mean_w = sum(vec[name] for vec in vectors) / len(vectors)
+        assert abs(mean_w - wt) < 0.04, (name, mean_w, wt)
+    # Determinism: the same seed reproduces every draw exactly.
+    assert dirichlet_weight_vectors(base, 1500, 3.0, 7) == vectors
+    assert dirichlet_weight_vectors(base, 1500, 3.0, 8) != vectors
+    # A chain with default weight 0 is never switched on by a draw.
+    zero = dirichlet_weight_vectors({"a": 0.5, "b": 0.0, "c": 0.5}, 10, 3.0, 1)
+    assert all(vec["b"] == 0.0 for vec in zero)
+
+
+def test_anchor_vector_reproduces_the_stored_efficacy_exactly():
+    from neoag.sensitivity import weight_sensitivity_table
+
+    profile = {"l3_weights": {"alpha": 0.5, "beta": 0.5}}
+    row = {
+        "peptide_id": "ANCH", "peptide": "A" * 9, "hla_allele": "HLA-A*02:01",
+        "l3_alpha_score": "0.6000", "l3_beta_score": "0.8000",
+        "immunology_composite_score": "0.7000",
+        "efficacy_score": "0.5600",  # = 0.7000 * 0.8 multiplier chain
+    }
+    window, _chains = weight_sensitivity_table([row], profile, samples=40)
+    # score(default vector) == stored efficacy_score; a lone candidate can
+    # never fall out of any window, so it is trivially consistent.
+    assert window[0]["base_score"] == "0.5600"
+    assert window[0]["base_rank"] == "1"
+    assert window[0]["verdict"] == "rank_stable"
+    assert window[0]["consistency"] == "1.0000"
+    assert window[0]["top_selection"] == "yes"
+
+
+def test_single_chain_driver_is_penalized_by_the_dominance_factor():
+    from neoag.sensitivity import weight_sensitivity_table
+
+    profile = {"l3_weights": {"alpha": 0.45, "beta": 0.45, "gamma": 0.10}}
+    common = {"peptide": "A" * 9, "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+              "l3_gamma_score": "0.0000"}
+    bal = {"peptide_id": "BAL", **common,
+           "l3_alpha_score": "1.0000", "l3_beta_score": "1.0000",
+           "immunology_composite_score": "0.9000", "efficacy_score": "0.9000"}
+    one = {"peptide_id": "ONE", **common,
+           "l3_alpha_score": "1.0000", "l3_beta_score": "0.0000",
+           "immunology_composite_score": "0.4500", "efficacy_score": "0.4500"}
+    rows, _chains = weight_sensitivity_table([bal, one], profile, samples=40)
+    out = {r["peptide_id"]: r for r in rows}
+    assert out["ONE"]["dominance"] == "1.0000"
+    assert out["ONE"]["effective_chains"] == "1.00"
     assert out["ONE"]["dominance_factor"] == "0.5000"
+    assert float(out["BAL"]["dominance_factor"]) == 1.0
+    # expected_score is the mean over region draws (unbiased, small sampling
+    # error), so compare with a tolerance: BAL ~ 0.90, ONE ~ 0.45 * 0.5.
+    assert abs(float(out["BAL"]["adjusted_score"]) - 0.90) < 0.10
+    assert abs(float(out["ONE"]["adjusted_score"]) - 0.225) < 0.05
     assert int(out["BAL"]["adjusted_rank"]) < int(out["ONE"]["adjusted_rank"])
-    assert out["ONE"]["adjusted_score"] == "0.5000"
 
 
-def test_consistency_and_top_selection_mark_consistent_top_candidates():
-    from neoag.presentation import weight_sensitivity_table
+def test_window_reports_at_least_the_top_50_but_selection_stays_downstream():
+    from neoag.sensitivity import SENSITIVITY_DEFAULT_TOP_K, weight_sensitivity_table
 
-    base = {"peptide": "A" * 9, "hla_allele": "HLA-A*02:01", "mhc_class": "I",
-            "mhcflurry_presentation_score": "", "mhcflurry_processing_score": "",
-            "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""}
-    r1 = {"peptide_id": "R1", **base, "netmhcpan_ba_rank": "0.0", "netmhcpan_el_rank": "9"}
-    r2 = {"peptide_id": "R2", **base, "netmhcpan_ba_rank": "9", "netmhcpan_el_rank": "0.0"}
-    # R2 leads on the default weights (el 0.35 > ba 0.25) but a +-50% ba-up or
-    # el-down vector flips it out of the top 1: consistency must be < 1 and
-    # top_selection must say no even for the leading candidate.
-    out = {r["peptide_id"]: r for r in weight_sensitivity_table([r1, r2], {}, top_k=1)}
-    assert out["R2"]["base_rank"] == "1"
-    assert float(out["R2"]["consistency"]) < 1.0 and float(out["R2"]["consistency"]) > 0.8
-    assert float(out["R1"]["consistency"]) < 0.2
-    assert out["R1"]["top_selection"] == "no" and out["R2"]["top_selection"] == "no"
-    # A candidate that can never fall out of the window (only row) is consistent.
-    solo = weight_sensitivity_table([r2], {}, top_k=1)[0]
+    window, _chains = weight_sensitivity_table(_final_rows(60), {})
+    # The whole pool (60) was re-ranked; the REPORT window keeps every
+    # candidate inside the default or median top-50 - the 13th and 21st are
+    # covered, and so is the 50th; nothing about the window selects a final
+    # candidate list - that stays a review decision.
+    assert SENSITIVITY_DEFAULT_TOP_K == 50
+    assert window[0]["n_scorable"] == "60"
+    assert len(window) >= 50
+    by_rank = {int(r["base_rank"]): r for r in window}
+    assert 13 in by_rank and 21 in by_rank
+    assert any(int(r["base_rank"]) >= 50 for r in window) or len(window) >= 50
+
+
+def test_borderline_candidates_have_their_flips_marked():
+    from neoag.sensitivity import weight_sensitivity_table
+
+    profile = {"l3_weights": {"alpha": 0.5, "beta": 0.5}}
+    common = {"peptide": "A" * 9, "hla_allele": "HLA-A*02:01", "mhc_class": "I"}
+    r1 = {"peptide_id": "R1", **common, "l3_alpha_score": "1.0000", "l3_beta_score": "0.0000",
+          "immunology_composite_score": "1.0000", "efficacy_score": "1.0000"}
+    r2 = {"peptide_id": "R2", **common, "l3_alpha_score": "0.0000", "l3_beta_score": "1.0000",
+          "immunology_composite_score": "1.0000", "efficacy_score": "1.0000"}
+    # Perfect tie under the default; a Dirichlet draw favours one side or the
+    # other, so neither candidate may sit in the top-1 under every draw.
+    rows, _chains = weight_sensitivity_table([r1, r2], profile, samples=400, top_k=1)
+    out = {r["peptide_id"]: r for r in rows}
+    for rid in ("R1", "R2"):
+        assert 0.15 < float(out[rid]["consistency"]) < 0.85
+        assert out[rid]["top_selection"] == "no"
+        assert int(out[rid]["rank_spread"]) >= 1
+    solo = weight_sensitivity_table([r1], profile, samples=40, top_k=1)[0][0]
     assert solo["consistency"] == "1.0000" and solo["top_selection"] == "yes"
 
 
-def test_technical_report_shows_both_tables_and_the_formula(tmp_path):
-    from neoag.presentation import weight_sensitivity_table
+def test_technical_report_shows_both_tables_the_chains_and_the_formula(tmp_path):
     from neoag.reports_dual import ReportBundle, make_technical_report
+    from neoag.sensitivity import weight_sensitivity_table
 
-    sens = weight_sensitivity_table(_sens_rows(5), {})
-    bundle = ReportBundle(profile={}, events=[], peptides=[], weight_sensitivity=sens)
+    sens, chains = weight_sensitivity_table(_final_rows(8), {})
+    bundle = ReportBundle(profile={}, events=[], peptides=[],
+                          weight_sensitivity=sens, weight_sensitivity_chains=chains)
     make_technical_report(tmp_path / "tech.html", bundle)
     html = (tmp_path / "tech.html").read_text(encoding="utf-8")
-    assert "Weight Sensitivity" in html
-    assert "Table 1: ranking under the default weights" in html
-    assert "Table 2: ranking after the sensitivity test" in html
-    assert "adjusted_score = base_score" in html
-    assert "dominance_factor = min(1, effective_components/2)" in html
+    assert "Weight Sensitivity (regional Dirichlet)" in html
+    assert "Table 1: default-weight ranking" in html
+    assert "Table 2: stability-adjusted ranking" in html
+    assert "adjusted_score = expected_score" in html
+    assert "dominance_factor = min(1, effective_chains/2)" in html
     assert "robustness to the weight choice, not accuracy" in html
+    # The per-chain diagnostic lists the real chain names.
+    assert "hla_presentation" in html
 
 
 def test_invalid_sensitivity_arguments_are_rejected():
-    from neoag.presentation import weight_sensitivity_table
     import pytest
 
-    with pytest.raises(ValueError, match="perturb"):
-        weight_sensitivity_table(_sens_rows(3), {}, perturb=1.0)
+    from neoag.sensitivity import weight_sensitivity_table
+
+    with pytest.raises(ValueError, match="samples"):
+        weight_sensitivity_table(_final_rows(3), {}, samples=0)
+    with pytest.raises(ValueError, match="concentration"):
+        weight_sensitivity_table(_final_rows(3), {}, concentration=0.0)
     with pytest.raises(ValueError, match="top_k"):
-        weight_sensitivity_table(_sens_rows(3), {}, top_k=0)
+        weight_sensitivity_table(_final_rows(3), {}, top_k=0)
 
 
 # --- APPM integration note / scoring investigation 6.2: binding aggregation

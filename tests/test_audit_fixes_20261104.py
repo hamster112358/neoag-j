@@ -272,25 +272,31 @@ def test_a1_consensus_preserves_ranked_votes_and_tie():
 
 
 def test_a3_weight_sensitivity_exposes_weight_driven_ranks():
-    from neoag.presentation import weight_sensitivity_table
+    from neoag.sensitivity import weight_sensitivity_table
 
+    profile = {"l3_weights": {"alpha": 0.6, "beta": 0.4}}
     rows = [
         {"peptide_id": "P1", "peptide": "AAAAAAAAA", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
-         "netmhcpan_ba_rank": "1", "netmhcpan_el_rank": "99", "mhcflurry_presentation_score": "",
-         "mhcflurry_processing_score": "", "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""},
+         "l3_alpha_score": "1.0000", "l3_beta_score": "0.0000",
+         "immunology_composite_score": "0.6000", "efficacy_score": "0.6000"},
         {"peptide_id": "P2", "peptide": "BBBBBBBBB", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
-         "netmhcpan_ba_rank": "99", "netmhcpan_el_rank": "1", "mhcflurry_presentation_score": "",
-         "mhcflurry_processing_score": "", "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""},
+         "l3_alpha_score": "0.7400", "l3_beta_score": "1.0000",
+         "immunology_composite_score": "0.8440", "efficacy_score": "0.8440"},
     ]
-    # With the default weights the el weight (0.35) beats ba (0.25); at a +-50%
-    # sweep the ba-up vector flips them - the table must reveal that.
-    out = weight_sensitivity_table(rows, {}, perturb=0.5)
-    assert out and all(r["n_vectors"] == "13" for r in out)
+    # P2 leads under the default weights, but its lead comes from the beta
+    # chain: any Dirichlet draw that puts enough weight on alpha flips the
+    # pair (P1 > P2 iff 0.26*w_alpha > w_beta) - the regional table must
+    # reveal the flip instead of hiding it behind the single default vector.
+    out, _chains = weight_sensitivity_table(rows, profile, samples=400)
+    assert out and all(r["n_draws"] == "401" for r in out)
     assert {r["peptide_id"] for r in out} == {"P1", "P2"}
+    p2 = next(r for r in out if r["peptide_id"] == "P2")
+    assert p2["base_rank"] == "1"
+    assert int(p2["rank_spread"]) >= 1
+    assert p2["verdict"] in {"rank_minor_shift", "rank_unstable"}
+    assert float(p2["score_range"]) > 0
     p1 = next(r for r in out if r["peptide_id"] == "P1")
-    assert int(p1["rank_spread"]) >= 1
-    assert p1["verdict"] in {"rank_minor_shift", "rank_unstable"}
-    assert float(p1["score_range"]) > 0
+    assert float(p1["consistency"]) > 0.0  # the flip side is reachable in-region
 
 
 def test_b3_unresolved_immunogenicity_downgrades_instead_of_silent_redistribution():
