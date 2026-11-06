@@ -244,9 +244,7 @@ def build_weight_report(scoring_dir: Path, top: int, case_label: str = "") -> st
         "escape, cross-platform, mutant specificity): they are non-compensatory verdicts, not "
         "weights - a safety rejection must not be tradable against a high binding score. When "
         "every candidate shares the same verdicts they are run-constant and only rescale the "
-        "score; they reorder candidates as soon as any verdict differs. The weight-sensitivity "
-        "section below prints each candidate's multiplier product (chain_multiplier) so "
-        "constancy is answerable from the table.</p>")
+        "score; they reorder candidates as soon as any verdict differs.</p>")
     body.append(_table(ordered[:top], headers))
     body.append("</div>")
 

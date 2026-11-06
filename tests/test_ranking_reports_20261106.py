@@ -155,7 +155,6 @@ def test_weight_report_embeds_the_sensitivity_section(tmp_path):
     paths = write_ranking_reports(tmp_path)
     html = paths["weight"].read_text(encoding="utf-8")
     assert "Weight Sensitivity (regional Dirichlet)" in html
-    assert "chain_multiplier" in html
     assert "Regional draws" in html  # the verbatim formula is included
     assert "Evidence-chain contribution" in html
 

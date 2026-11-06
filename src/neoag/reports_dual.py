@@ -7065,10 +7065,7 @@ def weight_sensitivity_html(sens: list[Mapping[str, Any]],
         f"sensitivity test (adjusted_score = expected_score &times; dominance_factor &times; rank_stability). "
         f"Rows with top_selection=yes are in the default top-{k} and remain inside it under every draw - "
         f"those are the candidates with consistent top-selection. Candidates whose score is driven by a "
-        f"single chain, or whose rank moves widely across the region, are penalized. The chain_multiplier "
-        f"column shows each candidate's stored modifier product (safety &times; gate &times; APPM &times; CCF "
-        f"&times; escape &times; cross-platform; efficacy/composite), held fixed across draws - these are "
-        f"discrete decisions, not weights, so they are reported per candidate rather than sampled. "
+        f"single chain, or whose rank moves widely across the region, are penalized. "
         f"Stability under this "
         f"test is robustness to the weight choice, not accuracy.</p>"
     )
@@ -7083,7 +7080,7 @@ def weight_sensitivity_html(sens: list[Mapping[str, Any]],
     out.append(f"<h3>Table 1: default-weight ranking (top-{k} window)</h3>")
     out.append(_table(table1, [
         "base_rank", "peptide_id", "peptide", "gene", "hla_allele", "mhc_class",
-        "base_score", "chain_multiplier", "median_rank", "rank_iqr", "worst_rank", "verdict",
+        "base_score", "median_rank", "rank_iqr", "worst_rank", "verdict",
         "consistency", "top_selection",
     ]))
     table2 = sorted(sens, key=lambda r: int(r.get("adjusted_rank") or 0))[:50]

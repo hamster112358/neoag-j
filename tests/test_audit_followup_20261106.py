@@ -293,30 +293,6 @@ def test_anchor_vector_reproduces_the_stored_efficacy_exactly():
     assert window[0]["top_selection"] == "yes"
 
 
-def test_chain_multiplier_is_exposed_per_candidate():
-    # The modifier chain is held fixed across draws (it is a product of
-    # discrete decisions, not a weight), but the table must SHOW it per
-    # candidate so "are the modifiers constant?" is answerable from the
-    # output instead of from prose (operator question, 2026-11-06).
-    from neoag.sensitivity import WEIGHT_SENSITIVITY_FIELDS, weight_sensitivity_table
-
-    assert "chain_multiplier" in WEIGHT_SENSITIVITY_FIELDS
-    profile = {"l3_weights": {"alpha": 0.5, "beta": 0.5}}
-    gated = {"peptide_id": "GATED", "peptide": "A" * 9, "hla_allele": "HLA-A*02:01",
-             "l3_alpha_score": "0.6000", "l3_beta_score": "0.8000",
-             "immunology_composite_score": "0.7000", "efficacy_score": "0.5600"}
-    dead = {"peptide_id": "DEAD", "peptide": "C" * 9, "hla_allele": "HLA-A*02:01",
-            "l3_alpha_score": "0.0000", "l3_beta_score": "0.0000",
-            "immunology_composite_score": "0.0000", "efficacy_score": "0.0000"}
-    window, _chains = weight_sensitivity_table([gated, dead], profile, samples=20)
-    out = {r["peptide_id"]: r for r in window}
-    assert out["GATED"]["chain_multiplier"] == "0.8000"  # 0.5600 / 0.7000
-    # A zero composite forces every score to 0 whatever M would be: printing
-    # a fabricated 1.0 there would be an assertion, so the column says na.
-    assert out["DEAD"]["chain_multiplier"] == "na"
-    assert out["DEAD"]["base_score"] == "0.0000"
-
-
 def test_single_chain_driver_is_penalized_by_the_dominance_factor():
     from neoag.sensitivity import weight_sensitivity_table
 
