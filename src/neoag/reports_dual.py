@@ -1316,6 +1316,7 @@ class ReportBundle:
     hla_loh_tool_results: list[dict[str, str]] = field(default_factory=list)
     tool_versions: dict[str, dict[str, str]] = field(default_factory=dict)
     disease_knowledge: dict[str, Any] = field(default_factory=dict)
+    weight_sensitivity: list[dict[str, str]] = field(default_factory=list)
 
 
 def _load_disease_knowledge(
@@ -2017,11 +2018,21 @@ def load_report_bundle(
         for key, value in recovered_appm_completeness[0].items():
             if value not in (None, ""):
                 effective_appm_summary.setdefault(key, value)
+    # Optional weight-sensitivity QC table (written next to the presentation
+    # evidence when --weight-sensitivity was run); renders the two-table
+    # default-vs-sensitivity ranking in the technical report when present.
+    weight_sensitivity_rows = _read_optional(case_file(
+        "presentation_weight_sensitivity.tsv",
+        "presentation/presentation_weight_sensitivity.tsv",
+        "scoring/presentation_weight_sensitivity.tsv",
+        "final/parsed/presentation_weight_sensitivity.tsv",
+    ))
     return ReportBundle(
         profile=profile,
         events=enriched_events,
         peptides=enriched_peptides,
         appm_summary=effective_appm_summary,
+        weight_sensitivity=weight_sensitivity_rows,
         validation_rows=validation_rows or [],
         sample_id=sample_id or str(prov.get("sample_id") or (peptides[0].get("sample_id") if peptides else "")),
         entry_mode=entry_mode or str(prov.get("entry_mode") or ""),
@@ -7156,6 +7167,45 @@ def make_technical_report(path: str | Path, bundle: ReportBundle) -> None:
         "wgs_tumor_alt_vaf", "normal_depth", "normal_alt_count", "normal_alt_vaf",
     ]))
     out.append("</div>")
+
+    if bundle.weight_sensitivity:
+        from .presentation import SENSITIVITY_FORMULA
+        sens = bundle.weight_sensitivity
+        meta = sens[0]
+        try:
+            k = int(meta.get("top_k") or 10)
+        except ValueError:
+            k = 10
+        out.append("<div class='section'><h2>Weight Sensitivity (local perturbation)</h2>")
+        out.append(
+            f"<p>The presentation evidence was re-ranked under {esc(meta.get('n_vectors', '?'))} weight "
+            f"vectors: the profile default plus, for each of the {esc(meta.get('n_components', '?'))} active "
+            f"components, that component scaled by (1&plusmn;{esc(meta.get('perturb', '?'))}). "
+            f"<b>Table 1</b> is the ranking under the default weights; <b>Table 2</b> is the ranking after the "
+            f"sensitivity test (adjusted_score = base_score &times; consistency &times; dominance_factor). "
+            f"Rows with top_selection=yes are in the default top-{k} and remain inside it under every "
+            f"perturbation - those are the candidates with consistent top-selection. Candidates whose score "
+            f"is driven by a single component are penalized by the dominance factor. Stability under this "
+            f"test is robustness to the weight choice, not accuracy.</p>"
+        )
+        table1 = sorted(sens, key=lambda r: int(r.get("base_rank") or 0))[:50]
+        out.append("<h3>Table 1: ranking under the default weights</h3>")
+        out.append(_table(table1, [
+            "base_rank", "peptide_id", "peptide", "hla_allele", "mhc_class",
+            "base_score", "expected_rank", "rank_spread", "verdict",
+        ]))
+        table2 = sorted(sens, key=lambda r: int(r.get("adjusted_rank") or 0))[:50]
+        out.append("<h3>Table 2: ranking after the sensitivity test</h3>")
+        out.append(_table(table2, [
+            "adjusted_rank", "base_rank", "peptide_id", "peptide", "hla_allele",
+            "base_score", "consistency", "dominance", "effective_components",
+            "dominance_factor", "adjusted_score", "top_selection",
+        ]))
+        out.append(
+            "<p class='mono' style='white-space:pre-wrap; font-size:0.85em'>"
+            f"{esc(SENSITIVITY_FORMULA)}</p>"
+        )
+        out.append("</div>")
 
     out.append("<div class='section'><h2>Ranked Peptides (full)</h2>")
     out.append("<h3>Quantitative presentation and immunogenicity review</h3>")

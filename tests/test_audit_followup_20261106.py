@@ -177,56 +177,112 @@ def _sens_rows(count=20):
     return rows
 
 
-def test_sensitivity_modes_vector_counts_and_bounds():
+# --- 2026-11-06 operator round: sensitivity is ONE local mode; component
+# count comes from the profile/spec, perturbation is wider, single-driver
+# candidates are penalized, and the table feeds a two-part selection.
+
+
+def test_local_vectors_track_active_components_not_a_hardcoded_count():
     from neoag.presentation import weight_sensitivity_table
 
-    rows = _sens_rows()
-    baseline = weight_sensitivity_table(rows, {})
-    # 1 + 2W with six active weights = 13 (the audit's own arithmetic).
-    assert int(baseline[0]["n_vectors"]) == 13
-    assert baseline[0]["mode"] == "baseline"
-    assert baseline[0]["verdict"] in {"rank_stable", "rank_minor_shift", "rank_unstable"}
+    rows = _sens_rows(5)
+    default = weight_sensitivity_table(rows, {})
+    # Default profile activates six weights -> 1 + 2*6 vectors, and the table
+    # SAYS the component count instead of the reader inferring it.
+    assert default[0]["n_components"] == "6"
+    assert default[0]["n_vectors"] == "13"
 
-    glob = weight_sensitivity_table(rows, {}, mode="global")
-    # Full +-perturb grid: 3^6 vectors (base included exactly once).
-    assert int(glob[0]["n_vectors"]) == 3 ** 6
-
-    regional = weight_sensitivity_table(rows, {}, mode="regional", samples=100)
-    # Dirichlet draws plus the base vector.
-    assert int(regional[0]["n_vectors"]) == 101
-    for r in regional:
-        for key in ("acceptability_top1", "acceptability_top10",
-                    "acceptability_top50", "acceptability_top100"):
-            assert 0.0 <= float(r[key]) <= 1.0
-        assert 1.0 <= float(r["expected_rank"]) <= len(rows)
-    # Acceptability is monotone in K.
-    top = regional[0]
-    assert float(top["acceptability_top1"]) <= float(top["acceptability_top10"])
-    assert float(top["acceptability_top10"]) <= float(top["acceptability_top50"])
-    assert float(top["acceptability_top50"]) <= float(top["acceptability_top100"])
+    thinned = weight_sensitivity_table(rows, {"presentation_weights": {
+        "netmhcpan_ba": 0.25, "netmhcpan_el": 0.0,
+        "mhcflurry_presentation": 0.30, "mhcflurry_processing": 0.0,
+        "netchop_processing": 0.10, "netmhcstabpan_stability": 0.0,
+    }})
+    # Zeroing three weights must shrink the analysis to 1 + 2*3 = 7 vectors.
+    assert thinned[0]["n_components"] == "3"
+    assert thinned[0]["n_vectors"] == "7"
 
 
-def test_regional_mode_is_deterministic_and_concentration_controls_spread():
+def test_default_perturbation_is_the_widened_range():
+    from neoag.presentation import weight_sensitivity_table, SENSITIVITY_DEFAULT_PERTURB
+    import inspect
+
+    assert SENSITIVITY_DEFAULT_PERTURB == 0.5
+    sig = inspect.signature(weight_sensitivity_table)
+    assert sig.parameters["perturb"].default == 0.5
+    # The removed mode machinery must be gone, not merely hidden.
+    assert "mode" not in sig.parameters and "samples" not in sig.parameters
+    row = weight_sensitivity_table(_sens_rows(3), {})[0]
+    assert row["perturb"] == "0.50"
+
+
+def test_single_driver_candidate_is_penalized_by_the_dominance_factor():
     from neoag.presentation import weight_sensitivity_table
 
-    rows = _sens_rows()
-    a = weight_sensitivity_table(rows, {}, mode="regional", samples=60, concentration=8.0)
-    b = weight_sensitivity_table(rows, {}, mode="regional", samples=60, concentration=8.0)
-    assert a == b  # fixed seed: same inputs, same table
+    shared = {"peptide": "A" * 9, "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+              "mhcflurry_presentation_score": "", "mhcflurry_processing_score": "",
+              "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""}
+    balanced = {"peptide_id": "BAL", **shared,
+                "netmhcpan_ba_rank": "0.0", "netmhcpan_el_rank": "0.0"}
+    single = {"peptide_id": "ONE", **shared,
+              "netmhcpan_ba_rank": "", "netmhcpan_el_rank": "",
+              "netchop_31d_cterm_score": "1.0"}
+    # Both score 1.0 under the base weights...
+    out = {r["peptide_id"]: r for r in weight_sensitivity_table([balanced, single], {}, top_k=2)}
+    assert out["BAL"]["base_score"] == "1.0000" and out["ONE"]["base_score"] == "1.0000"
+    # ...but the single-driver candidate carries half the adjusted score.
+    assert float(out["BAL"]["effective_components"]) > 1.9
+    assert out["ONE"]["effective_components"] == "1.00"
+    assert float(out["BAL"]["dominance_factor"]) > 0.95
+    assert out["ONE"]["dominance_factor"] == "0.5000"
+    assert int(out["BAL"]["adjusted_rank"]) < int(out["ONE"]["adjusted_rank"])
+    assert out["ONE"]["adjusted_score"] == "0.5000"
 
-    tight = weight_sensitivity_table(rows, {}, mode="regional", samples=60, concentration=200.0)
-    loose = weight_sensitivity_table(rows, {}, mode="regional", samples=60, concentration=1.0)
-    # A tighter Dirichlet region must not produce more rank dispersion than a
-    # looser one, measured on the worst candidate.
-    assert max(float(r["rank_std"]) for r in tight) <= max(float(r["rank_std"]) for r in loose)
+
+def test_consistency_and_top_selection_mark_consistent_top_candidates():
+    from neoag.presentation import weight_sensitivity_table
+
+    base = {"peptide": "A" * 9, "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+            "mhcflurry_presentation_score": "", "mhcflurry_processing_score": "",
+            "netchop_31d_cterm_score": "", "netmhcstabpan_rank": ""}
+    r1 = {"peptide_id": "R1", **base, "netmhcpan_ba_rank": "0.0", "netmhcpan_el_rank": "9"}
+    r2 = {"peptide_id": "R2", **base, "netmhcpan_ba_rank": "9", "netmhcpan_el_rank": "0.0"}
+    # R2 leads on the default weights (el 0.35 > ba 0.25) but a +-50% ba-up or
+    # el-down vector flips it out of the top 1: consistency must be < 1 and
+    # top_selection must say no even for the leading candidate.
+    out = {r["peptide_id"]: r for r in weight_sensitivity_table([r1, r2], {}, top_k=1)}
+    assert out["R2"]["base_rank"] == "1"
+    assert float(out["R2"]["consistency"]) < 1.0 and float(out["R2"]["consistency"]) > 0.8
+    assert float(out["R1"]["consistency"]) < 0.2
+    assert out["R1"]["top_selection"] == "no" and out["R2"]["top_selection"] == "no"
+    # A candidate that can never fall out of the window (only row) is consistent.
+    solo = weight_sensitivity_table([r2], {}, top_k=1)[0]
+    assert solo["consistency"] == "1.0000" and solo["top_selection"] == "yes"
 
 
-def test_unknown_sensitivity_mode_is_rejected():
+def test_technical_report_shows_both_tables_and_the_formula(tmp_path):
+    from neoag.presentation import weight_sensitivity_table
+    from neoag.reports_dual import ReportBundle, make_technical_report
+
+    sens = weight_sensitivity_table(_sens_rows(5), {})
+    bundle = ReportBundle(profile={}, events=[], peptides=[], weight_sensitivity=sens)
+    make_technical_report(tmp_path / "tech.html", bundle)
+    html = (tmp_path / "tech.html").read_text(encoding="utf-8")
+    assert "Weight Sensitivity" in html
+    assert "Table 1: ranking under the default weights" in html
+    assert "Table 2: ranking after the sensitivity test" in html
+    assert "adjusted_score = base_score" in html
+    assert "dominance_factor = min(1, effective_components/2)" in html
+    assert "robustness to the weight choice, not accuracy" in html
+
+
+def test_invalid_sensitivity_arguments_are_rejected():
     from neoag.presentation import weight_sensitivity_table
     import pytest
 
-    with pytest.raises(ValueError, match="unknown sensitivity mode"):
-        weight_sensitivity_table(_sens_rows(3), {}, mode="everything")
+    with pytest.raises(ValueError, match="perturb"):
+        weight_sensitivity_table(_sens_rows(3), {}, perturb=1.0)
+    with pytest.raises(ValueError, match="top_k"):
+        weight_sensitivity_table(_sens_rows(3), {}, top_k=0)
 
 
 # --- APPM integration note / scoring investigation 6.2: binding aggregation
