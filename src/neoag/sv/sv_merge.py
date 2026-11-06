@@ -68,14 +68,49 @@ class SVCluster:
 
 
 def cluster_sv_records(records: list[SVRecord], distance: int = 200, consider_type: bool = True, consider_strand: bool = True) -> list[SVCluster]:
-    clusters: list[SVCluster] = []
-    for rec in sorted(records, key=_norm_chrom_pair):
-        placed = False
-        for cl in clusters:
-            if _compatible(cl.representative, rec, distance, consider_type, consider_strand):
-                cl.records.append(rec)
-                placed = True
-                break
-        if not placed:
-            clusters.append(SVCluster([rec]))
-    return clusters
+    """Cluster compatible SV records.
+
+    Review B4-10: the old implementation was a greedy first-fit against the
+    dynamically changing cluster representative, so the partition depended on
+    input order and records compatible via an intermediate member but further
+    than ``distance`` from the current representative started a new cluster.
+    Clustering is now the transitive closure of pairwise compatibility
+    (union-find): both canonical endpoints within ``distance``, same type
+    family, strand-compatible.  The partition is identical for every input
+    permutation.
+    """
+    ordered = sorted(records, key=lambda r: (_norm_chrom_pair(r), r.record_id, r.caller))
+    parent = list(range(len(ordered)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    # Bucket by canonical chromosome pair and sweep each bucket by endpoint 1;
+    # two records can only be compatible while their first endpoint distance
+    # is within the window, so the sweep prunes without changing the closure.
+    buckets: dict[tuple[str, str], list[int]] = {}
+    for index, rec in enumerate(ordered):
+        a, b = _canonical_endpoints(rec)
+        buckets.setdefault((a.chrom, b.chrom), []).append(index)
+    for indices in buckets.values():
+        indices.sort(key=lambda i: (_canonical_endpoints(ordered[i])[0].pos, i))
+        for pos, i in enumerate(indices):
+            endpoint_i = _canonical_endpoints(ordered[i])[0]
+            for j in indices[pos + 1:]:
+                if _canonical_endpoints(ordered[j])[0].pos - endpoint_i.pos > distance:
+                    break
+                if _compatible(ordered[i], ordered[j], distance, consider_type, consider_strand):
+                    union(i, j)
+
+    grouped: dict[int, list[SVRecord]] = {}
+    for index, rec in enumerate(ordered):
+        grouped.setdefault(find(index), []).append(rec)
+    return [SVCluster(sorted(members, key=_norm_chrom_pair)) for _, members in sorted(grouped.items())]

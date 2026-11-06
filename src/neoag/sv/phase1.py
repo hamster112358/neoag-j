@@ -55,12 +55,38 @@ def _event_id(sample_id: str, svtype: str, gene1: str, gene2: str, chrom1: str, 
     return stable_identifier("SV", sample_id, svtype, chrom1, pos1, chrom2, pos2)
 
 
-def _event_expression(effect_class: str, gene1: str, gene2: str, expr: dict[str, float], rna_reads: int) -> float:
+def _event_expression(effect_class: str, gene1: str, gene2: str, expr: dict[str, float], rna_reads: int) -> tuple[float | None, str]:
+    """Return (TPM or None, expression_evidence_status).
+
+    Review B4-16: a gene missing from the expression table used to become
+    TPM 0.0, presenting absent evidence as a measured zero.  Absence now
+    yields None (blank in the table) plus a status, reusing the same
+    vocabulary as evidence_layer.build_expression_evidence.
+    """
     del rna_reads  # Junction read support is not an expression unit and must never be used as TPM.
-    if effect_class == "SV_Fusion" and gene1 and gene2:
-        vals = [expr.get(g, 0.0) for g in (gene1, gene2) if g]
-        return min(vals) if vals else 0.0
-    return expr.get(gene1, 0.0)
+    genes = [g for g in ((gene1, gene2) if effect_class == "SV_Fusion" else (gene1,)) if g]
+    if not genes:
+        return None, "UNASSESSED"
+    vals = [expr[g] for g in genes if g in expr]
+    missing = [g for g in genes if g not in expr]
+    if not vals:
+        return None, "UNASSESSED_ID_NOT_MAPPED"
+    value = min(vals) if len(genes) > 1 else vals[0]
+    if missing:
+        # A fusion is limited by its lower-expressed partner, but a partner
+        # with no row contributes nothing - partial evidence only.
+        return value, "GENE_ONLY_PARTIAL"
+    return value, "GENE_TPM_MEASURED"
+
+
+def _support_rollup(records, attr: str) -> str:
+    """Cluster-level support status: MEASURED wins; otherwise the least
+    committal status seen (review B4-01/B4-07)."""
+    statuses = {str(getattr(r, attr, "") or "") for r in records}
+    for status in ("MEASURED", "NO_EVIDENCE_KEYS", "FORMAT_ABSENT", "SAMPLE_ABSENT"):
+        if status in statuses:
+            return status
+    return ""
 
 
 def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], conf, protein: ProteinReconstruction | None, rna_reads: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -100,6 +126,11 @@ def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], 
         "normal_pe": cluster.max_int("normal_pe"),
         "normal_alt_support": n_alt,
         "normal_local_depth": n_depth,
+        "tumor_support_status": _support_rollup(cluster.records, "tumor_support_status"),
+        "normal_support_status": _support_rollup(cluster.records, "normal_support_status"),
+        "breakpoint1_cds_mapping": meta.get("breakpoint1_cds_mapping", ""),
+        "breakpoint2_cds_mapping": meta.get("breakpoint2_cds_mapping", ""),
+        "breakpoint_orientation_status": meta.get("breakpoint_orientation_status", ""),
         "sniffles_support": cluster.max_int("sniffles_support"),
         "sniffles_coverage": cluster.max_int("sniffles_coverage"),
         "sniffles_precise": rep.sniffles_precise,
@@ -144,20 +175,31 @@ def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], 
     }
 
 
-def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | None, expr: dict[str, float], normal_expr: dict[str, dict[str, Any]], profile_name: str) -> dict[str, Any]:
+def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | None, expr: dict[str, float], normal_expr: dict[str, dict[str, Any]], profile_name: str, sv_rules: dict[str, Any] | None = None) -> dict[str, Any]:
     gene1 = str(svrow.get("gene1") or "")
     gene2 = str(svrow.get("gene2") or "")
     genes = [g for g in [gene1, gene2] if g]
     effect_class = str(svrow.get("effect_class") or "SV_Noncoding")
     rna_reads = int(float(svrow.get("rna_junction_reads") or 0))
-    exp = _event_expression(effect_class, gene1, gene2, expr, rna_reads)
+    exp, expression_status = _event_expression(effect_class, gene1, gene2, expr, rna_reads)
     ne = normal_expr_for_genes(genes, normal_expr)
     t_alt = float(svrow.get("tumor_alt_support") or 0)
     t_depth = float(svrow.get("tumor_local_depth") or 0)
     vaf = float(svrow.get("sv_vaf_like") or 0)
+    # Review B4-07: a single-sample VCF cannot establish normal-zero support.
+    # Encoding the missing normal as a measured zero kept specificity at the
+    # 1.0 maximum; without a matched normal the value is capped and the
+    # basis is stated in tumor_specificity_status.
     specificity = 1.0
     if float(svrow.get("normal_alt_support") or 0) > 0:
         specificity -= 0.3
+        specificity_status = "MATCHED_NORMAL_SUPPORT_DETECTED"
+    elif str(svrow.get("normal_support_status") or "") == "MEASURED":
+        specificity_status = "MATCHED_NORMAL_ZERO_SUPPORT"
+    else:
+        cap = float((sv_rules or {}).get("normal_unassessed_specificity_cap", 0.85))
+        specificity = min(specificity, cap)
+        specificity_status = "NORMAL_UNASSESSED"
     if str(svrow.get("population_sv_overlap", "not_assessed")) == "yes":
         specificity -= 0.4
     gene_label = f"{gene1}::{gene2}" if effect_class == "SV_Fusion" and gene2 and gene2 != gene1 else gene1
@@ -197,7 +239,8 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         "consequence": "fusion_transcript" if effect_class == "SV_Fusion" else ("frameshift_variant" if effect_class == "SV_Frameshift" else "protein_altering_variant"),
         "rna_junction_reads": str(rna_reads),
         "event_confidence": svrow.get("event_confidence_score", "0"),
-        "event_expression": f"{exp:.4f}",
+        "event_expression": "" if exp is None else f"{exp:.4f}",
+        "expression_evidence_status": expression_status,
         "driver_relevance": "0.5000",
         "tumor_vaf": f"{vaf:.4f}",
         "tumor_depth": f"{t_depth:.0f}",
@@ -207,6 +250,7 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         "clonality": f"{min(1.0, vaf / 0.35 if vaf > 0 else 0.0):.4f}",
         "persistence": "0.7000" if effect_class in {"SV_Fusion", "SV_Frameshift"} else "0.5000",
         "tumor_specificity": f"{clamp(specificity):.4f}",
+        "tumor_specificity_status": specificity_status,
         "ccf_estimate": "",
         "ccf_status": "",
         "clonality_multiplier": "1.0",
@@ -403,6 +447,7 @@ def build_sv_phase1_raw(
     expressed_products_tsv: str | Path | None = None,
     strict_sample_names: bool = True,
     include_nonpass: bool = False,
+    unfiltered_policy: str = "exclude",
     allow_heuristic_proteins: bool = False,
 ) -> dict[str, str]:
     outdir = Path(outdir)
@@ -435,6 +480,7 @@ def build_sv_phase1_raw(
 
     sv_rules = profile.get("sv_wes_phase1_5" if wes_mode else "sv_phase1", {}) or {}
     effective_merge_distance = int(sv_rules.get("merge_distance_bp", merge_distance_bp))
+    filter_ledger: list[dict[str, str]] = []
     records = read_sv_inputs(
         sv_vcfs,
         callers,
@@ -442,7 +488,15 @@ def build_sv_phase1_raw(
         normal_sample_name=normal_sample_name,
         require_explicit_sample_names=strict_sample_names,
         include_nonpass=include_nonpass,
+        unfiltered_policy=unfiltered_policy,
+        filter_ledger=filter_ledger,
     )
+    # Review B4-06: FILTER="." (no filter decision) exclusions must be
+    # auditable, never silent.
+    filter_ledger_path = parsed_dir / "sv_vcf_filter_exclusions.tsv"
+    write_tsv(filter_ledger_path, filter_ledger, [
+        "source_path", "caller", "record_id", "chrom", "pos", "filter", "decision",
+    ])
     clusters = cluster_sv_records(records, distance=effective_merge_distance)
 
     sv_rows: list[dict[str, Any]] = []
@@ -545,7 +599,7 @@ def build_sv_phase1_raw(
         design = _long_design_from_protein(protein)
         if design:
             validation_designs.append(design)
-        raw_event = _raw_event_from_sv(svrow, protein, expr, normal_expr, profile_name)
+        raw_event = _raw_event_from_sv(svrow, protein, expr, normal_expr, profile_name, sv_rules)
         raw_events.append(raw_event)
         cands = build_mhc1_peptides(
             [protein], hla_alleles, lengths=peptide_lengths, normal_ligands=normal_ligands,
@@ -582,6 +636,9 @@ def build_sv_phase1_raw(
         "hla_alleles": hla_alleles,
         "mhc1_peptide_lengths": list(peptide_lengths),
         "records_parsed": len(records),
+        "filter_exclusions": len(filter_ledger),
+        "filter_exclusions_ledger": str(filter_ledger_path),
+        "unfiltered_policy": unfiltered_policy,
         "clusters": len(clusters),
         "sv_events_written": len(sv_rows),
         "raw_events_written": len(raw_events),
@@ -613,5 +670,6 @@ def build_sv_phase1_raw(
         "sv_mutant_proteins": str(proteins_fa_path),
         "sv_event_to_peptide": str(sidecar_peptides_path),
         "sv_validation_design": str(validation_design_path),
+        "sv_vcf_filter_exclusions": str(filter_ledger_path),
         "provenance": str(prov_path),
     }

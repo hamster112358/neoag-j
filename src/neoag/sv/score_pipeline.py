@@ -100,11 +100,24 @@ def run_sv_score(
             provenance_registry.set(net_prov)
         elif net_raw:
             provenance_registry.register_passthrough("netmhcpan", net_raw)
+        mhc_provided = bool(mhc_raw)
         if not mhc_raw:
             mhc_raw = tools_dir / "mhcflurry.csv"
             run_mhcflurry(ctx, mhc_raw)
-        if mhc_raw and not provenance_registry.has("mhcflurry"):
-            provenance_registry.register_real("mhcflurry", mhc_raw) if not binding_stub else provenance_registry.register_stub("mhcflurry")
+        mhc_prov = ctx.tool_provenance.get("mhcflurry")
+        if mhc_prov:
+            # Review B4-14: provenance comes from the actual producer of the
+            # file, never from a global feature flag.
+            provenance_registry.set(mhc_prov)
+        elif mhc_raw and not provenance_registry.has("mhcflurry"):
+            if mhc_provided:
+                # A user-supplied real evidence file stays real even when
+                # binding_stub=True would stub tools we had to run ourselves.
+                provenance_registry.register_passthrough("mhcflurry", mhc_raw)
+            elif binding_stub:
+                provenance_registry.register_stub("mhcflurry")
+            else:
+                provenance_registry.register_real("mhcflurry", mhc_raw)
 
     net_path = pres / "netmhcpan_evidence.tsv"
     mhc_path = pres / "mhcflurry_evidence.tsv"

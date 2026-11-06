@@ -1506,6 +1506,30 @@ def _patient_molecular_anchor_callouts(bundle: ReportBundle) -> list[str]:
     return callouts
 
 
+def _record_discovered_tool(
+    tools: dict[str, Any], key: str, *, path: Path, display_name: str = "",
+    mode: str = "runtime_output_discovery",
+) -> None:
+    """Merge a runtime-discovered tool output into the provenance record.
+
+    Review B4-14: discovery only proves that an output file exists, never
+    who produced it.  A status the run itself registered (e.g. "stub" for a
+    pipeline-generated table) is authoritative and must never be upgraded
+    to "real" here; discovery fills in tools the run left unregistered.
+    """
+    record = tools.get(key)
+    if not isinstance(record, dict):
+        record = {}
+        tools[key] = record
+    record["source"] = "local"
+    record["file"] = str(path)
+    if not str(record.get("status") or "").strip():
+        record["status"] = "real"
+    record.setdefault("mode", mode)
+    if display_name:
+        record.setdefault("display_name", display_name)
+
+
 def _augment_runtime_tool_provenance(root: Path, provenance: dict[str, Any]) -> None:
     """Register tools proven by non-empty standard outputs in a completed run."""
     tools = provenance.setdefault("tools", {})
@@ -1527,12 +1551,7 @@ def _augment_runtime_tool_provenance(root: Path, provenance: dict[str, Any]) -> 
     for name, path in markers.items():
         if not path.is_file() or path.stat().st_size == 0:
             continue
-        record = tools.get(name)
-        if not isinstance(record, dict):
-            record = {}
-            tools[name] = record
-        record.update({"source": "local", "status": "real", "file": str(path)})
-        record.setdefault("mode", "runtime_output_discovery")
+        _record_discovered_tool(tools, name, path=path)
 
     summary_paths = (
         root.parent / "evidence" / "purity_cnv" / "purity_cnv_tool_summary.tsv",
@@ -1549,13 +1568,7 @@ def _augment_runtime_tool_provenance(root: Path, provenance: dict[str, Any]) -> 
             if not raw_name:
                 continue
             key = _patient_tool_key(raw_name)
-            record = tools.get(key)
-            if not isinstance(record, dict):
-                record = {}
-                tools[key] = record
-            record.update({"source": "local", "status": "real", "file": str(path)})
-            record.setdefault("mode", "tool_summary_discovery")
-            record.setdefault("display_name", raw_name)
+            _record_discovered_tool(tools, key, path=path, display_name=raw_name, mode="tool_summary_discovery")
 
     # Event-producing tools may be preserved only on canonical raw events and
     # disappear from peptide-level ranking tables. Discover them from the
@@ -1571,12 +1584,8 @@ def _augment_runtime_tool_provenance(root: Path, provenance: dict[str, Any]) -> 
         for key, count in _patient_source_tool_counts(_read_optional(path)).items():
             if key not in _PATIENT_SOURCE_TOOL_META:
                 continue
-            record = tools.get(key)
-            if not isinstance(record, dict):
-                record = {}
-                tools[key] = record
-            record.update({"source": "local", "status": "real", "file": str(path)})
-            record.setdefault("mode", "event_source_discovery")
+            _record_discovered_tool(tools, key, path=path, mode="event_source_discovery")
+            record = tools[key]
             record["evidence_event_rows"] = max(
                 int(record.get("evidence_event_rows") or 0), count
             )

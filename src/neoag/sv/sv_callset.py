@@ -77,26 +77,66 @@ def parse_format(fmt: str, sample: str) -> dict[str, str]:
     return {k: vals[i] if i < len(vals) else "" for i, k in enumerate(keys)}
 
 
-def evidence_from_sample(sample_map: dict[str, str]) -> tuple[int, int, int, int]:
-    """Return (sr, pe, alt_support, depth) from heterogeneous SV FORMAT fields."""
+# Review B4-01: GRIDSS and SvABA sample FORMAT keys.  GRIDSS reports support
+# via PAI/PAIR (spanning pairs), SUR/SU (split reads), PSC/PSR (reference-side
+# support) and VD (assembled variant reads); SvABA via SPLIT_READS /
+# PAIRED_READS support and GENOME_DEPTH.  Before these maps existed, records
+# from the two callers the merge trusts most as representatives (see
+# sv_merge.SVCluster.representative) always parsed to zero support, so
+# unavailable support was silently encoded as measured zero.
+_GRIDSS_SPLIT_KEYS = ("SUR", "SU")
+_GRIDSS_PAIR_KEYS = ("PAI", "PAIR")
+_GRIDSS_REF_KEYS = ("PSC", "PSR")
+_SVABA_SUPPORT_KEYS = ("SPLIT_READS", "PAIRED_READS")
+# FORMAT keys that carry SV support evidence at all (absence of all of them
+# means the support was never measured, which is NOT a measured zero).
+_SUPPORT_EVIDENCE_KEYS = {
+    "SR", "PR", "PE", "DV", "RV", "AD", "AO", "TIR", "TAR", "DR",
+    "SU", "SUR", "PAI", "PAIR", "VD", "SPLIT_READS", "PAIRED_READS",
+}
+
+
+def evidence_from_sample(sample_map: dict[str, str]) -> tuple[int, int, int, int, bool]:
+    """Return (sr, pe, alt_support, depth, evidence_observed) from SV FORMAT fields.
+
+    ``evidence_observed`` is False when no support-bearing FORMAT key was
+    present: the caller must treat the zeros as "not measured", not as a
+    negative observation (review B4-01).
+    """
     sr = 0
     pe = 0
-    # Manta commonly uses PR/SR as ref,alt pairs. DELLY may use DV/RV.
-    if "SR" in sample_map:
-        sr = _last_int(sample_map.get("SR"))
-    elif "RV" in sample_map:
-        sr = _as_int(sample_map.get("RV"), 0)
-    elif "SRQ" in sample_map:
-        sr = 0
+    # SvABA explicit support counts win over the generic PE key (SvABA
+    # FORMATs also carry a PE field with a different meaning).
+    if "SPLIT_READS" in sample_map or "PAIRED_READS" in sample_map:
+        sr = _as_int(sample_map.get("SPLIT_READS"), 0)
+        pe = _as_int(sample_map.get("PAIRED_READS"), 0)
+    else:
+        # Manta commonly uses PR/SR as ref,alt pairs. DELLY may use DV/RV.
+        if "SR" in sample_map:
+            sr = _last_int(sample_map.get("SR"))
+        elif "RV" in sample_map:
+            sr = _as_int(sample_map.get("RV"), 0)
+        elif "SRQ" in sample_map:
+            sr = 0
 
-    if "PR" in sample_map:
-        pe = _last_int(sample_map.get("PR"))
-    elif "PE" in sample_map:
-        pe = _last_int(sample_map.get("PE"))
-    elif "DV" in sample_map:
-        pe = _as_int(sample_map.get("DV"), 0)
+        if "PR" in sample_map:
+            pe = _last_int(sample_map.get("PR"))
+        elif "PE" in sample_map:
+            pe = _last_int(sample_map.get("PE"))
+        elif "DV" in sample_map:
+            pe = _as_int(sample_map.get("DV"), 0)
+
+        # GRIDSS (review B4-01): split reads and spanning pairs, only when
+        # nothing above produced support (GRIDSS uses none of those keys).
+        if sr == 0 and pe == 0 and any(key in sample_map for key in (*_GRIDSS_SPLIT_KEYS, *_GRIDSS_PAIR_KEYS, "VD")):
+            sr = sum(_as_int(sample_map.get(key), 0) for key in _GRIDSS_SPLIT_KEYS)
+            pe = sum(_as_int(sample_map.get(key), 0) for key in _GRIDSS_PAIR_KEYS)
 
     alt = sr + pe
+    if "VD" in sample_map:
+        # GRIDSS VD is the assembled variant-read support; keep the larger
+        # of VD and the raw split+pair sum.
+        alt = max(alt, _as_int(sample_map.get("VD"), 0))
     if alt <= 0:
         for key in ("AD", "AO", "TIR", "TAR", "DR", "DV"):
             if key in sample_map:
@@ -106,17 +146,23 @@ def evidence_from_sample(sample_map: dict[str, str]) -> tuple[int, int, int, int
                     alt = _sum_ints(sample_map.get(key))
                 break
     depth = _as_int(sample_map.get("DP"), 0)
+    if depth <= 0 and "GENOME_DEPTH" in sample_map:  # SvABA (review B4-01)
+        depth = _as_int(sample_map.get("GENOME_DEPTH"), 0)
     if depth <= 0:
         # Approximate depth from ref/alt evidence where possible.
         if "AD" in sample_map:
             depth = _sum_ints(sample_map.get("AD"))
         elif "PR" in sample_map or "SR" in sample_map:
             depth = _sum_ints(sample_map.get("PR")) + _sum_ints(sample_map.get("SR"))
+        elif any(key in sample_map for key in _GRIDSS_REF_KEYS):
+            # GRIDSS PSC/PSR are reference-side support reads; with the alt
+            # reads they bound the sampled read count at the locus.
+            depth = sum(_as_int(sample_map.get(key), 0) for key in _GRIDSS_REF_KEYS) + sr + pe
         elif "DR" in sample_map or "DV" in sample_map:
             depth = _as_int(sample_map.get("DR"), 0) + _as_int(sample_map.get("DV"), 0)
     if alt <= 0:
         alt = sr + pe
-    return sr, pe, alt, depth
+    return sr, pe, alt, depth, any(key in sample_map for key in _SUPPORT_EVIDENCE_KEYS)
 
 
 @dataclass
@@ -150,6 +196,12 @@ class SVRecord:
     normal_pe: int = 0
     normal_alt_support: int = 0
     normal_local_depth: int = 0
+    # Review B4-01/B4-07: "MEASURED" only when support-bearing FORMAT keys
+    # were actually present; a single-sample VCF yields
+    # normal_support_status="NORMAL_UNASSESSED" so downstream scoring must
+    # not present the encoded zero as a measured normal-negative.
+    tumor_support_status: str = "FORMAT_ABSENT"
+    normal_support_status: str = "NORMAL_UNASSESSED"
     info: dict[str, str | bool] = field(default_factory=dict)
     source_path: str = ""
 
@@ -202,6 +254,15 @@ def _select_sample_indices(
     return tumor_i, normal_i
 
 
+def _support_status(fmt_map: dict[str, str], *, observed: bool, sample_present: bool) -> str:
+    """Classify one side's FORMAT evidence (review B4-01/B4-07)."""
+    if not sample_present:
+        return "SAMPLE_ABSENT"
+    if not fmt_map:
+        return "FORMAT_ABSENT"
+    return "MEASURED" if observed else "NO_EVIDENCE_KEYS"
+
+
 def parse_vcf_records(
     path: str | Path,
     caller: str,
@@ -210,7 +271,17 @@ def parse_vcf_records(
     normal_sample_name: str | None = None,
     require_explicit_sample_names: bool = True,
     include_nonpass: bool = False,
+    unfiltered_policy: str = "exclude",
+    filter_ledger: list[dict[str, str]] | None = None,
 ) -> list[SVRecord]:
+    """Parse one SV VCF.
+
+    Review B4-06: FILTER="." means "no filter decision was made", which is
+    neither PASS nor FAIL.  Such records are recorded in ``filter_ledger``
+    with decision EXCLUDED_FILTER_NOT_ASSESSED (kept under
+    ``unfiltered_policy="include"`` for research review) instead of being
+    silently dropped alongside genuinely failed records.
+    """
     records: list[SVRecord] = []
     sample_names: list[str] = []
     tumor_i: int | None = None
@@ -239,7 +310,22 @@ def parse_vcf_records(
             chrom, pos, rid, ref, alt, qual, filt, info_raw = parts[:8]
             filter_tokens = {token.strip().upper() for token in filt.split(";") if token.strip()}
             if not include_nonpass and filter_tokens != {"PASS"}:
-                continue
+                unfiltered = filter_tokens in (set(), {"."})
+                keep_unfiltered = unfiltered and str(unfiltered_policy).strip().lower() == "include"
+                if not keep_unfiltered:
+                    if filter_ledger is not None:
+                        filter_ledger.append({
+                            "source_path": str(path),
+                            "caller": caller,
+                            "record_id": rid if rid and rid != "." else f"{caller}_{chrom}_{pos}",
+                            "chrom": chrom,
+                            "pos": pos,
+                            "filter": filt,
+                            "decision": (
+                                "EXCLUDED_FILTER_NOT_ASSESSED" if unfiltered else "EXCLUDED_FILTER_NOT_PASS"
+                            ),
+                        })
+                    continue
             info = parse_info(info_raw)
             svtype = str(info.get("SVTYPE") or "")
             bnd = parse_bnd_alt(alt)
@@ -279,8 +365,8 @@ def parse_vcf_records(
                     fmt_map_t = parse_format(fmt, samples[tumor_i])
                 if normal_i is not None and normal_i < len(samples):
                     fmt_map_n = parse_format(fmt, samples[normal_i])
-            t_sr, t_pe, t_alt, t_depth = evidence_from_sample(fmt_map_t)
-            n_sr, n_pe, n_alt, n_depth = evidence_from_sample(fmt_map_n)
+            t_sr, t_pe, t_alt, t_depth, t_observed = evidence_from_sample(fmt_map_t)
+            n_sr, n_pe, n_alt, n_depth, n_observed = evidence_from_sample(fmt_map_n)
             # Fallback to INFO fields used by some SV callers.
             if t_alt <= 0:
                 t_sr = _as_int(info.get("SR"), t_sr)
@@ -323,6 +409,10 @@ def parse_vcf_records(
                 normal_pe=n_pe,
                 normal_alt_support=n_alt,
                 normal_local_depth=n_depth,
+                tumor_support_status=_support_status(
+                    fmt_map_t, observed=bool(t_observed or t_alt > 0), sample_present=tumor_i is not None,
+                ),
+                normal_support_status=_support_status(fmt_map_n, observed=n_observed, sample_present=normal_i is not None),
                 info=info,
                 source_path=str(path),
             ))
@@ -337,6 +427,8 @@ def read_sv_inputs(
     normal_sample_name: str | None = None,
     require_explicit_sample_names: bool = True,
     include_nonpass: bool = False,
+    unfiltered_policy: str = "exclude",
+    filter_ledger: list[dict[str, str]] | None = None,
 ) -> list[SVRecord]:
     paths = [Path(p) for p in sv_vcfs]
     caller_names = list(callers or [])
@@ -350,5 +442,7 @@ def read_sv_inputs(
             normal_sample_name=normal_sample_name,
             require_explicit_sample_names=require_explicit_sample_names,
             include_nonpass=include_nonpass,
+            unfiltered_policy=unfiltered_policy,
+            filter_ledger=filter_ledger,
         ))
     return out
