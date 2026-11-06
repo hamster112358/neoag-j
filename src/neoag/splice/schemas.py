@@ -15,6 +15,7 @@ JUNCTION_FIELDS = [
     "intron_start_1based", "intron_end_1based", "strand",
     "donor_1based", "acceptor_1based", "splice_motif", "annotation_status",
     "unique_split_reads", "multi_split_reads", "total_split_reads", "max_overhang",
+    "ir_site_coverage", "ir_site_coverage_source", "split_read_support_status",
     "source_coordinate_systems", "source_tools", "source_tool_versions",
     "source_files", "source_record_ids", "provenance_record_count",
     "junction_resolution_status", "evidence_conflict_status",

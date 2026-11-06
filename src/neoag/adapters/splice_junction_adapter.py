@@ -438,7 +438,11 @@ def merge_splice_into_catalog(
         tools_dir.mkdir(parents=True, exist_ok=True)
         write_tsv(
             tools_dir / "splice_junctions.tsv",
-            index.registry.entity_rows(sample_id=sample_id, primary_tools={"RegTools"}),
+            # Review B3b-10: the verified-read view used to force {"RegTools"}
+            # as the primary source even when the run's junction input came
+            # from STAR SJ.out.tab, zeroing STAR-only samples' verified reads.
+            # Use the tools that actually supplied this run's index.
+            index.registry.entity_rows(sample_id=sample_id, primary_tools=set(index.primary_tools) or {"RegTools"}),
             JUNCTION_ENTITY_FIELDS,
         )
         write_tsv(

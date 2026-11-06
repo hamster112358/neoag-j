@@ -3,16 +3,35 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from neoag.splice.causal_status import CAUSAL_STATUS_PRIORITY as _CAUSAL_PRIORITY
 from neoag.splice.identifiers import stable_id
 from neoag.splice.junction_qc import passing_junctions
 from neoag.splice.normal_background import assessment_is_critical, assessment_is_detected
 
 _RNA_GENERATORS = {"ImmunoPepper", "moPepGen"}
-_CAUSAL_PRIORITY = {
-    "UNASSESSED": 0, "DNA_PREDICTION_ONLY": 1, "DNA_RNA_CIS_SUPPORTED": 2,
-    "TARGETED_SPANNING_ONLY": 3, "PVACSPLICE_SUPPORTED": 4,
-    "TARGETED_REQUANT_SUPPORTED": 5,
-}
+
+# Review B3b-12: "a presentation row exists" used to earn P1, which the tier
+# ladder treated as favorable presentation.  Predicted-but-weak evidence no
+# longer passes the gate.  P0 = never predicted, P1 = prediction performed,
+# no predictor result favorable; P2 = at least one result passes the
+# pre-declared strong-binding cutoff below.
+FAVORABLE_PRESENTATION_PERCENTILE = 2.0
+
+
+def _favorable_presentation(rows: list[dict[str, str]], cutoff: float = FAVORABLE_PRESENTATION_PERCENTILE) -> bool:
+    for row in rows:
+        for field in ("best_presentation_percentile", "median_presentation_percentile"):
+            raw = str(row.get(field, "")).strip()
+            if not raw:
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if value <= cutoff:
+                return True
+            break  # best value present but not favorable; median cannot be better
+    return False
 
 
 def _split(value: str) -> set[str]:
@@ -240,7 +259,12 @@ def build_consensus(tables: dict[str, list[dict[str, str]]], *, sample_id: str) 
             normal_status = "NORMAL_BACKGROUND_INCOMPLETE"
 
         presentations = presentations_by_origin.get(por, [])
-        presentation_grade = "P1" if presentations else "P0"
+        if not presentations:
+            presentation_grade = "P0"
+        elif _favorable_presentation(presentations):
+            presentation_grade = "P2"
+        else:
+            presentation_grade = "P1"
         rna_chain = chain_by_origin_type.get((por, "RNA_DRIVEN"), {})
         dna_chain = chain_by_origin_type.get((por, "DNA_CAUSAL"), {})
         normal_chain = chain_by_origin_type.get((por, "NORMAL_BACKGROUND"), {})
@@ -276,18 +300,21 @@ def build_consensus(tables: dict[str, list[dict[str, str]]], *, sample_id: str) 
             caps.append("CAP_PARTIAL_OR_EPITOPE_ONLY_R3")
         if presentation_grade == "P0":
             caps.append("CAP_PRESENTATION_UNASSESSED_R3")
+        elif presentation_grade == "P1":
+            caps.append("CAP_PRESENTATION_PREDICTED_NOT_FAVORABLE_R3")
 
         if hard:
             tier = "R4"
-        elif _grade_num(event_grade) >= 2 and _grade_num(orf_grade) >= 2 and _grade_num(normal_grade) >= 2 and presentation_grade == "P1":
+        elif _grade_num(event_grade) >= 2 and _grade_num(orf_grade) >= 2 and _grade_num(normal_grade) >= 2 and presentation_grade == "P2":
             tier = "R1"
-        elif _grade_num(event_grade) >= 1 and _grade_num(orf_grade) >= 1 and presentation_grade == "P1":
+        elif _grade_num(event_grade) >= 1 and _grade_num(orf_grade) >= 1 and presentation_grade == "P2":
             tier = "R2"
         else:
             tier = "R3"
         r3_caps = {
             "CAP_NORMAL_BACKGROUND_INCOMPLETE_R3", "CAP_K4NEO_ONLY_R3",
             "CAP_SPLICE_EVENT_RNA_UNCONFIRMED_R3", "CAP_PRESENTATION_UNASSESSED_R3",
+            "CAP_PRESENTATION_PREDICTED_NOT_FAVORABLE_R3",
             "CAP_PEPTIDE_NOVELTY_UNRESOLVED_R3",
             "CAP_REQUIRED_JUNCTION_QC_NOT_PASS_R3", "CAP_PARTIAL_OR_EPITOPE_ONLY_R3",
         }

@@ -4,19 +4,15 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Iterable
 
+from neoag.splice.causal_status import CAUSAL_STATUS_PRIORITY as _CAUSAL_PRIORITY
 from neoag.splice.identifiers import stable_id
 from neoag.splice.junction_qc import passing_junctions
 from neoag.splice.normal_background import assessment_is_critical, assessment_is_detected
 
 _RNA_GENERATORS = {"ImmunoPepper", "moPepGen"}
-_CAUSAL_PRIORITY = {
-    "UNASSESSED": 0,
-    "DNA_PREDICTION_ONLY": 1,
-    "DNA_RNA_CIS_SUPPORTED": 2,
-    "PVACSPLICE_SUPPORTED": 3,
-    "TARGETED_SPANNING_ONLY": 3,
-    "TARGETED_REQUANT_SUPPORTED": 4,
-}
+# Review B3b-13: this module's private ladder tied PVACSPLICE_SUPPORTED with
+# TARGETED_SPANNING_ONLY while consensus/pipeline ranked them 4>3; both tables
+# can now only pick the same winner for the same evidence.
 
 
 def _tokens(value: str) -> set[str]:

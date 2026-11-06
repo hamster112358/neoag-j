@@ -673,7 +673,11 @@ def read_source_rows(path: str | Path, *, source_tool: str = "") -> Iterable[dic
                 yield next(csv.reader([line], delimiter=delimiter))
 
         for cells in parsed_lines():
-            if source_tool.strip().casefold() == "star" and len(cells) >= 9:
+            # Review B3b-04: the pipeline registers STAR junction files as
+            # "STAR-SJ" while normalization calls the tool "STAR"; matching
+            # only "star" made SJ.out.tab fall through to the BED6 branch,
+            # silently losing read counts and mis-reading the strand code.
+            if source_tool.strip().casefold() in {"star", "star-sj", "star_sj"} and len(cells) >= 9:
                 keys = [
                     "chrom",
                     "intron_start_1based",
@@ -714,6 +718,72 @@ def read_source_rows(path: str | Path, *, source_tool: str = "") -> Iterable[dic
             yield {key: cells[index] if index < len(cells) else "" for index, key in enumerate(keys)}
 
 
+_JUNCTION_IDENTITY_SYSTEMS = {"intron_1based_closed", "1based", "one_based", "star_sj"}
+_JUNCTION_BED0_SYSTEMS = {"bed0_half_open", "bed0", "regtools_annotated", "splice_boundaries_0based"}
+
+
+def sniff_junction_table_format(path: str | Path) -> str:
+    """Classify a junction table by CONTENT: 'bed', 'star_sj', or 'other'.
+
+    Review B3b-04: --junction-tool STAR keyed the conversion off the caller's
+    tool name, so feeding STAR's 0-based junctions.bed applied the 1-based
+    SJ.out.tab identity conversion - every junction shifted by one base with
+    no sanity check.  The format must be verified against the file itself.
+    """
+    source = Path(path)
+    if not source.is_file() or source.stat().st_size == 0:
+        return "other"
+    kwargs = {"mode": "rt", "encoding": "utf-8", "errors": "replace", "newline": ""}
+    stream = gzip.open(source, **kwargs) if source.suffix.casefold() == ".gz" else source.open(**kwargs)
+    bed_rows = 0
+    sj_rows = 0
+    with stream as handle:
+        for line in handle:
+            if not line.strip() or line.startswith(("#", "browser", "track")):
+                continue
+            cells = line.rstrip("\n").split("\t")
+            if len(cells) >= 8 and cells[3].strip() in {"0", "1", "2"}:
+                # SJ.out.tab: intron strand code 0/1/2 in column 4.
+                sj_rows += 1
+            elif len(cells) >= 6 and cells[5].strip() in {"+", "-", "."}:
+                # BED-family: strand in column 6.
+                bed_rows += 1
+            if bed_rows + sj_rows >= 10:
+                break
+    if bed_rows and bed_rows >= sj_rows:
+        return "bed"
+    if sj_rows:
+        return "star_sj"
+    return "other"
+
+
+def check_junction_format_vs_system(
+    path: str | Path, *, source_tool: str, coordinate_system: str
+) -> None:
+    """Refuse coordinate-system/tool claims that contradict the file content."""
+    requested = str(coordinate_system or "auto").strip().lower()
+    tool = str(source_tool or "").strip().lower()
+    if requested in {"", "auto"}:
+        if tool not in {"star", "star-sj", "star_sj"}:
+            return
+        # detect_coordinate_system() maps tool "star" to the identity system.
+        requested = "star_sj"
+    fmt = sniff_junction_table_format(path)
+    if fmt == "bed" and requested in _JUNCTION_IDENTITY_SYSTEMS:
+        raise JunctionNormalizationError(
+            f"{Path(path).name}: content is 0-based BED but coordinate system "
+            f"{requested!r} applies the 1-based STAR identity conversion, shifting every "
+            "junction by one base.  Pass the BED coordinate system "
+            "(--junction-coordinate-system bed0_half_open) or use SJ.out.tab with STAR "
+            "(review B3b-04)."
+        )
+    if fmt == "star_sj" and requested in _JUNCTION_BED0_SYSTEMS:
+        raise JunctionNormalizationError(
+            f"{Path(path).name}: content looks like 1-based STAR SJ.out.tab but "
+            f"coordinate system {requested!r} would shift it by one base (review B3b-04)."
+        )
+
+
 def iter_junction_records(
     path: str | Path,
     *,
@@ -724,6 +794,7 @@ def iter_junction_records(
     source_tool_version: str = "UNASSESSED",
     strict: bool = False,
 ) -> Iterable[JunctionSourceRecord]:
+    check_junction_format_vs_system(path, source_tool=source_tool, coordinate_system=coordinate_system)
     for index, row in enumerate(read_source_rows(path, source_tool=source_tool), 1):
         yield junction_record_from_row(
             row,
@@ -743,7 +814,9 @@ def peptide_metadata(record: JunctionSourceRecord) -> dict[str, str]:
     return {
         "peptide": _peptide_from_row(row),
         "hla_allele": _hla_from_row(row),
-        "crosses_junction": first(row, ["crosses_junction", "Crosses Junction"], "true"),
+        # Review B3b-09: junction-spanning novelty must be observed, not
+        # presumed; an absent column is UNASSESSED, not "true".
+        "crosses_junction": first(row, ["crosses_junction", "Crosses Junction"], "UNASSESSED"),
         "generation_status": first(
             row,
             ["generation_status", "status"],

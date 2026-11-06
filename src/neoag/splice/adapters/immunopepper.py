@@ -411,6 +411,22 @@ def parse_immunopepper_kmers(
             "provided_value": kmer, "verified_value": kmer, "resolution_status": "MAPPED_UNIQUE_ORF",
             "resolution_reason": f"cross_junction={crosses}; junction_annotated={junction_annotated}", "raw_payload_sha256": row_hash(row),
         })
+    if rows_unmapped and not record_unmapped_conflicts:
+        # Review B3b-03: suppressing per-kmmer conflict rows is only safe when
+        # the meta pass was restricted (most reference kmers legitimately have
+        # no retained ORF); the coverage loss must still be visible as ONE
+        # explicit orphan-summary record instead of vanishing.
+        result["conflicts"].append({
+            "entity_type": "PEPTIDE", "entity_id": str(p), "sample_id": sample_id,
+            "conflict_type": "IMMUNOPEPPER_KMER_ORPHAN_SUMMARY", "field_name": "kmer",
+            "observed_values": f"unmapped={rows_unmapped};mapped={rows_mapped};ambiguous={rows_ambiguous}",
+            "source_tools": "ImmunoPepper", "source_record_ids": f"{p}:{rows_scanned}_rows",
+            "severity": "WARNING", "resolution_status": "PARTIAL_COVERAGE_LOSS",
+            "resolution_reason": (
+                "Reference metadata was pre-filtered to this sample's observed canonical junctions, "
+                f"so {rows_unmapped} k-mers have no retained ORF and were not registered individually."
+            ),
+        })
     result["manifest"] = [{
         "adapter": "ImmunoPepper-kmer",
         "input_path": str(p),
@@ -420,5 +436,6 @@ def parse_immunopepper_kmers(
         "rows_ambiguous": str(rows_ambiguous),
         "mapping_policy": "EXACT_KMER_TO_UNIQUE_RETAINED_ORF",
         "retained_orf_count": str(len(orfs)),
+        "unmapped_conflict_rows": "suppressed_summary_only" if not record_unmapped_conflicts else "per_kmer",
     }]
     return result

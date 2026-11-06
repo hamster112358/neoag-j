@@ -208,7 +208,11 @@ def test_immunopepper_kmer_uses_exact_retained_orf_index(tmp_path: Path):
     assert bundle["manifest"][0]["rows_scanned"] == "2"
     assert bundle["manifest"][0]["rows_mapped"] == "1"
     assert bundle["manifest"][0]["rows_unmapped"] == "1"
-    assert not bundle["conflicts"]
+    # Review B3b-03: per-kmer conflict rows stay suppressed under the filtered
+    # meta pass, but the coverage loss must remain visible as exactly one
+    # explicit orphan-summary record instead of vanishing.
+    assert [c["conflict_type"] for c in bundle["conflicts"]] == ["IMMUNOPEPPER_KMER_ORPHAN_SUMMARY"]
+    assert bundle["conflicts"][0]["observed_values"] == "unmapped=1;mapped=1;ambiguous=0"
 
 
 def test_pvacbind_requires_exact_fasta_index(tmp_path: Path):

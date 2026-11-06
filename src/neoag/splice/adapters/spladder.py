@@ -349,6 +349,26 @@ def _read_spladder_txt_rows(path: Path) -> list[dict[str, str]]:
             else:
                 feature_started = True
                 features.append(token)
+        # Review B3b-01: "every leading integer is a coordinate" silently
+        # turned SplAdder's appended integer sample-count columns into bogus
+        # exon pairs.  Real exon coordinate runs are even in length and
+        # strictly ascending in genomic order; appended counts break one of
+        # those two structural invariants.  Refuse to guess.
+        coord_nums = [int(x) for x in coordinates]
+        pairs = list(zip(coord_nums[0::2], coord_nums[1::2]))
+        invalid_reason = ""
+        if len(coord_nums) % 2:
+            invalid_reason = "odd coordinate cell count"
+        elif any(start >= end for start, end in pairs):
+            invalid_reason = "exon pair start >= end"
+        elif any(pairs[i][1] >= pairs[i + 1][0] for i in range(len(pairs) - 1)):
+            invalid_reason = "exon pairs not strictly ascending in genomic order"
+        if invalid_reason:
+            raise ValueError(
+                f"{path.name}: headerless SplAdder event row {line_no} has {invalid_reason}: "
+                f"{coordinates[:12]} - refusing to guess where exon coordinates end and "
+                "integer count/feature columns begin (review B3b-01)"
+            )
         exon_pairs = [f"{coordinates[i]}-{coordinates[i+1]}" for i in range(0, len(coordinates) - 1, 2)]
         rows.append({
             "chrom": chrom, "strand": strand, "event_id": event_id, "gene": gene,

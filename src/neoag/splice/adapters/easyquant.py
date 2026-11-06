@@ -89,7 +89,12 @@ def parse_easyquant(
                 "causal_link_id": link, "variant_id": variant_id, "junction_id": junction_id,
                 "splice_event_id": event_id, "sample_id": sample_id, "gene": "", "gene_id": "",
                 "transcript_id": query.get("transcript_hypothesis_id", ""),
-                "causal_status": support if junction_reads > 0 else "DNA_RNA_CIS_SUPPORTED",
+                # Review B3b-05: a zero-junction-read (negative or
+                # spanning-pairs-only) re-quantification does not positively
+                # establish a DNA->RNA cis link.  It must not be promoted to
+                # DNA_RNA_CIS_SUPPORTED; the honest negative/spanning signal
+                # stays visible in targeted_requant_status instead.
+                "causal_status": support if junction_reads > 0 else "DNA_PREDICTION_ONLY",
                 "prediction_status": "UNASSESSED", "rna_junction_status": "EXACT_RNA_SUPPORTED" if junction_reads > 0 else "UNASSESSED",
                 "targeted_requant_status": support, "pvacsplice_status": "UNASSESSED",
                 "junction_reads": "", "easyquant_junction_reads": str(junction_reads),

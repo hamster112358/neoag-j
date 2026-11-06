@@ -61,13 +61,25 @@ def parse_irfinder(
         splice_left = get(row, "SpliceLeft", "splice_left")
         splice_right = get(row, "SpliceRight", "splice_right")
         splice_exact = get(row, "SpliceExact", "MaxSplice", "splice_exact")
+        splice_exact_field = next(
+            (key for key in ("SpliceExact", "splice_exact", "MaxSplice") if str(row.get(key, "")).strip() != ""),
+            "",
+        )
         annotation = "IRFINDER_VALIDATED" if clean(cnn).casefold() in {"pass", "true", "1", "validated"} else "IRFINDER_QUANTIFIED"
         result["junctions"].append({
             "junction_id": junction.junction_id, "sample_id": sample_id, "genome_build": build,
             "chrom": chrom, "intron_start_1based": str(start1), "intron_end_1based": str(end1),
             "strand": strand, "donor_1based": str(junction.donor_1based), "acceptor_1based": str(junction.acceptor_1based),
             "splice_motif": "", "annotation_status": annotation,
-            "unique_split_reads": splice_exact, "multi_split_reads": "", "total_split_reads": splice_exact,
+            # Review B3b-11: IRFinder's SpliceExact/MaxSplice is SITE COVERAGE
+            # at the retained intron's boundaries, not a split-read count.
+            # Mapping it onto unique/total_split_reads let IR junctions pass
+            # the unique-read gate on non-split-read evidence, so those fields
+            # stay blank and the site coverage lives in IR-specific fields.
+            "unique_split_reads": "", "multi_split_reads": "", "total_split_reads": "",
+            "ir_site_coverage": splice_exact,
+            "ir_site_coverage_source": f"IRFinder-S:{splice_exact_field}" if splice_exact_field else "",
+            "split_read_support_status": "NOT_MEASURED_BY_IRFINDER",
             "max_overhang": "", "source_coordinate_systems": coordinate_system,
             "source_tools": "IRFinder-S", "source_tool_versions": source_tool_version,
             "source_files": str(p), "source_record_ids": record_id, "provenance_record_count": "1",

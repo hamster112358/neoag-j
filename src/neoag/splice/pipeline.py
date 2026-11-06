@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from neoag.schemas import EVENT_FIELDS as LEGACY_EVENT_FIELDS, PEPTIDE_FIELDS as LEGACY_PEPTIDE_FIELDS, RNA_JUNCTION_EVIDENCE_FIELDS
+from neoag.splice.causal_status import CAUSAL_STATUS_PRIORITY
 from neoag.splice.coordinates import file_sha256
 from neoag.splice.identifiers import link_id, splice_event_id, stable_digest, stable_id
 from neoag.utils import read_tsv, write_json, write_tsv
@@ -56,7 +57,15 @@ _MAX_FIELDS = {
     "junction_reads", "easyquant_junction_reads", "easyquant_spanning_pairs", "junction_score",
     "sample_count", "total_samples", "sample_prevalence", "kmer_prevalence", "uniqueness_rate",
     "normal_total_junction_reads", "normal_tissue_count",
+    # Review B3b-02: these numeric fields used to fall through to the
+    # lexicographic _best(); stronger observation wins.
+    "psi", "outlier_score",
 }
+# Signed effect sizes: keep the largest absolute deviation, not the string that
+# sorts first and not the largest signed value (which would prefer +0.1 over -0.9).
+_MAXABS_FIELDS = {"delta_psi"}
+# p-value-like fields: smaller is stronger evidence.
+_MIN_FIELDS = {"qvalue"}
 _IDENTITY_FIELDS = {
     "genome_build", "chrom", "intron_start_1based", "intron_end_1based", "strand",
     "donor_1based", "acceptor_1based", "event_type", "junction_ids", "gene", "gene_id",
@@ -65,10 +74,8 @@ _IDENTITY_FIELDS = {
     "ref", "alt", "query_id", "sequence_sha256",
 }
 _STATUS_PRIORITY: dict[str, dict[str, int]] = {
-    "causal_status": {
-        "UNASSESSED": 0, "DNA_PREDICTION_ONLY": 1, "DNA_RNA_CIS_SUPPORTED": 2,
-        "TARGETED_SPANNING_ONLY": 3, "PVACSPLICE_SUPPORTED": 4, "TARGETED_REQUANT_SUPPORTED": 5,
-    },
+    # Review B3b-13: one shared causal-status ladder for the whole splice layer.
+    "causal_status": CAUSAL_STATUS_PRIORITY,
     "targeted_requant_status": {
         "UNASSESSED": 0, "TARGETED_REQUANT_NEGATIVE": 1, "TARGETED_SPANNING_ONLY": 2,
         "TARGETED_REQUANT_SUPPORTED": 3,
@@ -87,10 +94,25 @@ def _tokens(value: Any) -> set[str]:
 
 def _best(values: set[str]) -> str:
     non_missing = [x for x in values if x and x.upper() not in {"UNASSESSED", "UNRESOLVED", "NA", "NONE"}]
-    return sorted(non_missing or [x for x in values if x])[0] if (non_missing or values) else ""
+    candidates = non_missing or [x for x in values if x]
+    if not candidates:
+        return ""
+    # Review B3b-02: a fully numeric conflict is resolved by strongest
+    # observation (numeric max), never by string order ("10.5" vs "9.5").
+    if len(candidates) > 1 and all(_is_number(x) for x in candidates):
+        return _numeric_pick(candidates, mode="max")
+    return sorted(candidates)[0]
 
 
-def _numeric_max(values: set[str]) -> str:
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except Exception:
+        return False
+
+
+def _numeric_pick(values, mode: str) -> str:
     parsed: list[float] = []
     for value in values:
         try:
@@ -99,8 +121,17 @@ def _numeric_max(values: set[str]) -> str:
             pass
     if not parsed:
         return ""
-    maximum = max(parsed)
-    return str(int(maximum)) if maximum.is_integer() else f"{maximum:.12g}"
+    if mode == "min":
+        winner = min(parsed)
+    elif mode == "maxabs":
+        winner = max(parsed, key=abs)
+    else:
+        winner = max(parsed)
+    return str(int(winner)) if float(winner).is_integer() else f"{winner:.12g}"
+
+
+def _numeric_max(values: set[str]) -> str:
+    return _numeric_pick(values, mode="max")
 
 
 def _status_best(field_name: str, values: set[str]) -> str:
@@ -160,6 +191,10 @@ class SpliceLayer:
                     output[field_name] = ";".join(sorted({token for value in values for token in _tokens(value)}))
                 elif field_name in _MAX_FIELDS:
                     output[field_name] = _numeric_max(values)
+                elif field_name in _MAXABS_FIELDS:
+                    output[field_name] = _numeric_pick(values, mode="maxabs")
+                elif field_name in _MIN_FIELDS:
+                    output[field_name] = _numeric_pick(values, mode="min")
                 elif field_name in _STATUS_PRIORITY:
                     output[field_name] = _status_best(field_name, values)
                 elif field_name == "provenance_record_count":
@@ -554,13 +589,17 @@ def build_splice_provenance_layer(
         ))
 
     # ImmunoPepper reference metadata may contain millions of translated paths.
-    # Restrict it, in a streaming pass, to exact canonical junctions emitted by
-    # the independent SplAdder event model. This preserves relevant provenance
-    # without materializing the complete reference graph in memory.
+    # Restrict it, in a streaming pass, to exact canonical junctions already
+    # observed for this sample.  Review B3b-03: the target set used to be
+    # limited to SplAdder-sourced junction ids, which silently dropped
+    # ImmunoPepper translation support for RegTools/STAR-only junctions.  The
+    # join key is the canonical junction (build/chrom/coordinates/strand),
+    # which is caller-independent by construction; every source contributes
+    # its observed junctions to the target set.
     immunopepper_target_junctions = {
         row.get("junction_id", "")
         for row in layer.tables.get("junctions", [])
-        if "SplAdder" in _tokens(row.get("source_tools", "")) and row.get("junction_id")
+        if row.get("junction_id")
     }
     use_target_filter = bool(immunopepper_target_junctions)
     for path in _as_paths(immunopepper_meta):

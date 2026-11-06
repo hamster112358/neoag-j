@@ -264,7 +264,9 @@ def parse_splice2neo(
                     "crosses_junction": get(row, "crosses_junction", default="UNASSESSED"),
                     "junction_ids": jid, "required_junction_ids": jid,
                     "junction_offset_in_peptide": get(row, "junction_offset_in_peptide"),
-                    "contains_novel_aa": get(row, "contains_novel_aa", default="true"),
+                    # Review B3b-09: novelty must be an observation, not a
+                    # presumption; an absent column is UNASSESSED.
+                    "contains_novel_aa": get(row, "contains_novel_aa", default="UNASSESSED"),
                     "novel_aa_positions": get(row, "novel_aa_positions"),
                     "wildtype_counterpart_status": get(row, "wildtype_counterpart_status", default="UNRESOLVED"),
                     "wildtype_peptide": get(row, "wildtype_peptide"), "reference_proteome_match": get(row, "reference_proteome_match", default="UNASSESSED"),

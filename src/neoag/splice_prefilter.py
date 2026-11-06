@@ -34,13 +34,24 @@ def _number(rows: list[Mapping[str, Any]], *fields: str) -> float | None:
         return None
 
 
-def _status(rows: list[Mapping[str, Any]], fields: tuple[str, ...], *, pass_tokens: set[str], fail_tokens: set[str]) -> Decision:
+def _status(
+    rows: list[Mapping[str, Any]],
+    fields: tuple[str, ...],
+    *,
+    pass_tokens: set[str],
+    fail_tokens: set[str],
+    precedence_tokens: set[str] | frozenset[str] = frozenset(),
+) -> Decision:
     value = _text(rows, *fields)
     if not value:
         return None, "not_recorded"
     upper = value.upper()
     def matches(token: str) -> bool:
         return upper == token if token in {"NO", "YES", "TRUE", "FALSE", "PASS", "FAIL"} else token in upper
+    # Review B3b-07: enumerated positive statuses win over shorter FAIL
+    # tokens they contain ("NMD_ESCAPE" contains the FAIL token "NMD").
+    if precedence_tokens and any(matches(token) for token in precedence_tokens):
+        return True, value
     negated_pass_tokens = {"NOT_DETECTED", "NOT_FOUND", "NOT_PREDICTED", "ABSENT", "NEGATIVE", "FALSE", "NO", "ESCAPES_NMD", "UNANNOTATED"}
     if any(matches(token) for token in pass_tokens & negated_pass_tokens):
         return True, value
@@ -49,6 +60,46 @@ def _status(rows: list[Mapping[str, Any]], fields: tuple[str, ...], *, pass_toke
     if any(matches(token) for token in pass_tokens):
         return True, value
     return None, value
+
+
+def _junction_read_qc_decision(rows: list[Mapping[str, Any]], *, incomplete_policy: str) -> Decision:
+    """Formal junction read QC verdict (review B3b-06).
+
+    FAIL is contradictory evidence; INCOMPLETE is merely insufficient data.
+    INCOMPLETE therefore defaults to the REVIEW branch so STAR-only samples
+    land in the explicitly-labelled exploration pool instead of being hard
+    rejected; profiles can opt into strictness with
+    gates.junction_read_qc_incomplete_policy = "reject".
+    """
+    value = _text(rows, "junction_read_qc_status")
+    if not value:
+        return None, "not_recorded"
+    upper = value.upper()
+    if "FAIL" in upper:
+        return False, value
+    if "INCOMPLETE" in upper:
+        if incomplete_policy == "reject":
+            return False, f"{value}; policy=junction_read_qc_incomplete_policy:reject"
+        return None, f"{value}; insufficient_junction_read_qc_review"
+    if upper == "PASS" or ("PASS" in upper and "NOT" not in upper):
+        return True, value
+    return None, value
+
+
+def _binder_sort_key(row: Mapping[str, str]) -> tuple:
+    """Order peptide/HLA rows by declared presentation ranking, best first.
+
+    Review B3b-07: the per-event top-N truncation used to take the first N
+    rows in file order, making candidate recall order-dependent.  Rows without
+    a numeric rank sort after ranked rows; peptide/HLA identifiers break ties
+    deterministically so the selection is independent of input order.
+    """
+    raw = str(row.get("el_rank") or row.get("binding_rank") or "").strip()
+    ident = (str(row.get("peptide_id", "")), str(row.get("hla_allele", "")), str(row.get("peptide", "")))
+    try:
+        return (0, float(raw), "", *ident)
+    except ValueError:
+        return (1, 0.0, raw, *ident)
 
 
 def _aggregate_exclusion_status(rows: list[Mapping[str, Any]], fields: tuple[str, ...], label: str) -> Decision:
@@ -153,11 +204,9 @@ def _stage_definitions(profile: Mapping[str, Any]) -> list[tuple[str, str, Calla
         (
             "FORMAL_JUNCTION_READ_QC",
             "complete junction read QC passed (reads, unique starts, anchor, MAPQ, multimapping, PSI and caller filter)",
-            lambda rows: _status(
+            lambda rows: _junction_read_qc_decision(
                 rows,
-                ("junction_read_qc_status",),
-                pass_tokens={"PASS"},
-                fail_tokens={"FAIL", "INCOMPLETE"},
+                incomplete_policy=str(gates.get("junction_read_qc_incomplete_policy", "review")).strip().lower(),
             ),
         ),
         (
@@ -213,7 +262,9 @@ def _stage_definitions(profile: Mapping[str, Any]) -> list[tuple[str, str, Calla
             lambda rows: _status(
                 rows,
                 ("splice_orf_status", "orf_evidence_grade", "rna_frame_status"),
-                pass_tokens={"PASS", "VALID", "IN_FRAME", "TRANSLATED", "O1", "O2"},
+                # Review B3b-06: O3 is the strongest ORF grade the consensus
+                # ladder emits; omitting it kept best-graded ORFs in REVIEW.
+                pass_tokens={"PASS", "VALID", "IN_FRAME", "TRANSLATED", "O1", "O2", "O3"},
                 fail_tokens={"FAIL", "INVALID", "OUT_OF_FRAME", "UNTRANSLATED", "O4"},
             ),
         ),
@@ -225,6 +276,10 @@ def _stage_definitions(profile: Mapping[str, Any]) -> list[tuple[str, str, Calla
                 ("splice_nmd_status", "nmd_status", "predicted_nmd"),
                 pass_tokens={"NOT_PREDICTED", "ESCAPES_NMD", "PASS", "FALSE", "NO"},
                 fail_tokens={"NMD", "PREDICTED_NMD", "FAIL", "TRUE", "YES"},
+                # Review B3b-07: any enumerated NMD-escape status (ESCAPES_NMD,
+                # NMD_ESCAPE, NMD_ESCAPING, ...) beats the bare "NMD" FAIL token
+                # it contains; escaping decay is the positive outcome here.
+                precedence_tokens={"ESCAPE"},
             ),
         ),
         (
@@ -346,7 +401,8 @@ def prefilter_splice_peptides(
     for event_id in event_order:
         if event_id not in selected_events:
             continue
-        for row in grouped.get(event_id, [])[:max_pairs]:
+        ordered_rows = sorted(grouped.get(event_id, []), key=_binder_sort_key)
+        for row in ordered_rows[:max_pairs]:
             enriched = dict(row)
             enriched["splice_prefilter_status"] = status_by_event[event_id]
             enriched["splice_candidate_pool"] = (
