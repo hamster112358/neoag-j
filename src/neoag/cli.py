@@ -125,9 +125,15 @@ def cmd_build_presentation(args):
     if getattr(args, "weight_sensitivity", False):
         from pathlib import Path
         from .presentation import write_weight_sensitivity
+        sens_mode = str(getattr(args, "sensitivity_mode", "baseline") or "baseline")
         sens = Path(args.out).with_name("presentation_weight_sensitivity.tsv")
-        write_weight_sensitivity(rows, load_profile(args.profile), sens, perturb=getattr(args, "sensitivity_perturb", 0.25))
-        print(f"Weight sensitivity QC table: {sens}")
+        write_weight_sensitivity(
+            rows, load_profile(args.profile), sens,
+            perturb=getattr(args, "sensitivity_perturb", 0.25),
+            mode=sens_mode,
+            samples=int(getattr(args, "sensitivity_samples", 300) or 300),
+        )
+        print(f"Weight sensitivity QC table ({sens_mode} mode): {sens}")
     print("Built PresentationEvidence.")
 
 def cmd_appm(args):
@@ -1150,7 +1156,7 @@ def build_parser():
     pm = sub.add_parser("parse-mhcflurry")
     pm.add_argument("--sample-id", default="SAMPLE001"); pm.add_argument("--input", required=True); pm.add_argument("--out", required=True); pm.set_defaults(func=cmd_parse_mhcflurry)
     bp = sub.add_parser("build-presentation-evidence")
-    bp.add_argument("--raw-peptides", required=True); bp.add_argument("--netmhcpan"); bp.add_argument("--mhcflurry"); bp.add_argument("--netmhcstabpan"); bp.add_argument("--netchop"); bp.add_argument("--profile", default="default"); bp.add_argument("--out", required=True); bp.add_argument("--weight-sensitivity", action="store_true", help="Write presentation_weight_sensitivity.tsv: re-rank saved evidence under +-perturbed weight vectors (per-patient QC, audit A3)"); bp.add_argument("--sensitivity-perturb", type=float, default=0.25); bp.set_defaults(func=cmd_build_presentation)
+    bp.add_argument("--raw-peptides", required=True); bp.add_argument("--netmhcpan"); bp.add_argument("--mhcflurry"); bp.add_argument("--netmhcstabpan"); bp.add_argument("--netchop"); bp.add_argument("--profile", default="default"); bp.add_argument("--out", required=True); bp.add_argument("--weight-sensitivity", action="store_true", help="Write presentation_weight_sensitivity.tsv: re-rank saved evidence under +-perturbed weight vectors (per-patient QC, audit A3)"); bp.add_argument("--sensitivity-perturb", type=float, default=0.25); bp.add_argument("--sensitivity-mode", choices=["baseline", "global", "regional"], default="baseline", help="baseline: 1+2W one-at-a-time vectors (default); global: full +-perturb grid; regional: SMAA-style Dirichlet draws around the base weights (audit follow-up 2026-11-06)"); bp.add_argument("--sensitivity-samples", type=int, default=300, help="Dirichlet draws for --sensitivity-mode regional"); bp.set_defaults(func=cmd_build_presentation)
     ap = sub.add_parser("appm-lite")
     ap.add_argument("--sample-id", default="SAMPLE001"); ap.add_argument("--vep-tsv"); ap.add_argument("--expression"); ap.add_argument("--hla-loh"); ap.add_argument("--cnv"); ap.add_argument("--raw-peptides"); ap.add_argument("--ccf"); ap.add_argument("--profile", default="default"); ap.add_argument("--outdir", required=True); ap.set_defaults(func=cmd_appm)
     ap2 = sub.add_parser("appm-2", help="Build APPM 2.0 gene/pathway/peptide evidence sidecars")

@@ -237,6 +237,82 @@ def consensus(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def allele_consensus(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Audit follow-up 2026-11-06: allele-level voting as a parallel branch.
+
+    The pair-level consensus above casts one vote per tool for the tool's
+    complete genotype pair.  When three tools split on which allele goes with
+    which (three different pairs), every pair gets one vote and nothing wins -
+    the disagreement the operator pointed at.  This branch votes per single
+    allele at the locus instead: each tool contributes its (up to two) distinct
+    two-field alleles, one vote each; support for an allele is the number of
+    tools that reported it.  The top two alleles by (support desc, allele asc)
+    form the allele-level call, deterministically, with a tie flag when the
+    second/third counts tie.
+
+    Output is an additional table for review.  It never replaces the pair
+    consensus and nothing downstream consumes it into a decision.
+    """
+    by_locus: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_locus[row["locus"]].append(row)
+    out: list[dict[str, Any]] = []
+    for loc in LOCUS_ORDER:
+        locus_rows = by_locus.get(loc, [])
+        votes: Counter[str] = Counter()
+        tools_by_allele: dict[str, set[str]] = defaultdict(set)
+        for row in locus_rows:
+            tool = row["tool"]
+            seen = set()
+            for value in (row.get("lowres1"), row.get("lowres2")):
+                if value and value not in seen:
+                    seen.add(value)
+                    votes[value] += 1
+                    tools_by_allele[value].add(tool)
+        n_tools = len({row["tool"] for row in locus_rows})
+        ranked = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_two = {allele for allele, _ in ranked[:2]}
+        tie = "no"
+        if len(ranked) >= 3 and ranked[1][1] == ranked[2][1]:
+            tie = "yes"
+        elif len(ranked) == 2 and ranked[0][1] == ranked[1][1]:
+            # a clean two-allele genotype is expected, not a tie worth flagging
+            tie = "no"
+        elif len(ranked) == 1:
+            tie = "no"
+        if not ranked:
+            out.append({
+                "locus": DISPLAY.get(loc, loc),
+                "rank": "0",
+                "allele_lowres": "",
+                "support": "0/0",
+                "n_tools": "0",
+                "status": "MISSING",
+                "selected": "no",
+                "tie": "no",
+                "voting_tools": "",
+            })
+            continue
+        for index, (allele, count) in enumerate(ranked, start=1):
+            status = (
+                "ALLELE_CONSENSUS" if count >= 2
+                else "ALLELE_SINGLE_TOOL" if n_tools == 1
+                else "ALLELE_DISCORDANT_SUPPORT"
+            )
+            out.append({
+                "locus": DISPLAY.get(loc, loc),
+                "rank": str(index),
+                "allele_lowres": allele,
+                "support": f"{count}/{n_tools}",
+                "n_tools": str(n_tools),
+                "status": status,
+                "selected": "yes" if allele in top_two else "no",
+                "tie": tie if index <= 2 else "no",
+                "voting_tools": ";".join(sorted(tools_by_allele[allele])),
+            })
+    return out
+
+
 def suggestions(bam: str | None, fastq1: str | None, fastq2: str | None) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     if bam:
@@ -283,8 +359,15 @@ def main(argv: list[str] | None = None) -> int:
     write_tsv(outdir / "hla_typing.standardized.tsv", rows, standardized_columns)
     consensus_columns = ["locus", "consensus_lowres", "consensus_2field", "consensus_high_resolution", "support", "high_resolution_support", "status", "high_resolution_status", "details", "ranked_votes", "tie"]
     write_tsv(outdir / "hla_typing_consensus.tsv", cons, consensus_columns)
+    # Audit follow-up 2026-11-06: allele-level view as a parallel, review-only
+    # branch (operator request); the pair table above remains the decision.
+    allele_cons = allele_consensus(rows)
+    write_tsv(
+        outdir / "hla_typing_consensus_allele_level.tsv", allele_cons,
+        ["locus", "rank", "allele_lowres", "support", "n_tools", "status", "selected", "tie", "voting_tools"],
+    )
     write_tsv(outdir / "hla_typing_run_suggestions.tsv", run_suggestions, ["tool", "command"])
-    write_json(outdir / "hla_typing_recommendation.json", {"sample_id": args.sample_id or "", "n_tool_locus_calls": len(rows), "consensus": cons})
+    write_json(outdir / "hla_typing_recommendation.json", {"sample_id": args.sample_id or "", "n_tool_locus_calls": len(rows), "consensus": cons, "allele_level_consensus": allele_cons})
     recommended: list[str] = []
     for row in cons:
         if row["locus"] in {"A", "B", "C"} and row["consensus_2field"]:

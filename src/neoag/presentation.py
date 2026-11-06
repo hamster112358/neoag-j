@@ -194,19 +194,102 @@ WEIGHT_SENSITIVITY_FIELDS = [
     "peptide_id", "peptide", "hla_allele", "mhc_class", "base_score", "base_rank",
     "best_rank", "worst_rank", "rank_spread", "score_min", "score_max", "score_range",
     "verdict", "n_vectors",
+    # Audit follow-up 2026-11-06 (ranking sensitivity modes): SMAA-style
+    # acceptability columns; mode names baseline|global|regional.
+    "mode", "expected_rank", "rank_std",
+    "acceptability_top1", "acceptability_top10", "acceptability_top50", "acceptability_top100",
 ]
 
+SENSITIVITY_MODES = ("baseline", "global", "regional")
+SENSITIVITY_MAX_VECTORS = 4000
 
-def weight_sensitivity_table(evidence_rows, profile, perturb: float = 0.25):
-    """Audit item A3: weight-choice sensitivity, computed from saved evidence.
+
+def _weight_vectors(mode: str, base: dict[str, float], perturb: float,
+                    samples: int, concentration: float, seed: int) -> dict[str, dict[str, float]]:
+    """Weight vectors to re-rank under, per sensitivity mode.
+
+    baseline (audit A3): the base vector plus one up/down perturbation per
+    active weight - 1 + 2W configurations, cheap enough for every run.
+    global: the full +-perturb grid over all active weights (3^W), capped
+    deterministically at SENSITIVITY_MAX_VECTORS.
+    regional (SMAA-style): Dirichlet draws centred on the base weights - the
+    audit's "Dirichlet distribution can be one of options in Regional mode" -
+    concentrated around the scientifically motivated vector (higher
+    concentration = tighter region), sampled with a fixed seed so a rerun of
+    the same inputs produces the same table.
+    """
+    import random as _random
+
+    keys = [k for k, v in base.items() if v > 0]
+    if mode not in SENSITIVITY_MODES:
+        raise ValueError(f"unknown sensitivity mode {mode!r}; expected one of {SENSITIVITY_MODES}")
+    vectors: dict[str, dict[str, float]] = {"base": dict(base)}
+    if mode == "baseline":
+        for key, val in base.items():
+            if val <= 0:
+                continue
+            for factor, tag in ((1.0 + perturb, "up"), (1.0 - perturb, "down")):
+                vec = dict(base)
+                vec[key] = val * factor
+                vectors[f"{key}_{tag}"] = vec
+        return vectors
+    if mode == "global":
+        combos = []
+        for mask in range(3 ** len(keys)):
+            rest, combo = mask, []
+            for _ in keys:
+                combo.append(rest % 3)
+                rest //= 3
+            combos.append(combo)
+        if len(combos) > SENSITIVITY_MAX_VECTORS:
+            stride = -(-len(combos) // SENSITIVITY_MAX_VECTORS)
+            combos = combos[::stride]
+        for index, combo in enumerate(combos):
+            if all(value == 1 for value in combo):
+                continue  # this is the base vector
+            vec = dict(base)
+            for key, state in zip(keys, combo):
+                vec[key] = base[key] * (1.0 - perturb if state == 0 else 1.0 + perturb)
+            vectors[f"grid{index}"] = vec
+        return vectors
+    rng = _random.Random(seed)
+    alpha = [max(base[key] * concentration, 1e-6) for key in keys]
+    total = sum(alpha)
+    for index in range(samples):
+        draws = [rng.gammavariate(a, 1.0) for a in alpha]
+        drawn = sum(draws) or 1.0
+        # Keep the Dirichlet draw at the base weight total so the perturbed
+        # vector stays comparable (the weighted mean renormalizes anyway).
+        scale = total / drawn
+        vectors[f"dirichlet{index}"] = {
+            **{key: base[key] for key in base if key not in keys},
+            **{key: value * scale for key, value in zip(keys, draws)},
+        }
+    return vectors
+
+
+def weight_sensitivity_table(evidence_rows, profile, perturb: float = 0.25,
+                             mode: str = "baseline", samples: int = 300,
+                             concentration: float = 10.0, seed: int = 20261106):
+    """Audit item A3 (+2026-11-06 follow-up): weight-choice sensitivity.
 
     No predictors are rerun: every component score is already in the
     presentation evidence table, so the weighted sum is simply recombined under
-    +-perturb weight vectors and the candidates re-ranked.  The result is a
+    a set of weight vectors and the candidates re-ranked.  The result is a
     per-patient QC table - a candidate whose rank moves only because of the
     weight choice is not a robust pick.  Default weights come from the profile;
     the mechanism is exactly the sensitivity rerun the audit suggested, and
     NetMHCstabpan/NetChop participate with their real (tunable) weights.
+
+    mode selects the vector set (see _weight_vectors):
+      baseline  1 + 2W configurations (the original audit-A3 test),
+      global    the full +-perturb grid (far more combinations),
+      regional  SMAA-style Dirichlet draws around the base weights.
+    Every mode additionally reports the stochastic acceptability of each
+    candidate - the fraction of weight vectors under which it lands in the
+    top-K - and its expected rank / rank dispersion across vectors (SMAA).
+    This is robustness, not accuracy: it never changes the production score,
+    it tells the reviewer which ranks survive the weight choice.
     """
 
     w = profile.get("presentation_weights", {}) or {}
@@ -218,14 +301,7 @@ def weight_sensitivity_table(evidence_rows, profile, perturb: float = 0.25):
         "netchop_processing": float(w.get("netchop_processing", 0.10)),
         "netmhcstabpan_stability": float(w.get("netmhcstabpan_stability", 0.05)),
     }
-    vectors = {"base": dict(base)}
-    for key, val in base.items():
-        if val <= 0:
-            continue
-        for factor, tag in ((1.0 + perturb, "up"), (1.0 - perturb, "down")):
-            vec = dict(base)
-            vec[key] = val * factor
-            vectors[f"{key}_{tag}"] = vec
+    vectors = _weight_vectors(mode, base, perturb, samples, concentration, seed)
 
     def score_row(row, vec):
         is_mhci = str(row.get("mhc_class") or "I").upper() not in {"II", "MHC-II", "CLASSII"}
@@ -271,6 +347,12 @@ def weight_sensitivity_table(evidence_rows, profile, perturb: float = 0.25):
         spread = max(rs) - min(rs)
         svals = [vals[i] for vals in scores.values() if vals[i] is not None]
         verdict = "rank_stable" if spread == 0 else ("rank_minor_shift" if spread <= minor_band else "rank_unstable")
+        expected = sum(rs) / len(rs)
+        variance = sum((r - expected) ** 2 for r in rs) / len(rs)
+        acceptability = {
+            f"acceptability_top{k}": f"{sum(1 for r in rs if r <= k) / len(rs):.4f}"
+            for k in (1, 10, 50, 100)
+        }
         out.append({
             "peptide_id": row.get("peptide_id", ""),
             "peptide": row.get("peptide", ""),
@@ -286,11 +368,19 @@ def weight_sensitivity_table(evidence_rows, profile, perturb: float = 0.25):
             "score_range": f"{max(svals) - min(svals):.4f}",
             "verdict": verdict,
             "n_vectors": str(len(vectors)),
+            "mode": mode,
+            "expected_rank": f"{expected:.2f}",
+            "rank_std": f"{variance ** 0.5:.2f}",
+            **acceptability,
         })
     return out
 
 
-def write_weight_sensitivity(evidence_rows, profile, path, perturb: float = 0.25):
-    rows = weight_sensitivity_table(evidence_rows, profile, perturb=perturb)
+def write_weight_sensitivity(evidence_rows, profile, path, perturb: float = 0.25,
+                             mode: str = "baseline", samples: int = 300,
+                             concentration: float = 10.0, seed: int = 20261106):
+    rows = weight_sensitivity_table(evidence_rows, profile, perturb=perturb,
+                                    mode=mode, samples=samples,
+                                    concentration=concentration, seed=seed)
     write_tsv(path, rows, WEIGHT_SENSITIVITY_FIELDS)
     return path

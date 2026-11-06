@@ -34,8 +34,11 @@ CCF_FIELDS = [
     "purity_consensus_status", "purity_range", "purity_n_tools", "purity_tool_values",
     "purity_recommendation_file",
     # Audit C5: every CCF row must carry the versioned rule that produced its
-    # purity-confidence label, not just the input-QC sidecar.
+    # purity-confidence label, not just the input-QC sidecar.  Follow-up
+    # (2026-11-06): the rule text describes both routes; purity_confidence_route
+    # additionally records which route THIS row's label actually came from.
     "purity_confidence_criteria",
+    "purity_confidence_route",
     "total_cn", "major_cn", "minor_cn", "loh_status", "cnv_confidence",
     "multiplicity_candidates", "multiplicity_best", "multiplicity_confidence", "multiplicity_ambiguity",
     "multiplicity_sensitivity",
@@ -56,7 +59,7 @@ CCF_FIELDS = [
 
 CCF_INPUT_QC_FIELDS = [
     "sample_id", "purity", "purity_source", "purity_confidence", "ploidy", "cnv_source",
-    "purity_confidence_criteria",
+    "purity_confidence_criteria", "purity_confidence_route",
     "purity_consensus_status", "purity_range", "purity_n_tools", "purity_tool_values",
     "purity_recommendation_file",
     "cnv_quality_status", "cnv_segment_count", "fraction_genome_cna", "fraction_genome_loh",
@@ -92,11 +95,21 @@ def load_purity(path: str | Path | None) -> tuple[float | None, float | None]:
 # instead of implicit in two loaders. Every emitted row carries this string so
 # a reviewer can see which rule produced a given confidence.
 PURITY_CONFIDENCE_CRITERIA = (
-    "purity-confidence-v1: consensus JSON - CONCORDANT=high, "
-    "SINGLE_TOOL/MODERATE_DISCORDANCE=medium, other=low; single-value TSV - an "
-    "explicit confidence column wins, otherwise purity>=0.35=high, "
-    "0.20<=purity<0.35=medium, purity<0.20 or invalid=low"
+    "purity-confidence-v2: consensus JSON (route=consensus_status_map) - "
+    "CONCORDANT=high, SINGLE_TOOL/MODERATE_DISCORDANCE=medium, other=low; "
+    "single-value TSV (route=explicit_confidence_column when a confidence "
+    "column was present, purity_value_thresholds otherwise) - explicit column "
+    "wins, otherwise purity>=0.35=high, 0.20<=purity<0.35=medium, "
+    "purity<0.20 or invalid=low; missing input (route=not_assessed)=low"
 )
+
+# Audit C5 follow-up (2026-11-06): the criteria string above describes the
+# rules; this per-row value records which route actually produced the label,
+# so a consumer never has to re-derive it from the input file's format.
+ROUTE_CONSENSUS_MAP = "consensus_status_map"
+ROUTE_EXPLICIT_COLUMN = "explicit_confidence_column"
+ROUTE_VALUE_THRESHOLDS = "purity_value_thresholds"
+ROUTE_NOT_ASSESSED = "not_assessed"
 
 
 def _load_purity_recommendation(path: Path) -> dict[str, Any]:
@@ -118,6 +131,7 @@ def _load_purity_recommendation(path: Path) -> dict[str, Any]:
         "purity_source": source,
         "purity_confidence": confidence,
         "purity_confidence_criteria": PURITY_CONFIDENCE_CRITERIA,
+        "purity_confidence_route": ROUTE_CONSENSUS_MAP,
         "purity_consensus_status": status,
         "purity_range": str(payload.get("range") or ""),
         "purity_n_tools": n_tools,
@@ -131,6 +145,7 @@ def _with_purity_consensus_defaults(info: dict[str, Any]) -> dict[str, Any]:
     return {
         **info,
         "purity_confidence_criteria": info.get("purity_confidence_criteria", PURITY_CONFIDENCE_CRITERIA),
+        "purity_confidence_route": info.get("purity_confidence_route", ROUTE_NOT_ASSESSED),
         "purity_consensus_status": info.get("purity_consensus_status", "NOT_ASSESSED"),
         "purity_range": info.get("purity_range", ""),
         "purity_n_tools": info.get("purity_n_tools", ""),
@@ -165,7 +180,10 @@ def load_purity_info(path: str | Path | None) -> dict[str, Any]:
     ploidy = to_float(first(r, ["ploidy", "tumor_ploidy"], ""), -1.0)
     source = first(r, ["source", "tool", "purity_source", "caller"], "provided")
     conf = first(r, ["confidence", "purity_confidence", "quality"], "")
-    if not conf:
+    if conf:
+        route = ROUTE_EXPLICIT_COLUMN
+    else:
+        route = ROUTE_VALUE_THRESHOLDS
         if purity <= 0:
             conf = "low"
         elif purity < 0.20:
@@ -180,6 +198,7 @@ def load_purity_info(path: str | Path | None) -> dict[str, Any]:
         "purity_source": source,
         "purity_confidence": conf,
         "purity_confidence_criteria": PURITY_CONFIDENCE_CRITERIA,
+        "purity_confidence_route": route,
         "reason": "purity_loaded" if purity > 0 else "invalid_purity",
     })
 
@@ -604,6 +623,8 @@ def build_input_qc(sample_id: str, purity_info: Mapping[str, Any], cnv_rows: lis
         "purity": "" if purity_info.get("purity") is None else f"{float(purity_info['purity']):.4f}",
         "purity_source": str(purity_info.get("purity_source", "")),
         "purity_confidence": str(purity_info.get("purity_confidence", "low")),
+        "purity_confidence_route": str(purity_info.get("purity_confidence_route", ROUTE_NOT_ASSESSED)),
+        "purity_confidence_criteria": str(purity_info.get("purity_confidence_criteria", PURITY_CONFIDENCE_CRITERIA)),
         "ploidy": "" if purity_info.get("ploidy") is None else f"{float(purity_info['ploidy']):.4f}",
         "purity_consensus_status": str(purity_info.get("purity_consensus_status", "")),
         "purity_range": str(purity_info.get("purity_range", "")),
@@ -993,6 +1014,7 @@ def build_ccf_2(
             "purity_tool_values": str(purity_info.get("purity_tool_values", "")),
             "purity_recommendation_file": str(purity_info.get("purity_recommendation_file", "")),
             "purity_confidence_criteria": str(purity_info.get("purity_confidence_criteria", PURITY_CONFIDENCE_CRITERIA)),
+            "purity_confidence_route": str(purity_info.get("purity_confidence_route", ROUTE_NOT_ASSESSED)),
             "total_cn": f"{total_cn:.4f}",
             "major_cn": cn.get("major_cn", ""),
             "minor_cn": cn.get("minor_cn", ""),

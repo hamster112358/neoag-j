@@ -1146,6 +1146,7 @@ def _enrich_rows_from_sources(
         "event_normal_hspc_status", "event_safety_missing_layers",
         "event_safety_reason",
         "ccf_estimate", "ccf_confidence_state", "purity_consensus_status", "hla_appm_state",
+        "multiplicity_sensitivity", "purity_confidence", "purity_confidence_route",
         "appm_integrity_status", "restricting_hla_lost", "restricting_locus_loh", "loh_status",
         "escape_status", "immunogenicity_score", "immunogenicity_composite_score",
         "netmhcpan_el_rank", "mhcflurry_presentation_score", "mhcflurry_processing_score",
@@ -1858,6 +1859,22 @@ def load_report_bundle(
         evidence_source_label = "ranked input (all_tool_results unavailable)"
         evidence_source_status = "RANKED_INPUT_ONLY"
     _augment_purity_from_ranked_rows(prov, events + peptides + source_peptides)
+    # Operator 2026-11-06 (audit C5 follow-up): display which route produced
+    # the purity-confidence label.  ccf_v2 guarantees a per-row
+    # purity_confidence_route; carry it onto the sample-level consensus block
+    # so both the patient and technical reports show the provenance next to
+    # the confidence label.  Display only - no decision reads these keys.
+    _ranked_purity_row = next(
+        (row for row in events + peptides + source_peptides
+         if str(row.get("purity_confidence_route") or "").strip()),
+        {},
+    )
+    if _ranked_purity_row and isinstance(prov.get("purity_cnv_consensus"), Mapping):
+        _consensus = dict(prov["purity_cnv_consensus"])
+        _consensus.setdefault("confidence", str(_ranked_purity_row.get("purity_confidence") or ""))
+        _consensus.setdefault("confidence_route", str(_ranked_purity_row.get("purity_confidence_route") or ""))
+        _consensus.setdefault("confidence_criteria", str(_ranked_purity_row.get("purity_confidence_criteria") or ""))
+        prov["purity_cnv_consensus"] = _consensus
     if not prov.get("purity_cnv_consensus") and (prov.get("purity_cnv_tools") or _purity_tools_from_provenance(prov)):
         tool_rows = [dict(row) for row in (prov.get("purity_cnv_tools") or _purity_tools_from_provenance(prov))]
         if len(tool_rows) == 1:
@@ -5758,8 +5775,18 @@ def _patient_purity_consensus(bundle: ReportBundle) -> tuple[str, str]:
         ploidy = _patient_purity_value(consensus.get("recommended_ploidy"), missing="未评估")
         tool = str(consensus.get("selected_tool") or "多工具共识")
         status = str(consensus.get("status") or "UNASSESSED")
-        result = f"推荐纯度 {purity}、倍性 {ploidy}（{tool}；{status}）"
+        confidence = str(consensus.get("confidence") or "").strip()
+        confidence_route = str(consensus.get("confidence_route") or "").strip()
+        confidence_criteria = str(consensus.get("confidence_criteria") or "").strip()
+        confidence_part = ""
+        if confidence:
+            confidence_part = f"；置信度 {confidence}" + (
+                f"（判定路径 {confidence_route}）" if confidence_route else ""
+            )
+        result = f"推荐纯度 {purity}、倍性 {ploidy}（{tool}；{status}{confidence_part}）"
         basis = str(consensus.get("basis") or "多工具结果已并列保留；共识依据未记录")
+        if confidence_criteria:
+            basis = f"{basis}（置信度判定规则: {confidence_criteria}）"
         return result, basis
     fallback = str(bundle.provenance.get("purity_ploidy") or "未评估")
     return fallback, "未提供结构化多工具共识；不得静默选择单一工具"
@@ -7112,7 +7139,12 @@ def make_technical_report(path: str | Path, bundle: ReportBundle) -> None:
         "cancer_gene_list_status", "cancer_gene_symbols", "cancer_gene_types", "cancer_driver_context",
         "oncokb_annotated", "cosmic_cgc_flag", "cancer_gene_source_count", "cancer_gene_sources", "cancer_gene_context",
         "event_score", "raw_ccf", "ccf_estimate", "ccf_status", "ccf_confidence",
-        "ccf_method", "ccf_warning", "clonality_multiplier", "safety_status", "safety_reason",
+        "ccf_method", "ccf_warning", "clonality_multiplier",
+        # Display-only provenance columns (operator 2026-11-06): whether the
+        # multiplicity choice can change the clonality verdict, and which
+        # route produced the purity-confidence label.
+        "multiplicity_sensitivity", "purity_confidence", "purity_confidence_route",
+        "safety_status", "safety_reason",
         "safety_evidence_completeness", "safety_missing_layers", "normal_expression_status",
         "normal_hspc_status", "reference_proteome_status", "normal_ligandome_status",
         "phase_group_id", "haplotype_status", "phase_support_reads",

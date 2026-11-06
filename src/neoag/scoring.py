@@ -362,6 +362,11 @@ def score_peptide(p, e, profile, pres, summary):
         "total_cn", "major_cn", "minor_cn", "multiplicity_best", "multiplicity_candidates",
         "multiplicity_confidence", "multiplicity_ambiguity", "mutation_multiplicity_source", "normal_contamination_status",
         "ccf_resolution", "ccf_resolution_reason",
+        # Report visibility (operator 2026-11-06): blast-radius of the
+        # multiplicity choice and the purity-confidence provenance ride
+        # through to the ranked tables for display only; no ranking rule
+        # consumes them.
+        "multiplicity_sensitivity", "purity_confidence", "purity_confidence_route",
     ):
         p[field] = e.get(field, p.get(field, ""))
     for field in (
@@ -476,6 +481,9 @@ def score(raw_events, raw_peptides, presentation_evidence, appm_summary_tsv, ccf
                 "total_cn", "major_cn", "minor_cn", "multiplicity_best", "multiplicity_candidates",
                 "multiplicity_confidence", "multiplicity_ambiguity", "mutation_multiplicity_source", "normal_contamination_status",
                 "ccf_resolution", "ccf_resolution_reason",
+                # Report visibility (operator 2026-11-06): carried from ccf_2
+                # for display; multiplicity sensitivity must not enter scoring.
+                "multiplicity_sensitivity", "purity_confidence", "purity_confidence_route",
             ):
                 e[field] = c.get(field, "")
         else:
