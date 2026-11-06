@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .utils import clamp, norm_rank, to_float
-from .evidence_provenance import ProvenanceRegistry
+from .evidence_provenance import (
+    ProvenanceRegistry,
+    STATUS_INVALID_FOR_PRODUCTION,
+    STATUS_REAL,
+    STATUS_STUB,
+)
 
 IMMUNOGENICITY_FIELDS = [
     "prime_score",
@@ -128,7 +133,20 @@ def component_scores(row: Mapping[str, Any], profile: Mapping[str, Any]) -> dict
 
 
 def _is_stub_evidence(row: Mapping[str, Any]) -> bool:
-    return str(row.get("evidence_status", "")).strip().lower() == "stub"
+    # Review C2-02: the row-level status wins first — a real tool file can
+    # still contain placeholder rows the tool never returned (C1-01), which
+    # the file-level column cannot see.  The file-level fallback also treats
+    # invalid_for_production as unusable, not just plain stub.
+    row_status = str(row.get("evidence_row_status", "")).strip().lower()
+    if row_status:
+        return row_status != STATUS_REAL
+    return str(row.get("evidence_status", "")).strip().lower() in {STATUS_STUB, STATUS_INVALID_FOR_PRODUCTION}
+
+
+def _all_stub_source_rows(rows: list[dict[str, str]]) -> bool:
+    return bool(rows) and all(
+        str(row.get("source_file", "")).strip().lower() == "stub" for row in rows
+    )
 
 
 def _non_stub_evidence_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -321,10 +339,14 @@ def run_immunogenicity_predictors(
             run_prime(ctx, prime_tool)
         if paths["prime"] is None and prime_can_use_tool_output and prime_tool.is_file():
             prime_path = pres_dir / "prime_evidence.tsv"
+            prime_rows = parse_prime(prime_tool, ctx.sample_id)
+            # A non-strict fallback may have stubbed the whole tool output;
+            # register that as stub, not real (review C1-01).
+            prime_is_stub = ctx.stub or _all_stub_source_rows(prime_rows)
             write_prime_evidence(
                 prime_path,
-                parse_prime(prime_tool, ctx.sample_id),
-                provenance=registry.register_real("prime", prime_tool) if not ctx.stub else registry.register_stub("prime"),
+                prime_rows,
+                provenance=registry.register_stub("prime") if prime_is_stub else registry.register_real("prime", prime_tool),
             )
             paths["prime"] = prime_path
         elif (pres_dir / "prime_evidence.tsv").is_file():
@@ -352,10 +374,12 @@ def run_immunogenicity_predictors(
             run_bigmhc_im(ctx, bigmhc_tool)
         if paths["bigmhc_im"] is None and bigmhc_can_use_tool_output and bigmhc_tool.is_file():
             bigmhc_path = pres_dir / "bigmhc_im_evidence.tsv"
+            bigmhc_rows = parse_bigmhc_im(bigmhc_tool, ctx.sample_id)
+            bigmhc_is_stub = ctx.stub or _all_stub_source_rows(bigmhc_rows)
             write_bigmhc_im_evidence(
                 bigmhc_path,
-                parse_bigmhc_im(bigmhc_tool, ctx.sample_id),
-                provenance=registry.register_real("bigmhc_im", bigmhc_tool) if not ctx.stub else registry.register_stub("bigmhc_im"),
+                bigmhc_rows,
+                provenance=registry.register_stub("bigmhc_im") if bigmhc_is_stub else registry.register_real("bigmhc_im", bigmhc_tool),
             )
             paths["bigmhc_im"] = bigmhc_path
         elif (pres_dir / "bigmhc_im_evidence.tsv").is_file():
@@ -383,10 +407,12 @@ def run_immunogenicity_predictors(
             run_deepimmuno(ctx, deepimmuno_tool)
         if paths["deepimmuno"] is None and deepimmuno_can_use_tool_output and deepimmuno_tool.is_file():
             deepimmuno_path = pres_dir / "deepimmuno_evidence.tsv"
+            deepimmuno_rows = parse_deepimmuno(deepimmuno_tool, ctx.sample_id)
+            deepimmuno_is_stub = ctx.stub or _all_stub_source_rows(deepimmuno_rows)
             write_deepimmuno_evidence(
                 deepimmuno_path,
-                parse_deepimmuno(deepimmuno_tool, ctx.sample_id),
-                provenance=registry.register_real("deepimmuno", deepimmuno_tool) if not ctx.stub else registry.register_stub("deepimmuno"),
+                deepimmuno_rows,
+                provenance=registry.register_stub("deepimmuno") if deepimmuno_is_stub else registry.register_real("deepimmuno", deepimmuno_tool),
             )
             paths["deepimmuno"] = deepimmuno_path
         elif (pres_dir / "deepimmuno_evidence.tsv").is_file():

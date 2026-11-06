@@ -189,6 +189,25 @@ def provenance_derived(tool: str, path: str | Path | None, *, upstream: str = ""
     )
 
 
+def _file_row_status(fields: Mapping[str, str]) -> str:
+    status = str(fields.get("evidence_status", "")).strip().lower()
+    mode = str(fields.get("evidence_mode", "")).strip().lower()
+    if status in {STATUS_STUB, STATUS_INVALID_FOR_PRODUCTION} or mode == MODE_STUB:
+        return STATUS_STUB
+    return STATUS_REAL
+
+
+def _row_evidence_status(row: Mapping[str, Any], fields: Mapping[str, str]) -> str:
+    # Sticky row marks (review C1-01/C2-02): a producer marks individual
+    # placeholder rows stub even when the file itself is real tool output;
+    # an explicit row mark must never be overwritten by file provenance.
+    if str(row.get("evidence_row_status", "")).strip().lower() == STATUS_STUB:
+        return STATUS_STUB
+    if str(row.get("source_file", "")).strip().lower() == "stub":
+        return STATUS_STUB
+    return _file_row_status(fields)
+
+
 def attach_provenance(
     rows: list[dict[str, str]],
     record: ProvenanceRecord | Mapping[str, str],
@@ -198,8 +217,8 @@ def attach_provenance(
     else:
         fields = dict(record)
     if not rows:
-        return [fields]
-    return [{**row, **fields} for row in rows]
+        return [{**fields, "evidence_row_status": _file_row_status(fields)}]
+    return [{**row, **fields, "evidence_row_status": _row_evidence_status(row, fields)} for row in rows]
 
 
 def write_evidence_tsv(

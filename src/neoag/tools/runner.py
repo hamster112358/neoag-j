@@ -1284,14 +1284,18 @@ def _prime_evidence_rows(
     sample_id: str,
     source_file: str,
 ) -> list[dict[str, str]]:
-    from ..adapters.prime import extract_prime_pair, predict_pair_stub
+    from ..adapters.prime import extract_prime_pair
+    from ..evidence_provenance import STATUS_REAL, STATUS_STUB
 
     merged: list[dict[str, str]] = []
     for peptide, allele in pairs:
         row = by_pep.get(peptide.upper(), {})
         score, rank = extract_prime_pair(row, peptide, allele)
-        if not score and not rank:
-            score, rank = predict_pair_stub(peptide, allele)
+        # Review C1-01: pairs PRIME never returned are recorded as empty
+        # placeholder rows with a row-level stub marker.  Previously
+        # predict_pair_stub fabricated a deterministic pseudo-random
+        # score/rank here and those numbers merged into the real tool file
+        # with no marking at all.
         merged.append({
             "sample_id": sample_id,
             "peptide": peptide,
@@ -1299,6 +1303,7 @@ def _prime_evidence_rows(
             "prime_score": score,
             "prime_rank": rank,
             "source_file": source_file,
+            "evidence_row_status": STATUS_REAL if (score or rank) else STATUS_STUB,
         })
     return merged
 

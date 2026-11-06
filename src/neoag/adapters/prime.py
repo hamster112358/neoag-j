@@ -138,7 +138,8 @@ def _parse_prime_tsv(path: Path, sample_id: str) -> list[dict[str, str]]:
                 "hla_allele": hla,
                 "prime_score": str(score),
                 "prime_rank": str(rank),
-                "source_file": str(path),
+                # Keep an explicit source marker (e.g. "stub") if present.
+                "source_file": str(row.get("source_file") or "").strip() or str(path),
             })
         if rows:
             return rows
@@ -187,7 +188,8 @@ def _parse_prime_tsv(path: Path, sample_id: str) -> list[dict[str, str]]:
                 "hla_allele": hla,
                 "prime_score": str(score),
                 "prime_rank": str(rank),
-                "source_file": str(path),
+                # Keep an explicit source marker (e.g. "stub") if present.
+                "source_file": str(row.get("source_file") or "").strip() or str(path),
             })
     return rows
 
@@ -198,9 +200,13 @@ def write_prime_evidence(
     provenance: ProvenanceRecord | None = None,
 ) -> None:
     src = rows[0].get("source_file") if rows else path
-    if src == "stub":
+    stub_rows = [row for row in rows if str(row.get("source_file", "")).strip().lower() == "stub"]
+    if stub_rows and len(stub_rows) == len(rows):
+        # A fully stubbed file is stub provenance no matter what the caller
+        # passed: the non-strict missing-tool fallback must not register the
+        # fabricated numbers as real tool output (review C1-01).
         from ..evidence_provenance import provenance_stub
-        prov = provenance or provenance_stub("prime", production_invalid=True)
+        prov = provenance_stub("prime", production_invalid=True)
     else:
         prov = provenance or provenance_from_file("prime", src, mode="tool_run")
     write_evidence_tsv(path, rows, without_provenance(PRIME_EVIDENCE_FIELDS), prov)

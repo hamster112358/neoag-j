@@ -69,7 +69,8 @@ def _parse_bigmhc_csv(path: Path, sample_id: str) -> list[dict[str, str]]:
             "peptide": peptide,
             "hla_allele": hla,
             "bigmhc_im_score": str(score),
-            "source_file": str(path),
+            # Keep an explicit source marker (e.g. "stub") if present.
+            "source_file": str(row.get("source_file") or "").strip() or str(path),
         })
     return rows
 
@@ -90,7 +91,8 @@ def _parse_bigmhc_tsv(path: Path, sample_id: str) -> list[dict[str, str]]:
                 "peptide": peptide,
                 "hla_allele": hla,
                 "bigmhc_im_score": str(score),
-                "source_file": str(path),
+                # Keep an explicit source marker (e.g. "stub") if present.
+                "source_file": str(row.get("source_file") or "").strip() or str(path),
             })
     return rows
 
@@ -101,8 +103,11 @@ def write_bigmhc_im_evidence(
     provenance: ProvenanceRecord | None = None,
 ) -> None:
     src = rows[0].get("source_file") if rows else path
-    if src == "stub":
-        prov = provenance or provenance_stub("bigmhc_im", production_invalid=True)
+    stub_rows = [row for row in rows if str(row.get("source_file", "")).strip().lower() == "stub"]
+    if stub_rows and len(stub_rows) == len(rows):
+        # Fully stubbed file: stub provenance even if a real provenance was
+        # passed by the caller (review C1-01).
+        prov = provenance_stub("bigmhc_im", production_invalid=True)
     else:
         prov = provenance or provenance_from_file("bigmhc_im", src, mode="tool_run")
     write_evidence_tsv(path, rows, without_provenance(BIGMHC_IM_EVIDENCE_FIELDS), prov)

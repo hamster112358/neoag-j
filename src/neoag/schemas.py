@@ -332,6 +332,9 @@ EVIDENCE_PROVENANCE_FIELDS = [
     "evidence_mode",
     "evidence_file",
     "evidence_status",
+    # Row-level sibling of evidence_status (review C1-01/C2-02): a real tool
+    # file may still contain placeholder rows the tool never returned.
+    "evidence_row_status",
 ]
 
 
