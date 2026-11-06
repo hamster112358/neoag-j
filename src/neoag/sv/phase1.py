@@ -268,7 +268,10 @@ def _raw_peptide_from_candidate(cand, effect_class: str, gene_label: str, rna_re
         "presentation_score": "0",
         "immunogenicity_score": "",
         "wildtype_binding_rank": "99",
-        "self_similarity_score": "0",
+        # Review C6-01: no self-similarity was computed here; a fabricated
+        # "0" read as "checked and safe".  Blank + explicit UNASSESSED.
+        "self_similarity_score": "",
+        "self_similarity_status": "UNASSESSED",
         "normal_hla_ligand_overlap": cand.normal_hla_ligand_overlap,
         "netmhcpan_ba_rank": "",
         "netmhcpan_el_rank": "",

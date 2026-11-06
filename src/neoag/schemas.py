@@ -117,7 +117,7 @@ PEPTIDE_FIELDS = [
     "source_file","source_row_number","source_record_id","source_tools","source_records",
     "provenance_record_count","evidence_conflict_status","generation_status",
     "binding_rank","el_rank","presentation_score","immunogenicity_score",
-    "wildtype_binding_rank","self_similarity_score","normal_hla_ligand_overlap",
+    "wildtype_binding_rank","self_similarity_score","self_similarity_status","normal_hla_ligand_overlap",
     "netmhcpan_mt_ic50","netmhcpan_mt_rank_ba","netmhcpan_mt_rank_el",
     "netmhcpan_wt_ic50","netmhcpan_wt_rank_ba","netmhcpan_wt_rank_el",
     "netmhcpan_ba_rank","netmhcpan_el_rank",

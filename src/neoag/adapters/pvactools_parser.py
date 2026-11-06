@@ -245,6 +245,11 @@ def peptide_from_row(
         ["rna_junction_reads", "RNA Junction Reads", "Read Support"],
         event.get("provided_rna_junction_reads", ""),
     )
+    # Review C6-01: a missing self-similarity value used to default to "0.0",
+    # which downstream readers could not tell apart from a computed safe 0.0.
+    self_similarity = first(
+        row, ["self_similarity_score", "Self Similarity"], ""
+    ).strip()
 
     base = {
         "peptide_id": peptide_id,
@@ -312,9 +317,8 @@ def peptide_from_row(
                 99.0,
             )
         ),
-        "self_similarity_score": first(
-            row, ["self_similarity_score", "Self Similarity"], "0.0"
-        ),
+        "self_similarity_score": self_similarity,
+        "self_similarity_status": "COMPUTED" if self_similarity else "UNASSESSED",
         "normal_hla_ligand_overlap": first(row, ["normal_hla_ligand_overlap"], "no"),
     }
     for field in (

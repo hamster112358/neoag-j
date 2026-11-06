@@ -50,6 +50,8 @@ enabled = true
 clonal_threshold = 0.80
 subclonal_threshold = 0.30
 missing_ccf_multiplier = 0.65
+unresolved_multiplier = 1.00
+indeterminate_multiplier = 0.75
 subclonal_multiplier = 0.75
 low_frequency_multiplier = 0.45
 

@@ -127,7 +127,10 @@ def peptide_from_variant_row(
         "presentation_score": "0.0",
         "immunogenicity_score": "0.5",
         "wildtype_binding_rank": "99",
-        "self_similarity_score": "0.0",
+        # Review C6-01: no self-similarity was computed here; a fabricated
+        # "0.0" read as "checked and safe".  Blank + explicit UNASSESSED.
+        "self_similarity_score": "",
+        "self_similarity_status": "UNASSESSED",
         "normal_hla_ligand_overlap": "no",
     }
     return enrich_peptide_layers(base, event)

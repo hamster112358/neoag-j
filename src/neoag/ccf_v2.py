@@ -493,13 +493,22 @@ def clonality_multiplier(status: str, profile: Mapping[str, Any]) -> float:
     cfg = profile.get("ccf_lite", {}) if profile else {}
     if status == "RNA_ONLY_UNRESOLVED":
         # Missing DNA clonality evidence is not evidence of a low-frequency clone.
-        return float(cfg.get("rna_only_unresolved_multiplier", 1.0))
+        return float(cfg.get("rna_only_unresolved_multiplier", cfg.get("unresolved_multiplier", 1.0)))
     if status in {"clonal_like", "clonal_compatible"}:
         return 1.0
-    if status in {"subclonal_like", "subclonal_compatible", "clonality_indeterminate"}:
+    if status == "clonality_indeterminate":
+        return float(cfg.get("indeterminate_multiplier", 0.75))
+    if status in {"subclonal_like", "subclonal_compatible"}:
         return float(cfg.get("subclonal_multiplier", 0.75))
     if status in {"low_frequency_subclonal", "low_frequency_subclonal_compatible"}:
         return float(cfg.get("low_frequency_multiplier", 0.45))
+    if status in {"unresolved", "vaf_only_unresolved"}:
+        # Review C4-02: absence of clonality evidence used to fall through to
+        # missing_ccf_multiplier (0.65), penalising "no evidence" worse than a
+        # *measured* subclone (0.75).  Absence is not negative evidence, so
+        # unresolved states are neutral by default; missing_ccf_multiplier
+        # still covers genuinely unknown status strings.
+        return float(cfg.get("unresolved_multiplier", 1.0))
     return float(cfg.get("missing_ccf_multiplier", 0.65))
 
 
