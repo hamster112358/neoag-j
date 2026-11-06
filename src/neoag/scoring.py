@@ -64,18 +64,34 @@ def resolve_appm_peptide_modifiers_tsv(
             return str(path)
     return None
 
-_PRIORITY_ORDER = {"D":0, "C":1, "C_CAUTION":1, "B_CAUTION":2, "B":3, "A":4}
+# Review D2-02: one typed priority ladder shared by every cap operation.
+# The CAUTION variants are strictly worse than their plain-letter peers
+# because priority() assigns them in place of the plain label when the safety
+# status is CAUTION/PARTIAL at the same score band (C_CAUTION replaces C,
+# B_CAUTION replaces B). The old code kept two disagreeing orderings
+# (_PRIORITY_ORDER tied C with C_CAUTION while _priority_rank ranked
+# C_CAUTION above C), so the final label depended on which helper applied a
+# cap. Ranks here are total: a cap keeps any label with rank <= its own,
+# which makes sequential cap application strictest-wins and
+# order-independent.
+_CAP_LADDER = {"D": 0, "C_CAUTION": 1, "C": 2, "B_CAUTION": 3, "B": 4, "A": 5}
+
+
+def cap_rank(label: str) -> int:
+    """Ladder rank (higher = better priority); unknown labels floor to D."""
+    return _CAP_LADDER.get(str(label or "").strip().upper(), 0)
+
 
 def apply_priority_cap_value(priority_value: str, cap: str) -> str:
     cap = str(cap or "").strip().upper()
-    if not cap:
+    if not cap or cap in {"A", "NONE"}:
+        return priority_value
+    if cap not in _CAP_LADDER:
+        # Off-ladder cap tokens are ignored rather than written into
+        # final_priority: the old code could emit a non-ladder label.
         return priority_value
     pri = str(priority_value or "D").strip().upper()
-    if cap in {"A", "NONE"}:
-        return priority_value
-    if _PRIORITY_ORDER.get(pri, 0) <= _PRIORITY_ORDER.get(cap, 0):
-        return priority_value
-    return cap
+    return priority_value if cap_rank(pri) <= cap_rank(cap) else cap
 
 def merge_appm_modifier(p: dict[str, Any], appm_row: Mapping[str, Any] | None) -> dict[str, Any]:
     if not appm_row:
@@ -199,19 +215,6 @@ def effective_weights(profile: Mapping[str, Any], peptide: Mapping[str, Any], pr
 
 
 
-def _priority_rank(label: str) -> int:
-    order = {"D": 0, "C": 1, "C_CAUTION": 2, "B_CAUTION": 3, "B": 4, "A": 5}
-    return order.get(str(label or ""), 5)
-
-def apply_priority_cap(priority_label: str, cap: str | None) -> str:
-    cap = str(cap or "").strip()
-    if not cap:
-        return priority_label
-    order = ["D", "C", "C_CAUTION", "B_CAUTION", "B", "A"]
-    if cap not in order:
-        return priority_label
-    return priority_label if _priority_rank(priority_label) <= _priority_rank(cap) else cap
-
 def merge_peptide_safety(p: dict[str, Any], safety_row: Mapping[str, Any] | None) -> dict[str, Any]:
     if not safety_row:
         return p
@@ -223,17 +226,14 @@ def merge_peptide_safety(p: dict[str, Any], safety_row: Mapping[str, Any] | None
             p[k] = safety_row.get(k, "")
     return p
 
-def merge_peptide_escape(p: dict[str, Any], escape_row: Mapping[str, Any] | None) -> dict[str, Any]:
-    if not escape_row:
-        return p
-    for k in ["escape_status", "escape_reason", "escape_multiplier", "restricting_hla_lost", "priority_cap"]:
-        if k == "restricting_hla_lost":
-            p[k] = escape_row.get("restricting_hla_lost", "")
-        elif k == "priority_cap":
-            p[k] = escape_row.get("priority_cap") or p.get("priority_cap", "")
-        elif k in escape_row:
-            p[k] = escape_row.get(k, "")
-    return p
+# Review D2-01/D2-02 (whole-repo call-site search: zero callers):
+# merge_peptide_escape used to OVERWRITE priority_cap with the escape row's
+# cap (`escape_row.get("priority_cap") or p.get("priority_cap")`), so a weaker
+# or empty escape cap could lift a stricter earlier restriction, and
+# apply_priority_cap/_priority_rank carried a second, disagreeing cap
+# ordering. The live escape merge (merge_escape_flags) already applies the
+# single shared strictest-wins ladder; the unsafe duplicates were removed
+# rather than repaired so the wrong helper can never be wired back in.
 
 def score_event(e, profile):
     w = profile.get("event_weights", {})
@@ -269,13 +269,34 @@ def appm_multiplier(p, summary, profile=None):
             base = clamp(base - pen)
     return clamp(base)
 
-def priority(safety, score):
+# Review D2-03: the ranking cutoffs used to be inline magic numbers. They are
+# now profile-configurable under [priority_thresholds] (locked in
+# profiles/default.toml with a version stamp), so a re-tune is a versioned,
+# diff-visible profile change; the built-in defaults reproduce the historical
+# 0.75/0.55/0.35 constants exactly and no existing profile's ranking changes.
+PRIORITY_THRESHOLD_DEFAULTS = {"score_a": 0.75, "score_b": 0.55, "score_c": 0.35}
+PRIORITY_THRESHOLD_VERSION_DEFAULT = "priority-thresholds-v1-builtin"
+
+
+def priority_thresholds(profile: Mapping[str, Any] | None = None) -> dict[str, float]:
+    raw = profile.get("priority_thresholds", {}) if profile else {}
+    values = {}
+    for key, default in PRIORITY_THRESHOLD_DEFAULTS.items():
+        try:
+            values[key] = float(raw.get(key, default)) if isinstance(raw, Mapping) else default
+        except (TypeError, ValueError):
+            values[key] = default
+    return values
+
+
+def priority(safety, score, profile=None):
+    cutoffs = priority_thresholds(profile)
     if safety == "FAIL": return "D"
-    if safety == "CAUTION": return "B_CAUTION" if score >= 0.55 else "C_CAUTION"
-    if safety in {"SAFETY_PARTIAL", "PARTIAL"}: return "C_CAUTION" if score >= 0.35 else "D"
-    if score >= 0.75: return "A"
-    if score >= 0.55: return "B"
-    if score >= 0.35: return "C"
+    if safety == "CAUTION": return "B_CAUTION" if score >= cutoffs["score_b"] else "C_CAUTION"
+    if safety in {"SAFETY_PARTIAL", "PARTIAL"}: return "C_CAUTION" if score >= cutoffs["score_c"] else "D"
+    if score >= cutoffs["score_a"]: return "A"
+    if score >= cutoffs["score_b"]: return "B"
+    if score >= cutoffs["score_c"]: return "C"
     return "D"
 
 def recommended(p, appm, ccf):
@@ -407,7 +428,12 @@ def score_peptide(p, e, profile, pres, summary):
     p.setdefault("appm_review_required", "yes" if summary.get("appm_evidence_completeness") in {"LOW", "UNASSESSED"} else "no")
     p["ccf_multiplier"] = f"{ccf:.4f}"
     p["escape_multiplier"] = f"{escape_mult:.4f}"
-    pri = priority(p.get("safety_status"), to_float(p["efficacy_score"], 0.0))
+    pri = priority(p.get("safety_status"), to_float(p["efficacy_score"], 0.0), profile)
+    thresholds_raw = profile.get("priority_thresholds", {}) if profile else {}
+    p["priority_policy_version"] = str(
+        thresholds_raw.get("version", PRIORITY_THRESHOLD_VERSION_DEFAULT)
+        if isinstance(thresholds_raw, Mapping) else PRIORITY_THRESHOLD_VERSION_DEFAULT
+    )
     specificity_cap = p.get("mutant_specificity_priority_cap", "")
     if specificity_cap:
         p["priority_cap"] = apply_priority_cap_value(p.get("priority_cap", "") or "A", specificity_cap)
@@ -452,6 +478,11 @@ def filter_by_enabled_sources(events: list[dict], profile: Mapping[str, Any]) ->
 
 def score(raw_events, raw_peptides, presentation_evidence, appm_summary_tsv, ccf_lite_tsv, normal_expression_tsv, normal_hla_ligands_tsv, profile, out_events, out_peptides, peptide_safety_tsv=None, event_safety_tsv=None, peptide_escape_flags_tsv=None, appm_peptide_modifiers_tsv=None, cross_platform_evidence_tsv=None, cancer_gene_list_tsv=None):
     events = [enrich_event_layers(e) for e in read_tsv(raw_events)]
+    # Review D2-04: keep the pre-filter event id set so an unmatched peptide
+    # can be classified as "event never existed" vs "event filtered out".
+    source_event_ids = {
+        str(e.get("event_id", "")).strip() for e in events if str(e.get("event_id", "")).strip()
+    }
     events = annotate_nearby_variant_groups(events)
     events = filter_by_enabled_sources(events, profile)
     events = annotate_events(events, load_cancer_gene_index(cancer_gene_list_tsv))
@@ -502,9 +533,24 @@ def score(raw_events, raw_peptides, presentation_evidence, appm_summary_tsv, ccf
         event_map[e["event_id"]] = e
         scored_e.append(e)
     scored_p = []
+    unmatched = []
     for p in peptides:
         e = event_map.get(p.get("event_id"))
         if not e:
+            # Review D2-04: the referential-integrity guard stays, but the
+            # drop is no longer silent — every unmatched row is ledgered
+            # beside the ranked output (see the sidecar write below).
+            unmatched.append({
+                "peptide_id": str(p.get("peptide_id", "")),
+                "event_id": str(p.get("event_id", "")),
+                "peptide": str(p.get("peptide", "")),
+                "hla_allele": str(p.get("hla_allele", "")),
+                "reason": (
+                    "event_filtered_out_by_enabled_sources"
+                    if str(p.get("event_id", "")).strip() in source_event_ids
+                    else "event_id_absent_from_raw_events"
+                ),
+            })
             continue
         p = propagate_to_peptide(p, e)
         p = enrich_peptide_layers(p, e)
@@ -518,4 +564,9 @@ def score(raw_events, raw_peptides, presentation_evidence, appm_summary_tsv, ccf
     scored_p.sort(key=lambda r: to_float(r.get("efficacy_score"),0), reverse=True)
     write_tsv(out_events, scored_e, EVENT_FIELDS)
     write_tsv(out_peptides, scored_p, PEPTIDE_FIELDS)
+    # Review D2-04: unmatched-peptide ledger is ALWAYS written (a header-only
+    # file is the visible statement that the count is zero), so the loss
+    # count is auditable instead of implicit in a row-count difference.
+    unmatched_path = Path(out_peptides).with_name(Path(out_peptides).stem + ".unmatched_peptides.tsv")
+    write_tsv(unmatched_path, unmatched, ["peptide_id", "event_id", "peptide", "hla_allele", "reason"])
     return scored_e, scored_p

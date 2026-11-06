@@ -11,6 +11,7 @@ import tomllib
 from typing import Any, Mapping
 
 from .evidence_states import DERIVERS, derive_all_states, event_track
+from .status_words import contains_positive, first_text
 from .candidate_identity import IDENTITY_FIELDS, candidate_identity
 from .source_chain import derive_source_chain_confidence
 from .pareto import nondominated_fronts
@@ -328,14 +329,33 @@ def _pareto_derived_grades(
     else:
         frame_grade = 0
 
-    normal_text = " ".join(str(source.get(field, "")).upper() for field in (
-        "normal_junction_status", "normal_junction_assessment_status", "normal_junction_exact_match",
-    ))
-    if any(token in normal_text for token in ("DETECTED", "EXACT_MATCH", "SUPPORTED_IN_NORMAL")) and "NOT_DETECTED" not in normal_text:
+    # Review D3-03: the three normal-junction fields used to be merged into one
+    # token soup, so an unrelated NOT_DETECTED in one field diluted an
+    # EXACT_MATCH in another and the pair silently landed in the "safe"
+    # grade-3 branch. Each source is now classified separately; an exact
+    # positive keeps precedence, and a genuine source-level contradiction is
+    # preserved as a middle grade instead of a safe verdict.
+    normal_signals = []
+    for field in ("normal_junction_status", "normal_junction_assessment_status", "normal_junction_exact_match"):
+        value = str(source.get(field, "")).strip().upper()
+        if not value or any(token in value for token in ("UNASSESSED", "MISSING", "NOT_AVAILABLE")):
+            normal_signals.append("UNASSESSED")
+        elif any(contains_positive(value, token) for token in ("EXACT_MATCH", "DETECTED", "SUPPORTED_IN_NORMAL")):
+            normal_signals.append("POSITIVE")
+        elif any(token in value for token in ("NOT_DETECTED", "ABSENT", "NO_MATCH")):
+            normal_signals.append("NEGATIVE")
+        else:
+            normal_signals.append("OTHER")
+    if "POSITIVE" in normal_signals and "NEGATIVE" in normal_signals:
+        # Contradictory sources: never a safe pass, never an unconditional
+        # hard risk from this grade alone (the states layer still hard-fails
+        # on an assessed exact normal match).
+        normal_junction_grade = 1
+    elif "POSITIVE" in normal_signals:
         normal_junction_grade = 0
-    elif any(token in normal_text for token in ("NOT_DETECTED", "ABSENT", "NO_MATCH")):
+    elif "NEGATIVE" in normal_signals:
         normal_junction_grade = 3
-    elif normal_text.strip() and not any(token in normal_text for token in ("UNASSESSED", "MISSING", "NOT_AVAILABLE")):
+    elif "OTHER" in normal_signals:
         normal_junction_grade = 2
     else:
         normal_junction_grade = 1
@@ -710,8 +730,11 @@ def _normalized_row(
         source, states, biological_track, rules,
     ).items()})
     row.update(_fusion_orf_gate(biological_track, source_chain_result))
+    # Review D3-02 (same endpoint separation as D1-01): the EL tiebreak must
+    # read EL fields only; binding_rank (BA) previously rode in here and put a
+    # BA percentile into the "NETMHCPAN_EL" tiebreak slot.
     netmhcpan_rank = _first_number(
-        source, "netmhcpan_mt_rank_el", "netmhcpan_el_rank", "el_rank", "binding_rank",
+        source, "netmhcpan_mt_rank_el", "netmhcpan_el_rank", "el_rank",
     )
     mhcflurry_score = _first_number(source, "mhcflurry_presentation_score")
     row["safety_completeness_grade"] = str(_safety_completeness_grade(source, states["safety"]))
@@ -972,11 +995,9 @@ def _rank_key(row: Mapping[str, Any], rules: Mapping[str, Any]) -> tuple[Any, ..
 
 
 def _row_text(row: Mapping[str, Any], *fields: str) -> str:
-    for field in fields:
-        value = str(row.get(field, "")).strip()
-        if value and value.upper() not in {"NA", "N/A", "NONE", "."}:
-            return value
-    return ""
+    # Review D4-05: same null/UNASSESSED vocabulary as candidate_identity so a
+    # value cannot survive one identity join and disappear in another.
+    return first_text(row, *fields)
 
 
 def _representative_fields(row: Mapping[str, Any], index: int) -> dict[str, str]:
@@ -1074,7 +1095,16 @@ def _event_output(peptides: list[dict[str, str]], deduplicate: bool) -> list[dic
     for row in peptides:
         event_id = _row_text(row, "event_id") or f"NO_EVENT:{row.get('peptide_id', '')}"
         phase_group = _row_text(row, "phase_group_id", "haplotype_group_id")
-        group_id = f"PHASE:{phase_group}" if phase_group else f"EVENT:{event_id}"
+        # Review D3-05: grouping on the bare event_id merged same-id events
+        # across samples if a multi-sample comprehensive TSV ever reached this
+        # point. Per-sample deployment kept the historical "EVENT:<id>" key,
+        # so single-sample artifacts are unchanged; as soon as a sample_id is
+        # present it becomes part of the group key.
+        sample_id = _row_text(row, "sample_id")
+        if phase_group:
+            group_id = f"PHASE:{sample_id}|{phase_group}" if sample_id else f"PHASE:{phase_group}"
+        else:
+            group_id = f"EVENT:{sample_id}|{event_id}" if sample_id else f"EVENT:{event_id}"
         groups[group_id].append(row)
     events = []
     for group_id, group in groups.items():
@@ -1160,6 +1190,40 @@ def _event_output(peptides: list[dict[str, str]], deduplicate: bool) -> list[dic
     for rank, row in enumerate(events, 1):
         row["event_evidence_rank"] = str(rank)
     return events
+
+
+def _legacy_baseline_order_status(source_rows: list[dict[str, str]]) -> tuple[str, str]:
+    """Review D3-04: certify whether input row order really is a weighted ranking.
+
+    legacy_weighted_rank is the input row order of the comprehensive evidence
+    TSV. Spearman and Top-N overlap against the consensus ranking are only
+    meaningful when that order encodes the weighted ranking, so the order is
+    validated up-front instead of silently trusting the row order.
+    """
+    if not source_rows:
+        return "NO_INPUT_ROWS", "comprehensive evidence input is empty"
+    for column in ("weighted_rank", "legacy_weighted_rank", "weighted_baseline_rank"):
+        if all(str(row.get(column, "")).strip() for row in source_rows):
+            try:
+                values = [int(float(row[column])) for row in source_rows]
+            except ValueError:
+                return "INVALID", f"rank column '{column}' present but not integer-valued"
+            if values == list(range(1, len(values) + 1)):
+                return "VALIDATED", f"explicit rank column '{column}' is a complete 1..n ranking in row order"
+            return "INVALID", f"rank column '{column}' is not a complete 1..n sequence in row order"
+    if all(str(row.get("efficacy_score", "")).strip() for row in source_rows):
+        try:
+            scores = [float(row["efficacy_score"]) for row in source_rows]
+        except ValueError:
+            return "INVALID", "efficacy_score column present but not numeric"
+        for index in range(1, len(scores)):
+            if scores[index] > scores[index - 1] + 1e-9:
+                return "INVALID", (
+                    f"efficacy_score increases at row {index + 1} "
+                    f"({scores[index - 1]:g} -> {scores[index]:g}); input row order is not a weighted ranking"
+                )
+        return "VALIDATED", "efficacy_score is non-increasing in row order (consistent with a weighted ranking)"
+    return "INVALID", "no complete rank column and no complete efficacy_score column; row order cannot be certified as a weighted ranking"
 
 
 def _comparison_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1411,6 +1475,11 @@ def _write_consensus_summary(
         {"metric": "duplicate_peptide_hla_evidence_rows", "category": "overall", "value": str(sum(row.get("peptide_hla_representative") == "no" for row in rows))},
         {"metric": "event_rows", "category": "overall", "value": str(len(event_rows))},
         {"metric": "conflict_rows", "category": "overall", "value": str(len(conflicts))},
+        # Review D3-05: sample scoping is now visible at summary level; more
+        # than one distinct sample in one consensus run means event groups are
+        # separated by sample id.
+        {"metric": "distinct_sample_ids", "category": "overall",
+         "value": str(len({str(row.get("sample_id", "")).strip() for row in rows if str(row.get("sample_id", "")).strip()}))},
         {"metric": "hard_failure_rows", "category": "overall", "value": str(sum(row["hard_failure"] == "yes" for row in rows))},
         {"metric": "manual_review_rows", "category": "overall", "value": str(sum(row["manual_review_required"] == "yes" for row in rows))},
     ]
@@ -1426,18 +1495,28 @@ def _write_comparison_markdown(
     comparison_rows: list[dict[str, str]],
     grade_counts: Mapping[str, int],
     track_counts: Mapping[str, int],
+    legacy_order_status: str = "NOT_ASSESSED",
+    legacy_order_detail: str = "",
 ) -> None:
     direction_counts = Counter(row["rank_shift_direction"] for row in comparison_rows)
     n_rows = len(comparison_rows)
-    spearman = "NA"
-    if n_rows > 1:
+    # Review D3-04: rank-agreement statistics are only emitted when the legacy
+    # baseline order was validated; a row order that is not a weighted ranking
+    # would make Spearman/Top-N overlap meaningless while looking authoritative.
+    comparable = legacy_order_status.startswith("VALIDATED")
+    spearman = "NA" if n_rows <= 1 else (
+        "NOT_COMPARABLE (legacy row order is not a validated weighted ranking)"
+        if not comparable else "pending"
+    )
+    if comparable and n_rows > 1:
         distance = sum((int(row["legacy_weighted_rank"]) - int(row["evidence_rank"])) ** 2 for row in comparison_rows)
         spearman = f"{1.0 - (6.0 * distance) / (n_rows * (n_rows * n_rows - 1)):.6f}"
     overlaps = []
-    for top_n in (10, 20, 50, 100):
-        left = {row["peptide_id"] for row in comparison_rows if int(row["legacy_weighted_rank"]) <= top_n}
-        right = {row["peptide_id"] for row in comparison_rows if int(row["evidence_rank"]) <= top_n}
-        overlaps.append((top_n, len(left & right), len(left), len(right)))
+    if comparable:
+        for top_n in (10, 20, 50, 100):
+            left = {row["peptide_id"] for row in comparison_rows if int(row["legacy_weighted_rank"]) <= top_n}
+            right = {row["peptide_id"] for row in comparison_rows if int(row["evidence_rank"]) <= top_n}
+            overlaps.append((top_n, len(left & right), len(left), len(right)))
     hla_count = len({row.get("hla_allele", "") for row in comparison_rows if row.get("hla_allele")})
     event_types = Counter(row.get("event_type", "UNASSESSED") or "UNASSESSED" for row in comparison_rows)
     source_chain_counts = Counter(row.get("source_chain_confidence_tier", "C3") or "C3" for row in comparison_rows)
@@ -1459,13 +1538,15 @@ def _write_comparison_markdown(
         "| Metric | Value |",
         "| --- | ---: |",
         f"| Candidate peptide-HLA rows | {len(comparison_rows)} |",
+        f"| Legacy baseline validation | {legacy_order_status}: {legacy_order_detail} |",
         f"| Spearman weighted vs consensus rank | {spearman} |",
         f"| Distinct restricting HLA alleles | {hla_count} |",
         f"| RNA-supported candidates | {rna_supported} |",
         f"| Safety-complete candidates | {safety_complete} |",
         f"| Hard-fail candidates in consensus Top50 | {hard_fail_top} |",
         f"| Manual-review candidates | {manual_review} |",
-        *[f"| Top{top_n} overlap | {overlap} (weighted={left_n}, consensus={right_n}) |" for top_n, overlap, left_n, right_n in overlaps],
+        *([f"| Top{top_n} overlap | {overlap} (weighted={left_n}, consensus={right_n}) |" for top_n, overlap, left_n, right_n in overlaps]
+          or ["| Top-N overlap | NOT_COMPARABLE (legacy row order is not a validated weighted ranking) |"]),
         *[f"| Rank shift: {key} | {value} |" for key, value in sorted(direction_counts.items())],
         *[f"| Evidence grade {key} | {value} |" for key, value in sorted(grade_counts.items())],
         *[f"| Source-chain tier {key} | {value} |" for key, value in sorted(source_chain_counts.items())],
@@ -1531,6 +1612,17 @@ def _write_run_manifest(
             "include_in_pareto": bool(_source_chain_config(rules).get("include_in_pareto", False)),
         },
         "legacy_ranking_modified": False,
+        # Review D3-04: baseline provenance and order certification, always
+        # present so a missing or unvalidatable baseline is a visible fact.
+        "legacy_baseline": {
+            "order_status": result.get("legacy_baseline_order_status", "NOT_ASSESSED"),
+            "order_detail": result.get("legacy_baseline_order_detail", ""),
+        },
+        "weighted_baseline": {
+            "status": result.get("weighted_baseline_status", "NOT_PROVIDED"),
+            "source": result.get("weighted_baseline_source", ""),
+            "sha256": result.get("weighted_baseline_sha256", ""),
+        },
         "outputs": outputs,
     }
     Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -1548,6 +1640,9 @@ def rank_evidence_consensus(
     """Run the independent provisional evidence-consensus ranking."""
 
     source_rows = read_tsv(comprehensive_tsv)
+    # Review D3-04: certify the legacy baseline order before any rank-agreement
+    # statistic is derived from it.
+    legacy_order_status, legacy_order_detail = _legacy_baseline_order_status(source_rows)
     original_fields = list(source_rows[0]) if source_rows else []
     rows: list[dict[str, str]] = []
     states: list[dict[str, str]] = []
@@ -1618,7 +1713,10 @@ def rank_evidence_consensus(
     source_chain_counts = dict(sorted(Counter(row.get("source_chain_confidence_tier", "C3") for row in rows).items()))
     source_chain_track_counts = dict(sorted(Counter(row.get("source_chain_track", "OTHER") for row in rows).items()))
     _write_consensus_summary(summary_path, rows, event_rows, conflicts)
-    _write_comparison_markdown(comparison_md_path, comparison_rows, grade_counts, track_counts)
+    _write_comparison_markdown(
+        comparison_md_path, comparison_rows, grade_counts, track_counts,
+        legacy_order_status, legacy_order_detail,
+    )
     all_tool_results, all_tool_results_manifest = _write_canonical_all_tool_results(
         comprehensive_tsv, all_tool_results_path, ranked_rows=rows,
     )
@@ -1648,6 +1746,8 @@ def rank_evidence_consensus(
         "source_chain_counts": source_chain_counts,
         "source_chain_track_counts": source_chain_track_counts,
         "legacy_ranking_modified": False,
+        "legacy_baseline_order_status": legacy_order_status,
+        "legacy_baseline_order_detail": legacy_order_detail,
     }
     _write_run_manifest(run_manifest_path, comprehensive_tsv, rules, result)
     if provenance_json:
@@ -1684,14 +1784,22 @@ def build_evidence_consensus(
         ]
     )
     baseline_source = next((path for path in baseline_candidates if path.is_file()), baseline_candidates[0])
+    # Review D3-04: baseline selection is recorded instead of silently skipped.
+    # The alias chain stays first-existing for compatibility, but the chosen
+    # file, its digest and the missing case all land in the run manifest.
+    result["weighted_baseline_status"] = "FOUND" if baseline_source.is_file() else "MISSING"
+    result["weighted_baseline_source"] = str(baseline_source)
     if baseline_source.is_file():
+        result["weighted_baseline_sha256"] = _sha256(baseline_source)
         standard_ranked = output_dir / "ranked_peptides.tsv"
         if not standard_ranked.is_file():
             result["output_ranked_peptides_compat"] = _materialize_alias(baseline_source, standard_ranked)
         result["output_weighted_baseline"] = _materialize_alias(
             baseline_source, output_dir / "ranked_peptides.weighted_baseline.tsv",
         )
-        _write_run_manifest(result["output_run_manifest"], comprehensive_tsv, effective_rules, result)
+    else:
+        result["weighted_baseline_sha256"] = ""
+    _write_run_manifest(result["output_run_manifest"], comprehensive_tsv, effective_rules, result)
     return {
         "rows": result["rows"],
         "ranked_peptides": result["output_peptides"],
@@ -1713,6 +1821,8 @@ def build_evidence_consensus(
         "source_chain_track_counts": result["source_chain_track_counts"],
         "ranked_peptides_compat": result.get("output_ranked_peptides_compat", str(output_dir / "ranked_peptides.tsv")),
         "weighted_baseline": result.get("output_weighted_baseline", ""),
+        "weighted_baseline_status": result.get("weighted_baseline_status", ""),
+        "weighted_baseline_source": result.get("weighted_baseline_source", ""),
         "grade_counts": result["grade_counts"],
         "track_counts": result["track_counts"],
         "legacy_ranking_modified": False,

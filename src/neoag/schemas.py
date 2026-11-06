@@ -175,7 +175,10 @@ PEPTIDE_FIELDS = [
     "immunology_composite_score",
     "splice_event_evidence_grade","orf_evidence_grade","normal_safety_grade",
     "independent_translation_generators","splice_consensus_tier",
-    "efficacy_score","final_priority","recommended_use"
+    "efficacy_score","final_priority","recommended_use",
+    # Review D2-03: which versioned priority cutoffs produced final_priority
+    # (display/provenance only; no ranking rule consumes it).
+    "priority_policy_version"
 ]
 
 PRESENTATION_FIELDS = [

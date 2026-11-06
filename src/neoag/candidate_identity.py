@@ -6,6 +6,8 @@ import hashlib
 import re
 from typing import Any, Mapping
 
+from .status_words import first_text
+
 
 IDENTITY_FIELDS = (
     "event_identity_id",
@@ -16,11 +18,10 @@ IDENTITY_FIELDS = (
 
 
 def _text(row: Mapping[str, Any], *fields: str) -> str:
-    for field in fields:
-        value = str(row.get(field) or "").strip()
-        if value and value.upper() not in {"NA", "N/A", "NONE", ".", "UNASSESSED"}:
-            return value
-    return ""
+    # Review D4-05: the null vocabulary ("NA", "NONE", ".", "UNASSESSED") is
+    # centralized in status_words.first_text so every identity layer agrees on
+    # which values mean "no information".
+    return first_text(row, *fields)
 
 
 def _stable_id(prefix: str, *parts: str) -> str:
@@ -60,11 +61,24 @@ def candidate_identity(row: Mapping[str, Any]) -> dict[str, str]:
         "event_name",
     )
     if not event_source:
-        event_source = "|".join(
+        coordinate_parts = [
             _text(row, field)
             for field in ("event_type", "gene", "chrom", "pos", "ref", "alt")
-        )
-    event_id = _stable_id("EVT", event_source or "UNRESOLVED_EVENT")
+        ]
+        if any(coordinate_parts):
+            event_source = "|".join(coordinate_parts)
+        else:
+            # Review D4-04: with no primary id AND no coordinates the old code
+            # hashed the literal string "|||||", so every unrelated unknown row
+            # collided on one event id and lost identity in deduplication. The
+            # fallback is now row-specific (digest of the full raw row) and
+            # explicitly marked UNRESOLVED so it cannot be mistaken for a
+            # biological event identity.
+            payload = "|".join(
+                f"{key}={row.get(key, '')}" for key in sorted(row, key=str)
+            )
+            event_source = "UNRESOLVED_EVENT_ROW:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    event_id = _stable_id("EVT", event_source)
 
     protein_change = _text(
         row,

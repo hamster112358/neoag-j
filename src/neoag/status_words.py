@@ -22,6 +22,8 @@ unassessed semantics instead of becoming a negative verdict.
 
 from __future__ import annotations
 
+from typing import Mapping
+
 NEGATION_PREFIXES = ("NOT_", "NO_", "NON_", "UN")
 
 # Whole-value negations that mean "this evidence does not exist", not
@@ -79,3 +81,27 @@ def starts_negated(text: object) -> bool:
     if not up or up in MISSING_NEGATIONS:
         return False
     return any(up.startswith(prefix) for prefix in NEGATION_PREFIXES)
+
+
+# Review D4-05: one shared "empty text" vocabulary.  candidate_identity._text
+# used to treat UNASSESSED as empty while evidence_consensus._row_text did
+# not, so the same value survived one identity join and disappeared in
+# another; every module now asks is_null_text().
+NULL_TEXT_TOKENS = frozenset({"", "NA", "N/A", "NONE", ".", "UNASSESSED"})
+
+
+def is_null_text(value: object) -> bool:
+    """True when a free-text value carries no information (blank or null-word)."""
+
+    text = str(value if value is not None else "").strip()
+    return not text or text.upper() in NULL_TEXT_TOKENS
+
+
+def first_text(row: Mapping[object, object], *fields: object, default: str = "") -> str:
+    """First non-null text among ``fields`` (shared D4-05 vocabulary)."""
+
+    for field in fields:
+        if is_null_text(row.get(field)):
+            continue
+        return str(row.get(field)).strip()
+    return default

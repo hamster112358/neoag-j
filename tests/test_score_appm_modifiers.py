@@ -61,4 +61,8 @@ def test_score_applies_appm_peptide_modifiers(tmp_path):
     assert peps[0]["appm_multiplier"] == "0.2500"
     assert peps[0]["appm_multiplier_reason"] == "mhc_i_defective"
     assert peps[0]["appm_integrity_status"] == "MHC_I_DEFECTIVE"
-    assert peps[0]["priority_cap"] == "C"
+    # Review D2-02: with one total cap ladder (D < C_CAUTION < C < ...) the
+    # APPM "C" cap and the missing-safety-evidence "C_CAUTION" partial cap now
+    # merge to the STRICTER label instead of silently keeping whichever was
+    # applied first (the old code tied C with C_CAUTION).
+    assert peps[0]["priority_cap"] == "C_CAUTION"

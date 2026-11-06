@@ -332,10 +332,29 @@ def derive_rna_support(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dict
 
 def derive_presentation_consensus(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dict[str, Any]:
     cfg = _section(rules, "presentation")
-    el = _float(row, "netmhcpan_mt_rank_el", "netmhcpan_el_rank", "el_rank", "binding_rank")
+    # Review D1-01: NetMHCpan EL rank and BA rank are distinct prediction
+    # endpoints. binding_rank (BA) used to be the last fallback in the EL field
+    # chain, so a BA percentile was judged against EL thresholds. The chains are
+    # now separate; EL thresholds are never applied to a BA value.
+    el = _float(row, "netmhcpan_mt_rank_el", "netmhcpan_el_rank", "el_rank")
+    ba = _float(row, "netmhcpan_mt_rank_ba", "netmhcpan_ba_rank", "binding_rank")
+    ba_note = (
+        "" if el is not None or ba is None
+        else f"; NetMHCpan_EL=unassessed(BA={ba:g} not substituted)"
+    )
     net_support = el is not None and el <= float(cfg.get("netmhcpan_el_supported", 2.0))
     net_strong = el is not None and el <= float(cfg.get("netmhcpan_el_strong", 0.5))
     mhcf = _float(row, "mhcflurry_presentation_score")
+    if el is None and ba is not None and mhcf is None:
+        # D1-01: only BA exists -> EL remains unassessed. We deliberately do
+        # not score BA against EL thresholds; its own calibration is a future
+        # explicitly-versioned step, so the honest state stays UNASSESSED.
+        return _result(
+            "PRESENTATION_UNASSESSED", 0,
+            f"EL rank unassessed; BA rank={ba:g} is recorded but not exchangeable with EL thresholds; "
+            "no MHCflurry evidence either",
+            assessed=False, reason_code="PRESENTATION_EL_UNASSESSED_BA_OBSERVED",
+        )
     mhcf_support = mhcf is not None and mhcf >= float(cfg.get("mhcflurry_presentation_supported", 0.50))
     mhcf_strong = mhcf is not None and mhcf >= float(cfg.get("mhcflurry_presentation_strong", 0.70))
     stability = _float(row, "netmhcstabpan_rank")
@@ -358,7 +377,7 @@ def derive_presentation_consensus(row: Mapping[str, Any], rules: Mapping[str, An
         return _result("PRESENTATION_WEAK", 0, f"both core groups below threshold; {auxiliary}")
     if el is not None or mhcf is not None:
         support = net_support if el is not None else mhcf_support
-        return _result("PRESENTATION_SINGLE_TOOL" if support else "PRESENTATION_WEAK", 2 if support else 0, f"single core group; NetMHCpan={net_support if el is not None else 'NA'}; MHCflurry={mhcf_support if mhcf is not None else 'NA'}; {auxiliary}")
+        return _result("PRESENTATION_SINGLE_TOOL" if support else "PRESENTATION_WEAK", 2 if support else 0, f"single core group; NetMHCpan={net_support if el is not None else 'NA'}; MHCflurry={mhcf_support if mhcf is not None else 'NA'}; {auxiliary}{ba_note}")
     if stability is not None or prime is not None or bigmhc is not None or deep is not None:
         return _result("PRESENTATION_UNASSESSED", 0, f"core groups unavailable; auxiliary evidence cannot replace them; {auxiliary}", assessed=False)
     return _result("PRESENTATION_UNASSESSED", 0, "presentation evidence unavailable", assessed=False)

@@ -4,13 +4,13 @@ import re
 from collections import defaultdict
 from typing import Any, Mapping
 
+from .candidate_identity import normalize_hla
+from .status_words import first_text
+
 
 def _text(row: Mapping[str, Any], *fields: str, default: str = "") -> str:
-    for field in fields:
-        value = str(row.get(field) or "").strip()
-        if value:
-            return value
-    return default
+    # Review D4-05: shared null/UNASSESSED vocabulary across identity layers.
+    return first_text(row, *fields, default=default)
 
 
 def _integer(value: Any, default: int = 10**9) -> int:
@@ -85,11 +85,19 @@ def build_vaccine_event_tables(
         matched.sort(key=lambda row: _integer(row.get("evidence_rank")))
 
         grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+        hla_originals: dict[tuple[str, str], str] = {}
         for peptide in matched:
             sequence = _text(peptide, "peptide", "mutant_peptide", "mt_peptide").upper()
-            hla = re.sub(r"\s+", "", _text(peptide, "hla_allele", "hla", "allele", "restricting_hla").upper())
+            # Review D4-02: the peptide-HLA grouping now uses the same
+            # canonical normalize_hla as candidate_identity; whitespace-only
+            # normalization made "A*02:01" and "HLA-A*02:01" two distinct
+            # "unique neoepitope-HLA" rows inside one event. The original
+            # representation is preserved per group for display/audit.
+            hla_raw = _text(peptide, "hla_allele", "hla", "allele", "restricting_hla")
+            hla = normalize_hla(hla_raw)
             if sequence:
                 grouped[(sequence, hla)].append(peptide)
+                hla_originals.setdefault((sequence, hla), hla_raw)
 
         representatives: list[dict[str, str]] = []
         for epitope_rank, ((sequence, hla), members) in enumerate(grouped.items(), 1):
@@ -103,7 +111,8 @@ def build_vaccine_event_tables(
                 "neoepitope_role": "SUPPORTING_PEPTIDE_HLA_EVIDENCE",
                 "neoepitope_rank_within_event": str(epitope_rank),
                 "peptide": sequence,
-                "hla_allele": hla,
+                "hla_allele": hla_originals[(sequence, hla)],
+                "hla_allele_canonical": hla,
                 "duplicate_evidence_row_count": str(len(members)),
                 "member_peptide_ids": ";".join(sorted({_text(row, "peptide_id") for row in members if _text(row, "peptide_id")})),
             })
@@ -113,7 +122,7 @@ def build_vaccine_event_tables(
         best = representatives[0] if representatives else {}
         event_type = _text(event, "event_type", "biological_event_track", "evidence_track", default=_text(best, "event_type"))
         peptide_values = {_text(row, "peptide", "mutant_peptide", "mt_peptide").upper() for row in representatives}
-        hla_values = {re.sub(r"\s+", "", _text(row, "hla_allele", "hla", "allele", "restricting_hla")) for row in representatives}
+        hla_values = {normalize_hla(_text(row, "hla_allele", "hla", "allele", "restricting_hla")) for row in representatives}
         hla_values.discard("")
         pair_labels = [f"{sequence}/{hla}" if hla else sequence for sequence, hla in grouped]
         summaries.append({

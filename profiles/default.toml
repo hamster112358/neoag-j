@@ -96,6 +96,16 @@ high_expression_tpm = 20.0
 # on top of weight redistribution. 1.0 restores pure redistribution.
 immunogenicity_unresolved_multiplier = 0.90
 
+# Review D2-03: priority() label cutoffs, now profile-locked instead of inline
+# magic numbers. Values reproduce the historical constants exactly; any change
+# must bump `version` and be evaluated with a before/after ablation (see
+# tests/test_gpackage_ge_20261106.py sensitivity test).
+[priority_thresholds]
+version = "priority-thresholds-v1-2026-11-06"
+score_a = 0.75
+score_b = 0.55
+score_c = 0.35
+
 [gates]
 enabled = true
 require_presentation_grades = ["A", "B"]
