@@ -1027,6 +1027,7 @@ def run_production(
             cross_site_path,
             secondary_sample_id=str(expanded_evidence.get("secondary_sample_id") or "SECONDARY_RNA"),
             identity_status=str(expanded_evidence.get("secondary_identity_status") or "UNASSESSED"),
+            genome_build=str(run_cfg.get("genome_build") or manifest.get("genome_build") or "GRCh38"),
         )
         expanded_evidence["cross_site_rna_evidence"] = str(cross_site_path)
         cross_site_summary_path = cross_site_path.with_suffix(".summary.json")

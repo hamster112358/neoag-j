@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import json
 import os
 import re
 from pathlib import Path
 
 from neoag.input_router import build_raw_intermediates
 from neoag.tools.upstream import run_upstream
+from neoag.utils import write_toml
 
 
 HLA_RE = re.compile(r"(?:HLA-)?(?:A|B|C)\*[0-9]{2,3}(?::[0-9A-Z]{2,3}){1,4}", re.I)
@@ -82,6 +82,15 @@ def resolve_vcf_sample_roles(
         tumor = next((sample for sample in samples if sample != normal), "")
     if tumor and normal and tumor == normal:
         raise SystemExit("tumor and normal VCF sample names must differ")
+    if len(samples) >= 2 and not (tumor and normal):
+        # Review B1-03: unresolved roles in a multi-sample VCF must fail
+        # closed here, not fall through to column-order guessing.
+        raise SystemExit(
+            f"cannot resolve tumor/normal roles for VCF samples={samples}; "
+            "pass --tumor-sample-name and --normal-sample-name explicitly"
+        )
+    if len(samples) == 1 and not tumor and not normal:
+        tumor = samples[0]
     return tumor, normal
 
 
@@ -137,21 +146,9 @@ def main() -> int:
             "normal_sample_name": normal_sample_name,
         })
         cfg = {"sample": {"id": args.sample_id, "profile": "default"}, "tools": {"enabled": []}, "inputs": inputs}
-        config = outdir / "candidate_upstream.runtime.toml"
-        config.write_text(
-            "[sample]\n"
-            f'id = "{args.sample_id}"\nprofile = "default"\n\n'
-            "[tools]\nenabled = []\n\n[inputs]\nentry_mode = \"snv_indel\"\n"
-            f'variants_vcf = "{source.resolve()}"\nvariant_peptide_extraction = true\nauto_vep_annotate = true\n'
-            f'hla_alleles = [{", ".join(repr(value) for value in alleles)}]\n'
-            f'reference_fasta = "{reference_fasta}"\nvep_cache = "{vep_cache}"\n'
-            f'vep_plugins = "{args.vep_plugins}"\n'
-            f'vep_bin = "{args.vep_bin}"\n'
-            f'normal_proteome_fasta = "{args.normal_proteome}"\n'
-            f'tumor_sample_name = {json.dumps(tumor_sample_name)}\n'
-            f'normal_sample_name = {json.dumps(normal_sample_name)}\n',
-            encoding="utf-8",
-        )
+        # Review B1-02: emit the runtime config from typed data (round-trip
+        # verified) instead of interpolating paths into a template.
+        config = write_toml(outdir / "candidate_upstream.runtime.toml", cfg)
         run_upstream(config, outdir)
     else:
         key = "fusion_tsv" if args.mode == "fusion" else "splice_junction_tsv"

@@ -116,3 +116,60 @@ def split_ws_or_tab(line: str) -> list[str]:
     if "\t" in line:
         return [x.strip() for x in line.strip().split("\t")]
     return [x.strip() for x in re.split(r"\s+", line.strip()) if x.strip()]
+
+
+def toml_literal(value: Any) -> str:
+    """Serialize one TOML scalar/array with full escaping (review B1-02).
+
+    JSON string escaping is a safe subset of TOML basic strings, so quotes,
+    backslashes and spaces in paths survive a tomllib round-trip instead of
+    silently breaking the document structure.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_literal(v) for v in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def write_toml(path: str | Path, doc: Mapping[str, Any]) -> Path:
+    """Write a flat-table TOML document and verify it parses before saving.
+
+    Review B1-02: runtime configs were built by interpolating paths into a
+    hand-written template, where one quote or backslash in a path silently
+    changed the document's meaning.  Values are emitted from typed data and
+    the rendered text must round-trip through tomllib, so a broken document
+    fails here instead of mid-run.
+    """
+    import tomllib
+
+    lines: list[str] = []
+    scalars: list[str] = []
+    tables: list[tuple[str, Mapping[str, Any]]] = []
+    for key, value in doc.items():
+        if isinstance(value, Mapping):
+            tables.append((str(key), value))
+        else:
+            if value is None:
+                continue  # absent is honest; TOML has no null
+            scalars.append(f"{key} = {toml_literal(value)}")
+    lines.extend(scalars)
+    for name, table in tables:
+        lines.append("")
+        lines.append(f"[{name}]")
+        for key, value in table.items():
+            if isinstance(value, Mapping) or value is None:
+                continue
+            lines.append(f"{key} = {toml_literal(value)}")
+    text = "\n".join(lines).strip() + "\n"
+    parsed = tomllib.loads(text)  # raises on any malformed emission
+    for name, table in tables:
+        for key in table:
+            if table[key] is not None and key not in parsed.get(name, {}):
+                raise ValueError(f"write_toml: key {name}.{key} lost in round-trip")
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p

@@ -176,6 +176,8 @@ def _write_fusion(inputs: dict[str, Any], declared: dict[str, dict[str, str]], o
 def _write_splice(
     declared: dict[str, dict[str, str]],
     outdir: Path,
+    *,
+    genome_build: str = "GRCh38",
 ) -> tuple[str, list[dict[str, str]]]:
     """Create exact splice consensus without gene/locus string matching.
 
@@ -222,7 +224,7 @@ def _write_splice(
                 source,
                 sample_id="",
                 source_tool=tool,
-                genome_build="GRCh38",
+                genome_build=genome_build,
                 coordinate_system="auto",
                 strict=False,
             ),
@@ -244,7 +246,7 @@ def _write_splice(
                     source,
                     sample_id="",
                     source_tool=tool,
-                    genome_build="GRCh38",
+                    genome_build=genome_build,
                     coordinate_system="auto",
                     strict=False,
                 ),
@@ -459,7 +461,11 @@ def build_tool_consensus(inputs: dict[str, Any], outdir: str | Path, *, evidence
     hla_status, _ = _write_hla(inputs, declared, root)
     loh_status, _, conflicts = _write_hla_loh(declared, root)
     fusion_status, _ = _write_fusion(inputs, declared, root)
-    splice_status, _ = _write_splice(declared, root)
+    # Review B5-03: the declared run build is the default for sources that
+    # carry no build column, instead of a hardcoded GRCh38 label.
+    splice_status, _ = _write_splice(
+        declared, root, genome_build=str(inputs.get("genome_build") or "GRCh38"),
+    )
     purity_status, _ = _write_purity(inputs, declared, root)
     presentation_status, ccf_status = _presentation_and_ccf_from_evidence(evidence_path, root)
     sample_identity_status, _ = _write_sample_identity(declared, root)

@@ -69,16 +69,23 @@ def _breakpoints(row: Mapping[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def event_keys(row: Mapping[str, Any]) -> list[tuple[str, str, str]]:
-    """Return (specificity, method, key); exact keys always precede broad keys."""
+def event_keys(row: Mapping[str, Any], *, default_build: str = "GRCh38") -> list[tuple[str, str, str]]:
+    """Return (specificity, method, key); exact keys always precede broad keys.
+
+    Review C6-06: keys embed the row's own genome_build (falling back to the
+    declared run build, not a hardcoded GRCh38 label), so same-coordinate
+    events from different builds simply do not match instead of being
+    silently compared under a wrong build prefix.
+    """
     track = _event_type(row)
+    build = _text(row, "genome_build") or default_build
     if track in {"SNV", "INDEL"}:
         chrom = _chrom(_text(row, "chrom", "chromosome"))
         pos = _text(row, "pos", "position", "start")
         ref = _text(row, "ref", "reference")
         alt = _text(row, "alt", "alternate")
         if chrom and pos and ref and alt:
-            return [("exact", "BUILD_CHROM_POS_REF_ALT", f"GRCh38|{chrom}|{pos}|{ref}|{alt}")]
+            return [("exact", "BUILD_CHROM_POS_REF_ALT", f"{build}|{chrom}|{pos}|{ref}|{alt}")]
     if track == "SPLICE":
         canonical = _text(row, "canonical_junction_id")
         if canonical.startswith("SJ|"):
@@ -87,7 +94,6 @@ def event_keys(row: Mapping[str, Any]) -> list[tuple[str, str, str]]:
         start = _text(row, "junction_start", "intron_start")
         end = _text(row, "junction_end", "intron_end")
         strand = _text(row, "junction_strand", "strand")
-        build = _text(row, "genome_build") or "GRCh38"
         if chrom and start and end and strand in {"+", "-"}:
             return [("exact", "BUILD_CHROM_INTRON_STRAND", f"SJ|{build}|{chrom}|{start}|{end}|{strand}")]
     if track == "FUSION":
@@ -133,12 +139,17 @@ def build_cross_site_rna_evidence(
     *,
     secondary_sample_id: str,
     identity_status: str = "UNASSESSED",
+    genome_build: str = "GRCh38",
 ) -> dict[str, Any]:
+    # Review C6-06: the declared run build keys every table that lacks its
+    # own genome_build column; the effective default is recorded in the
+    # summary so key provenance never claims GRCh38 implicitly.
+    default_build = str(genome_build or "GRCh38")
     primary = read_tsv(primary_events)
     secondary = read_tsv(secondary_events)
     index: dict[str, list[tuple[str, str, dict[str, str]]]] = defaultdict(list)
     for row in secondary:
-        for specificity, method, key in event_keys(row):
+        for specificity, method, key in event_keys(row, default_build=default_build):
             index[key].append((specificity, method, row))
 
     identity = str(identity_status or "UNASSESSED").strip().upper()
@@ -150,7 +161,7 @@ def build_cross_site_rna_evidence(
         track = _event_type(row)
         match = None
         used_key = ""
-        for specificity, method, key in event_keys(row):
+        for specificity, method, key in event_keys(row, default_build=default_build):
             candidates = index.get(key, [])
             if len(candidates) == 1:
                 match = (specificity, method, candidates[0][2])
@@ -215,7 +226,12 @@ def build_cross_site_rna_evidence(
             "cross_site_reason": reason,
         })
     write_tsv(output_tsv, output, CROSS_SITE_FIELDS)
-    return {"rows": len(output), "status_counts": dict(sorted(counts.items())), "output": str(output_tsv)}
+    return {
+        "rows": len(output),
+        "status_counts": dict(sorted(counts.items())),
+        "output": str(output_tsv),
+        "default_genome_build": default_build,
+    }
 
 
 __all__ = ["CROSS_SITE_FIELDS", "build_cross_site_rna_evidence", "event_keys"]
