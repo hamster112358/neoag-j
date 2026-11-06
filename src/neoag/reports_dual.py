@@ -7038,6 +7038,69 @@ def _provenance_section(provenance: Mapping[str, Any]) -> str:
     return "\n".join(out)
 
 
+def weight_sensitivity_html(sens: list[Mapping[str, Any]],
+                            chains: list[Mapping[str, Any]]) -> str:
+    """Render the regional-Dirichlet weight-sensitivity section (shared renderer).
+
+    Used by make_technical_report and by the standalone weight-ranking report
+    (ranking_reports.py) so the two renderings can never drift apart.
+    """
+    from .sensitivity import SENSITIVITY_FORMULA
+    if not sens:
+        return ""
+    meta = sens[0]
+    try:
+        k = int(meta.get("top_k") or 50)
+    except ValueError:
+        k = 50
+    out = ["<div class='section'><h2>Weight Sensitivity (regional Dirichlet)</h2>"]
+    out.append(
+        f"<p>The final peptide ranking was re-scored under {esc(meta.get('n_draws', '?'))} weight "
+        f"vectors: the profile default plus {esc(meta.get('n_draws', '?'))} draws from a Dirichlet "
+        f"distribution seeded at that default over the {esc(meta.get('n_chains', '?'))} Layer-3 evidence "
+        f"chains (concentration {esc(meta.get('concentration', '?'))}, seed {esc(meta.get('seed', '?'))}). "
+        f"Every candidate was re-ranked against all {esc(meta.get('n_scorable', '?'))} scorable candidates; "
+        f"the two tables below show the default top-{k} and the median top-{k}. "
+        f"<b>Table 1</b> is the ranking under the default weights; <b>Table 2</b> is the ranking after the "
+        f"sensitivity test (adjusted_score = expected_score &times; dominance_factor &times; rank_stability). "
+        f"Rows with top_selection=yes are in the default top-{k} and remain inside it under every draw - "
+        f"those are the candidates with consistent top-selection. Candidates whose score is driven by a "
+        f"single chain, or whose rank moves widely across the region, are penalized. The chain_multiplier "
+        f"column shows each candidate's stored modifier product (safety &times; gate &times; APPM &times; CCF "
+        f"&times; escape &times; cross-platform; efficacy/composite), held fixed across draws - these are "
+        f"discrete decisions, not weights, so they are reported per candidate rather than sampled. "
+        f"Stability under this "
+        f"test is robustness to the weight choice, not accuracy.</p>"
+    )
+    if chains:
+        out.append("<h3>Evidence-chain contribution under the default weights</h3>")
+        out.append("<p>mean_share is the average fraction of the composite each chain carries across the "
+                   "reported candidates under the default weights (a dominance diagnostic; shares sum to 1).</p>")
+        out.append(_table(chains, [
+            "chain", "default_weight", "mean_share", "n_candidates",
+        ]))
+    table1 = sorted(sens, key=lambda r: int(r.get("base_rank") or 0))[:50]
+    out.append(f"<h3>Table 1: default-weight ranking (top-{k} window)</h3>")
+    out.append(_table(table1, [
+        "base_rank", "peptide_id", "peptide", "gene", "hla_allele", "mhc_class",
+        "base_score", "chain_multiplier", "median_rank", "rank_iqr", "worst_rank", "verdict",
+        "consistency", "top_selection",
+    ]))
+    table2 = sorted(sens, key=lambda r: int(r.get("adjusted_rank") or 0))[:50]
+    out.append(f"<h3>Table 2: stability-adjusted ranking (top-{k} window)</h3>")
+    out.append(_table(table2, [
+        "adjusted_rank", "base_rank", "peptide_id", "peptide", "gene", "hla_allele",
+        "base_score", "expected_score", "consistency", "dominance", "effective_chains",
+        "dominance_factor", "rank_stability", "adjusted_score", "top_selection",
+    ]))
+    out.append(
+        "<p class='mono' style='white-space:pre-wrap; font-size:0.85em'>"
+        f"{esc(SENSITIVITY_FORMULA)}</p>"
+    )
+    out.append("</div>")
+    return "\n".join(out)
+
+
 def make_technical_report(path: str | Path, bundle: ReportBundle) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -7176,54 +7239,8 @@ def make_technical_report(path: str | Path, bundle: ReportBundle) -> None:
     out.append("</div>")
 
     if bundle.weight_sensitivity:
-        from .sensitivity import SENSITIVITY_FORMULA
-        sens = bundle.weight_sensitivity
-        meta = sens[0]
-        try:
-            k = int(meta.get("top_k") or 50)
-        except ValueError:
-            k = 50
-        out.append("<div class='section'><h2>Weight Sensitivity (regional Dirichlet)</h2>")
-        out.append(
-            f"<p>The final peptide ranking was re-scored under {esc(meta.get('n_draws', '?'))} weight "
-            f"vectors: the profile default plus {esc(meta.get('n_draws', '?'))} draws from a Dirichlet "
-            f"distribution seeded at that default over the {esc(meta.get('n_chains', '?'))} Layer-3 evidence "
-            f"chains (concentration {esc(meta.get('concentration', '?'))}, seed {esc(meta.get('seed', '?'))}). "
-            f"Every candidate was re-ranked against all {esc(meta.get('n_scorable', '?'))} scorable candidates; "
-            f"the two tables below show the default top-{k} and the median top-{k}. "
-            f"<b>Table 1</b> is the ranking under the default weights; <b>Table 2</b> is the ranking after the "
-            f"sensitivity test (adjusted_score = expected_score &times; dominance_factor &times; rank_stability). "
-            f"Rows with top_selection=yes are in the default top-{k} and remain inside it under every draw - "
-            f"those are the candidates with consistent top-selection. Candidates whose score is driven by a "
-            f"single chain, or whose rank moves widely across the region, are penalized. Stability under this "
-            f"test is robustness to the weight choice, not accuracy.</p>"
-        )
-        if bundle.weight_sensitivity_chains:
-            out.append("<h3>Evidence-chain contribution under the default weights</h3>")
-            out.append("<p>mean_share is the average fraction of the composite each chain carries across the "
-                       "reported candidates under the default weights (a dominance diagnostic; shares sum to 1).</p>")
-            out.append(_table(bundle.weight_sensitivity_chains, [
-                "chain", "default_weight", "mean_share", "n_candidates",
-            ]))
-        table1 = sorted(sens, key=lambda r: int(r.get("base_rank") or 0))[:50]
-        out.append(f"<h3>Table 1: default-weight ranking (top-{k} window)</h3>")
-        out.append(_table(table1, [
-            "base_rank", "peptide_id", "peptide", "gene", "hla_allele", "mhc_class",
-            "base_score", "median_rank", "rank_iqr", "worst_rank", "verdict",
-            "consistency", "top_selection",
-        ]))
-        table2 = sorted(sens, key=lambda r: int(r.get("adjusted_rank") or 0))[:50]
-        out.append(f"<h3>Table 2: stability-adjusted ranking (top-{k} window)</h3>")
-        out.append(_table(table2, [
-            "adjusted_rank", "base_rank", "peptide_id", "peptide", "gene", "hla_allele",
-            "base_score", "expected_score", "consistency", "dominance", "effective_chains",
-            "dominance_factor", "rank_stability", "adjusted_score", "top_selection",
-        ]))
-        out.append(
-            "<p class='mono' style='white-space:pre-wrap; font-size:0.85em'>"
-            f"{esc(SENSITIVITY_FORMULA)}</p>"
-        )
-        out.append("</div>")
+        out.append(weight_sensitivity_html(
+            bundle.weight_sensitivity, bundle.weight_sensitivity_chains))
 
     out.append("<div class='section'><h2>Ranked Peptides (full)</h2>")
     out.append("<h3>Quantitative presentation and immunogenicity review</h3>")

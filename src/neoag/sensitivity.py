@@ -40,7 +40,7 @@ SENSITIVITY_DEFAULT_SEED = 20261106
 
 WEIGHT_SENSITIVITY_FIELDS = [
     "peptide_id", "peptide", "hla_allele", "mhc_class", "gene",
-    "base_score", "base_rank", "expected_rank", "median_rank", "rank_iqr",
+    "base_score", "chain_multiplier", "base_rank", "expected_rank", "median_rank", "rank_iqr",
     "best_rank", "worst_rank", "rank_spread",
     "score_min", "score_max", "score_range", "expected_score",
     "consistency", "dominance", "effective_chains", "dominance_factor",
@@ -66,7 +66,13 @@ SENSITIVITY_FORMULA = (
     "scoring treats it); under a weight vector w: composite(w) = sum(w_k*s_k) / sum(w_k); "
     "M = efficacy_score / immunology_composite_score is the stored per-candidate chain of "
     "multipliers (safety, APPM, presentation gate, CCF, escape, cross-platform, mutant "
-    "specificity - constant across draws); score(w) = composite(w) * M. At the default "
+    "specificity - constant across draws); score(w) = composite(w) * M. M is reported "
+    "unchanged per candidate in the chain_multiplier column (na when the stored composite "
+    "is 0, which forces every score to 0 regardless of M). M is deliberately NOT sampled: "
+    "its factors are discrete decisions (safety rejection, presentation-gate tier, CCF "
+    "state, escape flag), not uncertain weights - perturbing a decision belongs in a "
+    "separate what-if scenario (re-rank with the chosen decision flipped), not in the "
+    "weight region. At the default "
     "vector score(w) equals the stored efficacy_score exactly. "
     "Regional draws: the default vector is the seed; each draw takes w_k = W * g_k / "
     "sum(g) with g_k ~ Gamma(base_k * concentration, 1) - a Dirichlet distribution centred "
@@ -177,7 +183,7 @@ def weight_sensitivity_table(peptide_rows, profile,
         # the composite is their weighted mean), so score(w) = 0 for every w
         # and the multiplier chain value is irrelevant; 1.0 keeps it finite.
         multiplier = eff / comp if comp > 0 else 1.0
-        scorable.append((row, values, multiplier))
+        scorable.append((row, values, multiplier, comp > 0))
 
     n = len(scorable)
     if n == 0:
@@ -189,13 +195,13 @@ def weight_sensitivity_table(peptide_rows, profile,
     for vec in vectors:
         score_cols.append([
             sum(vec[name] * values[name] for name in names) / total_w * mult
-            for _, values, mult in scorable
+            for _, values, mult, _has_comp in scorable
         ])
     rank_cols = [_dense_ranks(col) for col in score_cols]
 
     minor_band = max(3, int(0.05 * n))
     out = []
-    for i, (row, values, _mult) in enumerate(scorable):
+    for i, (row, values, _mult, has_composite) in enumerate(scorable):
         rs = [col[i] for col in rank_cols]
         ss = [col[i] for col in score_cols]
         expected_rank = sum(rs) / len(rs)
@@ -227,6 +233,7 @@ def weight_sensitivity_table(peptide_rows, profile,
             "mhc_class": row.get("mhc_class", ""),
             "gene": row.get("gene", ""),
             "base_score": f"{ss[0]:.4f}",
+            "chain_multiplier": (f"{_mult:.4f}" if has_composite else "na"),
             "base_rank": str(rs[0]),
             "expected_rank": f"{expected_rank:.2f}",
             "median_rank": f"{median(rs):.1f}",

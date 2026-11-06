@@ -144,6 +144,13 @@ def cmd_weight_sensitivity(args):
         f"per-chain diagnostic -> {chains_path}"
     )
 
+def cmd_ranking_reports(args):
+    """Two separate ranking reports: consensus logic ranking vs weight ranking."""
+    from .ranking_reports import write_ranking_reports
+    paths = write_ranking_reports(args.case_dir, out_dir=args.out_dir, top=args.top)
+    print(f"Consensus-based logic ranking report -> {paths['consensus']}")
+    print(f"Weight-based ranking report          -> {paths['weight']}")
+
 def cmd_appm(args):
     build_appm_lite(args.sample_id, args.vep_tsv, args.expression, args.hla_loh, load_profile(args.profile), args.outdir, cnv_tsv=getattr(args, "cnv", None), raw_peptides=getattr(args, "raw_peptides", None), ccf_tsv=getattr(args, "ccf", None))
     print("Built APPM 2.0 sidecars via compatibility entry point.")
@@ -1173,6 +1180,11 @@ def build_parser():
     ws.add_argument("--top-k", dest="top_k", type=int, default=50, help="Reporting/acceptability window K (default 50): table rows cover the default top-K and the median top-K; consistency = share of draws with rank <= K")
     ws.add_argument("--seed", type=int, default=20261106, help="RNG seed; same seed reproduces every draw exactly")
     ws.set_defaults(func=cmd_weight_sensitivity)
+    rr = sub.add_parser("ranking-reports", help="Write TWO separate ranking reports for one case: the consensus-based logic ranking (evidence_rank) and the weight-based ranking (efficacy_score), each self-contained with cross-references (operator request 2026-11-06)")
+    rr.add_argument("--case-dir", required=True, help="case root, final/ dir, or scoring dir (files are located under final/scoring, scoring, or directly)")
+    rr.add_argument("--out-dir", default=None, help="output directory (default: <case-dir>/reports)")
+    rr.add_argument("--top", type=int, default=50, help="rows per ranking table (default 50; counts in the report always cover the full pool)")
+    rr.set_defaults(func=cmd_ranking_reports)
     ap = sub.add_parser("appm-lite")
     ap.add_argument("--sample-id", default="SAMPLE001"); ap.add_argument("--vep-tsv"); ap.add_argument("--expression"); ap.add_argument("--hla-loh"); ap.add_argument("--cnv"); ap.add_argument("--raw-peptides"); ap.add_argument("--ccf"); ap.add_argument("--profile", default="default"); ap.add_argument("--outdir", required=True); ap.set_defaults(func=cmd_appm)
     ap2 = sub.add_parser("appm-2", help="Build APPM 2.0 gene/pathway/peptide evidence sidecars")
