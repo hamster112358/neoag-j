@@ -243,6 +243,13 @@ def _major_minor_available(row: Mapping[str, Any]) -> bool:
 
 
 def find_cn(chrom: str, pos: str | int | float, cnv_rows: list[dict[str, str]]) -> dict[str, Any]:
+    # Review C4-01: overlapping / nested / multi-tool concatenated segments no
+    # longer resolve to whichever row comes first in file order.  Candidates
+    # are ranked by declared segment quality first, then by specificity (the
+    # narrowest containing segment wins), then by coordinates, so the choice
+    # never depends on input order.  The chosen span is recorded, and genuine
+    # copy-number disagreement between overlapping segments is reported as a
+    # DISCORDANT overlap status with demoted confidence.
     p = int(to_float(pos, -1))
     best = {
         "total_cn": 2.0,
@@ -252,9 +259,14 @@ def find_cn(chrom: str, pos: str | int | float, cnv_rows: list[dict[str, str]]) 
         "matched": False,
         "cnv_confidence": "low",
         "cnv_source": "default_diploid",
+        "cnv_segment_span": "",
+        "cnv_overlap_status": "NONE",
+        "cnv_overlap_segments": "0",
     }
     if p < 0:
         return best
+    _CONF_RANK = {"high": 2, "medium": 1, "low": 0}
+    candidates: list[dict[str, Any]] = []
     for r in cnv_rows:
         if _normalise_chrom(_row_chrom(r)) != _normalise_chrom(chrom):
             continue
@@ -271,7 +283,7 @@ def find_cn(chrom: str, pos: str | int | float, cnv_rows: list[dict[str, str]]) 
             conf = first(r, ["cnv_confidence", "confidence", "seg_confidence", "quality"], "")
             if not conf:
                 conf = "high" if not math.isnan(major) and not math.isnan(minor) else "medium"
-            return {
+            candidates.append({
                 "total_cn": max(0.1, total),
                 "major_cn": "" if math.isnan(major) else f"{major:.4f}",
                 "minor_cn": "" if math.isnan(minor) else f"{minor:.4f}",
@@ -279,8 +291,30 @@ def find_cn(chrom: str, pos: str | int | float, cnv_rows: list[dict[str, str]]) 
                 "matched": True,
                 "cnv_confidence": conf,
                 "cnv_source": first(r, ["source", "tool", "caller"], "segment"),
-            }
-    return best
+                "_conf_rank": _CONF_RANK.get(str(conf).strip().lower(), 1),
+                "_width": end - start,
+                "_start": start,
+                "_end": end,
+            })
+    if not candidates:
+        return best
+    candidates.sort(key=lambda c: (-c["_conf_rank"], c["_width"], c["_start"], c["_end"]))
+    chosen = candidates[0]
+    distinct_cn = {f"{c['total_cn']:.4f}" for c in candidates}
+    if len(candidates) == 1:
+        overlap_status = "NONE"
+    elif len(distinct_cn) == 1:
+        overlap_status = "CONSISTENT"
+    else:
+        overlap_status = "DISCORDANT"
+    if overlap_status == "DISCORDANT":
+        chosen["cnv_confidence"] = "low"
+    chosen["cnv_segment_span"] = f"{chosen.pop('_start')}-{chosen.pop('_end')}"
+    chosen["cnv_overlap_status"] = overlap_status
+    chosen["cnv_overlap_segments"] = str(len(candidates))
+    for key in ("_conf_rank", "_width"):
+        chosen.pop(key, None)
+    return chosen
 
 
 def estimate_ccf_raw(vaf: float, purity: float, total_cn: float, multiplicity: float) -> float:
@@ -392,12 +426,43 @@ def _normal_allele_evidence(e: Mapping[str, Any]) -> tuple[int | None, int | Non
     )
 
 
+_PURITY_RANGE_PAIR = re.compile(
+    r"^\s*\(?\[?\s*([0-9]*\.?[0-9]+)\s*(?:-{1,2}|–|—|~|\.\.|\bto\b|,|/)\s*([0-9]*\.?[0-9]+)\s*\]?\)?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _purity_bounds(purity_info: Mapping[str, Any], purity: float) -> tuple[float, float]:
-    raw = str(purity_info.get("purity_range") or "")
-    values = [float(x) for x in re.findall(r"(?:^|[^0-9.])([01](?:\.\d+)?)", raw)]
-    values = [x for x in values if 0 < x <= 1]
-    if len(values) >= 2:
-        return min(values), max(values)
+    # Review C4-04: the previous scanner grabbed *every* 0-1 float found in the
+    # text, so prose like "estimate 0.45 (Q30 base 0.98)" fabricated a purity
+    # interval from unrelated numbers and silently widened the CCF bounds.
+    # Structured low/high keys win; a free-text range must be *exactly* a
+    # "lo-hi" pair; anything else (percentages, prose, single values) falls
+    # back to the point estimate instead of inventing an interval.
+    def _valid_pair(low_raw: Any, high_raw: Any) -> tuple[float, float] | None:
+        try:
+            lo, hi = float(low_raw), float(high_raw)
+        except (TypeError, ValueError):
+            return None
+        if 0 < lo <= 1 and 0 < hi <= 1:
+            return (lo, hi) if lo <= hi else (hi, lo)
+        return None
+
+    for lo_key, hi_key in (
+        ("purity_low", "purity_high"),
+        ("purity_ci_low", "purity_ci_high"),
+        ("purity_min", "purity_max"),
+    ):
+        pair = _valid_pair(purity_info.get(lo_key), purity_info.get(hi_key))
+        if pair is not None:
+            return pair
+    raw = str(purity_info.get("purity_range") or "").strip()
+    if raw and "%" not in raw:
+        match = _PURITY_RANGE_PAIR.match(raw)
+        if match:
+            pair = _valid_pair(match.group(1), match.group(2))
+            if pair is not None:
+                return pair
     return purity, purity
 
 
@@ -744,7 +809,10 @@ def _resolve_external(row: dict[str, str], external: Mapping[str, Mapping[str, s
 def _resolve_ccf_resolution(row: dict[str, str]) -> tuple[str, str]:
     if row.get("external_ccf"):
         if row.get("external_clonality_tool") == "SVclone":
-            return "external_svclone_preferred", "svclone_available_for_sv_event"
+            # Review C4-03: "preferred" overstated what the code does — no
+            # value is overwritten with SVclone's CCF; it is recorded alongside
+            # the internal estimate as advisory context, so name it as such.
+            return "external_available_advisory", "svclone_available_advisory_for_sv_event"
         internal = to_float(row.get("ccf_best", ""), -1.0)
         external = to_float(row.get("external_ccf", ""), -1.0)
         if internal >= 0 and external >= 0 and abs(internal - external) > 0.35:
@@ -1044,7 +1112,12 @@ def build_ccf_2(
             "ccf_interpretation": status,
             "ccf_formula_assumptions": (
                 f"CCF=VAF*(purity*total_cn+2*(1-purity))/(purity*m);m={best_m or 'unresolved'};"
-                f"local_cn={'matched' if cn.get('matched') else 'diploid_fallback'}"
+                f"local_cn={'matched' if cn.get('matched') else 'diploid_fallback'};"
+                # Review C4-01: record which segment was chosen so the estimate
+                # is reproducible even when overlapping segments existed.
+                f"cnv_segment={cn.get('cnv_segment_span') or 'none'};"
+                f"cnv_overlap={cn.get('cnv_overlap_status', 'NONE')}"
+                f"(n={cn.get('cnv_overlap_segments', '0')})"
             ),
             "local_cnv_status": "MATCHED_LOCAL_SEGMENT" if cn.get("matched") else "DIPLOID_FALLBACK_LOW_CONFIDENCE",
             "normal_alt_count": "" if normal_alt is None else str(normal_alt),

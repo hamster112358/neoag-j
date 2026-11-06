@@ -112,21 +112,46 @@ class CaptureRegions:
         d = self.nearest_distance(chrom, pos)
         return self.status_from_distance(d, near_bp, slop_bp), '' if d is None else str(d)
 
+    @classmethod
+    def _side_rank(cls, status: str, near_bp: int, slop_bp: int) -> int:
+        if status == 'ON_TARGET':
+            return 3
+        if status == f'NEAR_TARGET_{near_bp}BP':
+            return 2
+        if status == f'NEAR_TARGET_{slop_bp}BP':
+            return 1
+        if status == 'OFF_TARGET':
+            return 0
+        return -1
+
+    @classmethod
+    def joint_interpretability(cls, s1: str, s2: str, near_bp: int = 250, slop_bp: int = 1000) -> str:
+        """Joint capture interpretability of a two-breakend event.
+
+        Review B4-15: a single captured breakend gives PARTIAL, not high,
+        interpretability of a two-sided event.  HIGH therefore requires BOTH
+        sides on- or near-target; one-sided capture is MEDIUM (weak partner)
+        or LOW (partner off-target); LOW is now genuinely reachable instead
+        of dead code.
+        """
+        ranks = sorted((cls._side_rank(s1, near_bp, slop_bp), cls._side_rank(s2, near_bp, slop_bp)), reverse=True)
+        if -1 in ranks:
+            return 'NOT_ASSESSED'
+        if ranks[1] >= 2:
+            return 'HIGH'          # both breakends within capture range
+        if ranks[0] >= 2 and ranks[1] >= 1:
+            return 'MEDIUM'        # one side captured, partner weakly captured
+        if ranks[0] >= 2:
+            return 'LOW'           # one side captured, partner off-target
+        if ranks[0] >= 1:
+            return 'MEDIUM'        # both sides only in the far slop window
+        return 'UNINTERPRETABLE'   # both breakends outside the kit
+
     def classify_cluster(self, cluster: SVCluster, near_bp: int = 250, slop_bp: int = 1000) -> dict[str, str]:
         rep = cluster.representative
         s1, d1 = self.classify_breakend(rep.chrom1, rep.pos1, near_bp, slop_bp)
         s2, d2 = self.classify_breakend(rep.chrom2, rep.pos2, near_bp, slop_bp)
-        statuses = {s1, s2}
-        if 'ON_TARGET' in statuses or f'NEAR_TARGET_{near_bp}BP' in statuses:
-            interpret = 'HIGH'
-        elif f'NEAR_TARGET_{slop_bp}BP' in statuses:
-            interpret = 'MEDIUM'
-        elif statuses == {'OFF_TARGET'} or (s1 == 'OFF_TARGET' and s2 == 'OFF_TARGET'):
-            interpret = 'UNINTERPRETABLE'
-        elif 'NOT_ASSESSED' in statuses:
-            interpret = 'NOT_ASSESSED'
-        else:
-            interpret = 'LOW'
+        interpret = self.joint_interpretability(s1, s2, near_bp, slop_bp)
         return {
             'breakend1_capture_status': s1,
             'breakend2_capture_status': s2,
@@ -193,9 +218,13 @@ def annotate_cluster_capture(cluster: SVCluster, capture: CaptureRegions | None,
         ann['evidence_scope'] = 'EXOME_CAPTURE_LIMITED'
         ann['capture_filter_status'] = 'PASS' if interpret in {'HIGH','MEDIUM'} else ('REVIEW' if interpret == 'LOW' else 'FAIL')
         ann['capture_filter_reason'] = 'capture_near_target' if interpret in {'HIGH','MEDIUM'} else ('low_capture_interpretability' if interpret == 'LOW' else 'outside_capture_scope')
-    setattr(cluster, 'capture_annotation', ann)
+    # Review B4-17: SVCluster.capture_annotation is a declared typed field;
+    # assigning it directly keeps the coupling explicit and copy-safe.
+    cluster.capture_annotation = ann
     return ann
 
 
 def cluster_capture_annotation(cluster: SVCluster) -> dict[str, str]:
-    return getattr(cluster, 'capture_annotation', {}) or {}
+    """Boundary accessor: always yields a dict, from the typed field."""
+    ann = cluster.capture_annotation
+    return dict(ann) if isinstance(ann, dict) else {}

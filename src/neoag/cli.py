@@ -601,6 +601,8 @@ def cmd_sv_score(args):
         raw_peptides=raw_peptides,
         netmhcpan=_sv_optional_path(args.netmhcpan),
         mhcflurry=_sv_optional_path(args.mhcflurry),
+        netmhcstabpan=_sv_optional_path(getattr(args, "netmhcstabpan", None)),
+        netchop=_sv_optional_path(getattr(args, "netchop", None)),
         vep_appm=_sv_optional_path(args.vep_appm) or ROOT / "assets" / "empty_vep.tsv",
         expression=_sv_optional_path(args.expression),
         hla_loh=_sv_optional_path(args.hla_loh) or ROOT / "assets" / "empty_hla_loh.tsv",
@@ -655,6 +657,8 @@ def cmd_sv_run_full(args):
         sample_id=args.sample_id,
         raw_events=adapter_out / "parsed" / "raw_events.tsv",
         raw_peptides=adapter_out / "parsed" / "raw_peptides.tsv",
+        netmhcstabpan=_sv_optional_path(getattr(args, "netmhcstabpan", None)),
+        netchop=_sv_optional_path(getattr(args, "netchop", None)),
         vep_appm=_sv_optional_path(args.vep_appm) or ROOT / "assets" / "empty_vep.tsv",
         expression=_sv_optional_path(args.expression),
         hla_loh=_sv_optional_path(args.hla_loh) or ROOT / "assets" / "empty_hla_loh.tsv",
@@ -752,6 +756,8 @@ def cmd_sv_run_full_wes(args):
         sample_id=args.sample_id,
         raw_events=adapter_out / "parsed" / "raw_events.tsv",
         raw_peptides=adapter_out / "parsed" / "raw_peptides.tsv",
+        netmhcstabpan=_sv_optional_path(getattr(args, "netmhcstabpan", None)),
+        netchop=_sv_optional_path(getattr(args, "netchop", None)),
         vep_appm=_sv_optional_path(args.vep_appm) or ROOT / "assets" / "empty_vep.tsv",
         expression=_sv_optional_path(args.expression),
         hla_loh=_sv_optional_path(args.hla_loh) or ROOT / "assets" / "empty_hla_loh.tsv",
@@ -1569,6 +1575,8 @@ def build_parser():
     svs.add_argument("--raw-peptides", help="Override path to raw_peptides.tsv")
     svs.add_argument("--netmhcpan", help="Pre-computed NetMHCpan output (skip run)")
     svs.add_argument("--mhcflurry", help="Pre-computed MHCflurry output (skip run)")
+    svs.add_argument("--netmhcstabpan", help="Pre-computed NetMHCstabpan output (shared presentation schema, review B4-12)")
+    svs.add_argument("--netchop", help="Pre-computed NetChop output (shared presentation schema, review B4-12)")
     svs.add_argument("--vep-appm")
     svs.add_argument("--expression")
     svs.add_argument("--hla-loh")
@@ -1611,6 +1619,8 @@ def build_parser():
     svf.add_argument("--hla-loh")
     svf.add_argument("--purity")
     svf.add_argument("--cnv")
+    svf.add_argument("--netmhcstabpan", help="Pre-computed NetMHCstabpan output (shared presentation schema, review B4-12)")
+    svf.add_argument("--netchop", help="Pre-computed NetChop output (shared presentation schema, review B4-12)")
     svf.add_argument("--merge-distance-bp", type=int, default=200)
     svf.add_argument("--tier1-only", action="store_true")
     svf.add_argument("--peptide-lengths", default="", help="Explicit MHC-I peptide lengths (default: 8,9,10,11)")
@@ -1681,6 +1691,8 @@ def build_parser():
     svfw.add_argument("--hla-loh")
     svfw.add_argument("--purity")
     svfw.add_argument("--cnv")
+    svfw.add_argument("--netmhcstabpan", help="Pre-computed NetMHCstabpan output (shared presentation schema, review B4-12)")
+    svfw.add_argument("--netchop", help="Pre-computed NetChop output (shared presentation schema, review B4-12)")
     svfw.add_argument("--merge-distance-bp", type=int, default=200)
     svfw.add_argument("--tier1-only", action="store_true")
     svfw.add_argument("--peptide-lengths", default="", help="Explicit MHC-I peptide lengths (default: 8,9,10,11)")

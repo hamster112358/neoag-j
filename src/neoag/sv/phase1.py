@@ -156,7 +156,15 @@ def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], 
         "protein_sequence_id": protein.protein_sequence_id if protein else "",
         "junction_aa_position": meta.get("junction_aa_position", ""),
         "rna_junction_reads": rna_reads,
-        "rna_support_status": "RNA_JUNCTION_SUPPORTED" if extra.get("rna_evidence_qc") == "PASS" else ("RNA_JUNCTION_LOW_QC" if rna_reads > 0 else "RNA_NOT_AVAILABLE_OR_NOT_DETECTED"),
+        "rna_support_status": (
+            "RNA_JUNCTION_SUPPORTED" if rna_reads > 0 and extra.get("rna_evidence_qc") == "PASS"
+            # Review B4-13: QC passed but the match is review-flagged, so no
+            # reads were counted as support - say so instead of either
+            # "supported" or "not detected".
+            else "RNA_JUNCTION_REVIEW_ONLY" if extra.get("rna_evidence_qc") == "PASS"
+            else "RNA_JUNCTION_LOW_QC" if rna_reads > 0
+            else "RNA_NOT_AVAILABLE_OR_NOT_DETECTED"
+        ),
         "rna_evidence_match": extra.get("rna_evidence_match", "NO_EXACT_MATCH"),
         "rna_evidence_qc": extra.get("rna_evidence_qc", "UNASSESSED"),
         "final_sv_confidence": conf.tier,
@@ -202,6 +210,15 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         specificity_status = "NORMAL_UNASSESSED"
     if str(svrow.get("population_sv_overlap", "not_assessed")) == "yes":
         specificity -= 0.4
+    # Review B4-05: these three components are triage priors, not measured
+    # quantities.  The clonality number is a VAF proxy (vaf/0.35) that is not
+    # calibrated for purity or copy number - the calibrated per-event CCF and
+    # its multiplier are produced downstream by ccf_v2 and the final score
+    # uses those when present.  Each component's basis is stated verbatim in
+    # event_component_status so a consumer can never read a prior as a
+    # measurement by accident.
+    clonality = min(1.0, vaf / 0.35) if vaf > 0 else 0.0
+    persistence = 0.70 if effect_class in {"SV_Fusion", "SV_Frameshift"} else 0.50
     gene_label = f"{gene1}::{gene2}" if effect_class == "SV_Fusion" and gene2 and gene2 != gene1 else gene1
     base = {
         "event_id": svrow["event_id"],
@@ -242,13 +259,18 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         "event_expression": "" if exp is None else f"{exp:.4f}",
         "expression_evidence_status": expression_status,
         "driver_relevance": "0.5000",
+        "event_component_status": (
+            "clonality=VAF_proxy(vaf/0.35),not_calibrated_for_purity_or_copy_number;"
+            "persistence=fixed_prior;driver_relevance=fixed_prior;"
+            "population_sv_overlap=not_assessed_pending_matched_population_data"
+        ),
         "tumor_vaf": f"{vaf:.4f}",
         "tumor_depth": f"{t_depth:.0f}",
         "tumor_alt_count": f"{t_alt:.0f}",
         "normal_depth": str(svrow.get("normal_local_depth") or ""),
         "normal_alt_count": str(svrow.get("normal_alt_support") or ""),
-        "clonality": f"{min(1.0, vaf / 0.35 if vaf > 0 else 0.0):.4f}",
-        "persistence": "0.7000" if effect_class in {"SV_Fusion", "SV_Frameshift"} else "0.5000",
+        "clonality": f"{clonality:.4f}",
+        "persistence": f"{persistence:.4f}",
         "tumor_specificity": f"{clamp(specificity):.4f}",
         "tumor_specificity_status": specificity_status,
         "ccf_estimate": "",
@@ -262,9 +284,11 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         "appm_mhc_i_integrity": "",
         "appm_mhc_ii_integrity": "",
         "event_score": "",
-        "evidence_scope": svrow.get("evidence_scope", "GENOME_WIDE"),
-        "priority_cap": svrow.get("priority_cap", ""),
-        "wes_confidence_tier": svrow.get("wes_confidence_tier", ""),
+        # Review B4-05: evidence_scope / priority_cap / wes_confidence_tier
+        # were each emitted a second time here with identical values; a later
+        # duplicate silently overrides the earlier entry in a dict literal,
+        # so a future edit to only one of the pairs would change behaviour
+        # invisibly.  The keys are now defined exactly once, at the top.
         "source": ("WES_SV_Phase1_5:" if svrow.get("evidence_scope") == "EXOME_CAPTURE_LIMITED" else "SVPhase1:") + str(svrow.get('callers','')),
     }
     return enrich_event_layers(base)
@@ -481,6 +505,7 @@ def build_sv_phase1_raw(
     sv_rules = profile.get("sv_wes_phase1_5" if wes_mode else "sv_phase1", {}) or {}
     effective_merge_distance = int(sv_rules.get("merge_distance_bp", merge_distance_bp))
     filter_ledger: list[dict[str, str]] = []
+    peptide_exclusions: list[dict[str, str]] = []
     records = read_sv_inputs(
         sv_vcfs,
         callers,
@@ -534,7 +559,31 @@ def build_sv_phase1_raw(
             )
             if projected:
                 rna_evidence_match, exact_rna = projected
-        rna_reads = exact_rna.support_reads if exact_rna and exact_rna.qc_pass else 0
+                if (
+                    rna_evidence_match.startswith("PROJECTED_PARTNER_JUNCTION")
+                    and provisional_gene1
+                    and provisional_gene2
+                    and provisional_gene1 != provisional_gene2
+                    and ann.are_potential_readthrough_partners(
+                        rep.chrom1, provisional_gene1, rep.chrom2, provisional_gene2,
+                    )
+                ):
+                    # Review B4-13: the matched coordinates are equally well
+                    # explained by a native read-through junction of two
+                    # adjacent genes (no tumour rearrangement), and no normal
+                    # junction blacklist is loaded at this point.  The match
+                    # becomes a review flag instead of support until the two
+                    # are differentiated by normal background / gDNA evidence.
+                    rna_evidence_match = "PROJECTED_PARTNER_JUNCTION_ADJACENT_GENES_REVIEW"
+        # Review B4-13: a match labelled *_REVIEW (adjacent-gene read-through
+        # candidate) is real RNA evidence but not tumour-rearrangement
+        # evidence, so it does not count as junction support for scoring,
+        # hypothesis promotion, or peptide eligibility until differentiated.
+        junction_supports_product = bool(
+            exact_rna is not None and exact_rna.qc_pass
+            and not rna_evidence_match.endswith("_REVIEW")
+        )
+        rna_reads = exact_rna.support_reads if junction_supports_product else 0
         score_kwargs = {
             "min_tumor_sr": int(sv_rules.get("min_tumor_sr", 1 if wes_mode else 2)),
             "min_tumor_pe": int(sv_rules.get("min_tumor_pe", 2 if wes_mode else 4)),
@@ -554,7 +603,7 @@ def build_sv_phase1_raw(
             meta = product_meta(product)
         else:
             heuristic_protein, meta = reconstruct_cluster_protein(cluster, eid, sample_id, ann, ref)
-            if heuristic_protein and exact_rna is not None and exact_rna.qc_pass:
+            if heuristic_protein and junction_supports_product:
                 # Audit item SV E2 (path A): a DNA-only ORF hypothesis that an
                 # RNA junction confirms at QC PASS is no longer DNA-only.  It
                 # may proceed to peptide generation, but stays labelled as a
@@ -586,11 +635,47 @@ def build_sv_phase1_raw(
         }
         svrow = _sv_event_row(cluster, eid, sample_id, meta, conf, protein, rna_reads, extra)
         sv_rows.append(svrow)
+        # Review B4-11: an external CONFIRMED expressed product can still be
+        # blocked by NeoAG's own junction-QC policy (most commonly because no
+        # internal rna_junction_tsv was supplied).  Keeping the strict gate is
+        # defensible, but the exclusion must not be silent: every blocked
+        # confirmed product is written to an exclusion ledger with its
+        # provenance and the exact reason.
+        if protein and meta.get("reconstruction_status") == "confirmed_expressed_product":
+            if not junction_supports_product:
+                peptide_exclusions.append({
+                    "event_id": eid,
+                    "sample_id": sample_id,
+                    "gene": meta.get("gene1", "") + (f"::{meta['gene2']}" if meta.get("gene2") else ""),
+                    "product_provenance": str(meta.get("reconstruction_reason", "")),
+                    "adjacency_key": adjacency_key,
+                    "junction_match": rna_evidence_match or "NO_EXACT_MATCH",
+                    "junction_qc": extra.get("rna_evidence_qc", "UNASSESSED"),
+                    "exclusion_reason": (
+                        "rna_junction_qc_unavailable" if not exact_rna
+                        else "junction_match_adjacent_gene_readthrough_review" if rna_evidence_match.endswith("_REVIEW")
+                        else "rna_junction_qc_failed"
+                    ),
+                    "policy": "external confirmed products require NeoAG junction QC PASS before peptide generation (review B4-11); event evidence is retained",
+                })
+                continue
+            if meta.get("effect_class") not in {"SV_Fusion", "SV_Frameshift", "SV_Junction", "SV_Insertion"}:
+                peptide_exclusions.append({
+                    "event_id": eid,
+                    "sample_id": sample_id,
+                    "gene": meta.get("gene1", "") + (f"::{meta['gene2']}" if meta.get("gene2") else ""),
+                    "product_provenance": str(meta.get("reconstruction_reason", "")),
+                    "adjacency_key": adjacency_key,
+                    "junction_match": rna_evidence_match or "NO_EXACT_MATCH",
+                    "junction_qc": extra.get("rna_evidence_qc", "UNASSESSED"),
+                    "exclusion_reason": f"effect_class_not_peptide_eligible:{meta.get('effect_class', '')}",
+                    "policy": "peptides are built only for junction/frameshift/insertion protein products",
+                })
+                continue
         if (
             not protein
             or meta.get("reconstruction_status") not in {"confirmed_expressed_product", "rna_supported_hypothesis"}
-            or not exact_rna
-            or not exact_rna.qc_pass
+            or not junction_supports_product
         ):
             continue
         if meta.get("effect_class") not in {"SV_Fusion", "SV_Frameshift", "SV_Junction", "SV_Insertion"}:
@@ -612,6 +697,7 @@ def build_sv_phase1_raw(
 
     raw_events_path = parsed_dir / "raw_events.tsv"
     raw_peptides_path = parsed_dir / "raw_peptides.tsv"
+    peptide_exclusions_path = parsed_dir / "sv_peptide_exclusions.tsv"
     sv_events_path = sv_dir / "sv_events.full.tsv"
     proteins_path = sv_dir / "sv_protein_reconstruction.tsv"
     proteins_fa_path = sv_dir / "sv_mutant_proteins.fa"
@@ -619,6 +705,10 @@ def build_sv_phase1_raw(
     validation_design_path = sv_dir / "sv_validation_design.tsv"
     write_tsv(raw_events_path, raw_events, EVENT_FIELDS)
     write_tsv(raw_peptides_path, raw_peptides, PEPTIDE_FIELDS)
+    write_tsv(peptide_exclusions_path, peptide_exclusions, [
+        "event_id", "sample_id", "gene", "product_provenance", "adjacency_key",
+        "junction_match", "junction_qc", "exclusion_reason", "policy",
+    ])
     write_tsv(sv_events_path, sv_rows, SV_EVENT_FULL_FIELDS)
     write_tsv(proteins_path, [p.to_row() for p in proteins], SV_PROTEIN_FIELDS)
     write_fasta(proteins_fa_path, proteins)
@@ -638,6 +728,8 @@ def build_sv_phase1_raw(
         "records_parsed": len(records),
         "filter_exclusions": len(filter_ledger),
         "filter_exclusions_ledger": str(filter_ledger_path),
+        "confirmed_products_excluded_from_peptides": len(peptide_exclusions),
+        "peptide_exclusions_ledger": str(peptide_exclusions_path),
         "unfiltered_policy": unfiltered_policy,
         "clusters": len(clusters),
         "sv_events_written": len(sv_rows),
@@ -671,5 +763,6 @@ def build_sv_phase1_raw(
         "sv_event_to_peptide": str(sidecar_peptides_path),
         "sv_validation_design": str(validation_design_path),
         "sv_vcf_filter_exclusions": str(filter_ledger_path),
+        "sv_peptide_exclusions": str(peptide_exclusions_path),
         "provenance": str(prov_path),
     }

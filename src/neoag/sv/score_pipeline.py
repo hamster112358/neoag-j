@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..adapters.mhcflurry import parse_mhcflurry, write_mhcflurry_evidence
 from ..adapters.netmhcpan import parse_netmhcpan, write_netmhcpan_evidence
+from ..adapters.netmhcstabpan import parse_netmhcstabpan, write_netmhcstabpan_evidence
 from ..appm_lite import build_appm_lite
 from ..ccf_v2 import build_ccf_2
 from ..config import load_profile
@@ -42,6 +43,8 @@ def run_sv_score(
     raw_peptides: str | Path,
     netmhcpan: str | Path | None = None,
     mhcflurry: str | Path | None = None,
+    netmhcstabpan: str | Path | None = None,
+    netchop: str | Path | None = None,
     vep_appm: str | Path | None = None,
     expression: str | Path | None = None,
     hla_loh: str | Path | None = None,
@@ -128,9 +131,22 @@ def run_sv_score(
     )
     write_mhcflurry_evidence(mhc_path, parse_mhcflurry(mhc_raw, sample_id))
 
+    # Review B4-12: SV candidates must share the main branch's predictor
+    # schema, and whatever is missing must be recorded rather than silently
+    # left out.  The auxiliary predictors are passthrough here exactly as the
+    # main pipeline wires them (parse -> shared evidence schema -> weights).
+    stab_raw = _resolve_optional(netmhcstabpan)
+    netchop_raw = _resolve_optional(netchop)
+    stab_path = None
+    if stab_raw:
+        stab_path = pres / "netmhcstabpan_evidence.tsv"
+        stab_rec = provenance_registry.register_passthrough("netmhcstabpan", stab_raw)
+        write_netmhcstabpan_evidence(stab_path, parse_netmhcstabpan(stab_raw, sample_id), stab_rec)
+
     pres_path = pres / "presentation_evidence.tsv"
     build_presentation_evidence(
-        peptides_path, net_path, mhc_path, profile, pres_path, provenance_registry=provenance_registry,
+        peptides_path, net_path, mhc_path, profile, pres_path, stab_path, netchop_raw,
+        provenance_registry=provenance_registry,
     )
     pres_rows = read_tsv(pres_path)
     immuno_ctx = RunContext(
@@ -212,6 +228,14 @@ def run_sv_score(
         "raw_peptides": str(peptides_path),
         "binding_stub": binding_stub,
         "tools": provenance_registry.to_json(),
+        # Review B4-12: explicit per-predictor evidence completeness so an
+        # SV candidate's thinner evidence file is visible, not implied.
+        "predictor_evidence_status": {
+            "netmhcpan": "PRESENT" if net_raw and Path(net_raw).is_file() else "MISSING",
+            "mhcflurry": "PRESENT" if mhc_raw and Path(mhc_raw).is_file() else "MISSING",
+            "netmhcstabpan": "PRESENT" if stab_path else "NOT_PROVIDED",
+            "netchop": "PRESENT" if netchop_raw else "NOT_PROVIDED",
+        },
         "warning": "SV Phase 1 scoring prototype; validate SVs and binding experimentally.",
     }
     report_bundle = load_report_bundle(

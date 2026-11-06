@@ -60,7 +60,9 @@ class PeptideCandidate:
     novel_aa_count: int
     wildtype_match_status: str
     reference_proteome_match: str = "not_assessed"
-    normal_hla_ligand_overlap: str = "no"
+    # Review B4-03: an absent ligandome catalog is "not assessed", never a
+    # measured "no" - the default mirrors reference_proteome_match above.
+    normal_hla_ligand_overlap: str = "not_assessed"
 
     def to_sidecar_row(self) -> dict[str, str]:
         return {
@@ -136,7 +138,11 @@ def build_mhc1_peptides(
                 ref_match = "yes" if peptide in reference_peptides else "no" if reference_peptides else "not_assessed"
                 if ref_match == "yes":
                     continue
-                normal_overlap = "yes" if peptide in normal_ligands else "no"
+                # Review B4-03: "no" is only claimed when a ligand catalogue
+                # actually existed to be searched; an empty/absent catalogue
+                # leaves the comparison unassessed (same rule the
+                # reference-proteome check above applies to its database).
+                normal_overlap = "yes" if peptide in normal_ligands else ("no" if normal_ligands else "not_assessed")
                 for hla in hla_alleles:
                     key = (prot.event_id, peptide, hla, start0)
                     if key in seen:

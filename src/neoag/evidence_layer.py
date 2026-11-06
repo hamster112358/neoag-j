@@ -232,12 +232,16 @@ def build_rna_junction_evidence(
 ) -> list[dict[str, str]]:
     """RNA allele and junction support at event and peptide level."""
     from .adapters.rna_vaf import choose_rna_vaf_support, load_rna_vaf_support
+    from .sv.evidence import junction_positional_key, load_junction_reads
 
-    extra: dict[str, int] = {}
+    # Review B4-18: junction reads may only transfer through exact keys
+    # (event id / junction coordinates).  Gene-pair matches are recorded in a
+    # separate exploratory column and never boost support.
+    junction_exact: dict[str, int] = {}
+    junction_pairs: dict[str, int] = {}
     if junction_path and Path(junction_path).is_file():
-        from .sv.evidence import load_junction_reads
-
-        extra = load_junction_reads(junction_path)
+        _junction = load_junction_reads(junction_path)
+        junction_exact, junction_pairs = _junction.exact, _junction.gene_pair
 
     fusion_reads: dict[str, int] = {}
     fusion_frames: dict[str, str] = {}
@@ -259,18 +263,34 @@ def build_rna_junction_evidence(
         eid = enriched.get("event_id", "")
         gene = str(enriched.get("gene") or "")
         reads = int(to_float(enriched.get("rna_junction_reads"), 0.0))
-        for key in (eid, gene, gene.replace("::", "_")):
-            if key and key in extra:
-                reads = max(reads, extra[key])
+        exact_keys = [eid]
+        try:
+            if enriched.get("chrom1") and enriched.get("pos1") and enriched.get("chrom2") and enriched.get("pos2"):
+                exact_keys.append(junction_positional_key(
+                    str(enriched["chrom1"]), enriched["pos1"],
+                    str(enriched["chrom2"]), enriched["pos2"],
+                ))
+        except (TypeError, ValueError):
+            pass
+        exact_hits = [junction_exact[k] for k in exact_keys if k and k in junction_exact]
+        if exact_hits:
+            reads = max(reads, max(exact_hits))
         if eid in fusion_reads:
             reads = max(reads, fusion_reads[eid])
         source = ""
         if eid in fusion_reads:
             source = str(fusion_evidence_path)
-        elif any(k in extra for k in (eid, gene, gene.replace("::", "_")) if k):
+        elif exact_hits:
             source = str(junction_path) if junction_path else "rna_junction"
         elif reads > 0:
             source = row_source
+        # Exploratory only: gene-pair-level junction support from the same
+        # table.  Reported for grouping, never added to `reads` (B4-18).
+        gene_pair_reads = ""
+        for pair_key in (gene, gene.replace("::", "_"), gene.replace("_", "::")):
+            if pair_key and pair_key in junction_pairs:
+                gene_pair_reads = str(junction_pairs[pair_key])
+                break
         rna = choose_rna_vaf_support(enriched, rna_vaf, row_source)
         rna_fields = rna.as_fields()
         mutation_source = enriched.get("mutation_source", "")
@@ -288,6 +308,7 @@ def build_rna_junction_evidence(
             "gene_pair": gene if "::" in gene else "",
             "junction_reads": str(reads),
             "junction_source": source,
+            "rna_junction_gene_pair_reads": gene_pair_reads,
             "mutation_source": mutation_source,
             "peptide_consequence": consequence,
             **rna_fields,

@@ -218,7 +218,10 @@ def test_ccf21_svclone_preferred_for_sv_event(tmp_path):
     rows = build_ccf_2(events, purity, cnv, load_profile("default"), tmp_path / "ccf.tsv", svclone_tsv=svclone)
     assert rows[0]["external_clonality_tool"] == "SVclone"
     assert rows[0]["svclone_ccf"] == "0.88"
-    assert rows[0]["ccf_resolution"] == "external_svclone_preferred"
+    # C4-03: SVclone CCF is recorded as advisory context, not "preferred"
+    # over the internal estimate, so the resolution name says advisory.
+    assert rows[0]["ccf_resolution"] == "external_available_advisory"
+    assert rows[0]["ccf_resolution_reason"] == "svclone_available_advisory_for_sv_event"
 
 
 def _write_ccf_inputs(tmp_path):

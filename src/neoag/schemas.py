@@ -41,7 +41,7 @@ EVENT_FIELDS = [
     "driver_relevance",
     "tumor_vaf","tumor_depth","tumor_alt_count",
     "rna_vaf","rna_alt_reads","rna_depth","rna_vaf_source",
-    "clonality","persistence","tumor_specificity","tumor_specificity_status",
+    "clonality","persistence","event_component_status","tumor_specificity","tumor_specificity_status",
     "cohort_analysis_status",
     "raw_ccf","ccf_estimate","ccf_best","ccf_min","ccf_max","ccf_ci_low","ccf_ci_high",
     "ccf_status","ccf_confidence","ccf_warning","ccf_method","ccf_interval_method",
@@ -208,7 +208,7 @@ EXPRESSION_EVIDENCE_FIELDS = [
 
 RNA_JUNCTION_EVIDENCE_FIELDS = [
     "evidence_id", "event_id", "peptide_id", "sample_id", "gene", "gene_pair",
-    "junction_reads", "junction_source", "mutation_source", "peptide_consequence",
+    "junction_reads", "junction_source", "rna_junction_gene_pair_reads", "mutation_source", "peptide_consequence",
     "rna_alt_reads", "rna_ref_reads", "rna_depth", "rna_vaf", "rna_vaf_source",
     "rna_frame_status", "rna_support_status", "rna_evidence_completeness", "rna_evidence_score",
     "targeted_validation_status", "targeted_validation_source",

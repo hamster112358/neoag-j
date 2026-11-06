@@ -40,6 +40,11 @@ def _compatible(a: SVRecord, b: SVRecord, distance: int = 200, consider_type: bo
 @dataclass
 class SVCluster:
     records: list[SVRecord] = field(default_factory=list)
+    # Review B4-17: the WES capture annotation used to be smuggled between
+    # calls via setattr on an undeclared attribute, which any object copy
+    # (dataclasses.replace, pickling round-trips) would silently lose.  It is
+    # now a declared typed field that survives construction and copying.
+    capture_annotation: dict[str, str] = field(default_factory=dict)
 
     @property
     def representative(self) -> SVRecord:
