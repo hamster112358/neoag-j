@@ -25,6 +25,17 @@ from .utils import first, read_tsv, to_float, write_tsv
 
 KILLING_GENES = {"CASP8", "FAS", "FADD", "TNFRSF10A", "TNFRSF10B", "BAX", "BAK1", "SERPINB9"}
 
+# Review C5-01: only these allele-consensus states carry loss-flavoured
+# evidence and may therefore drive a peptide caution cap.  Absence states
+# (UNASSESSED) and single-tool retention (SINGLE_TOOL_RETAINED) do not.
+_LOSS_FLAVORED_LOH_STATUSES = {
+    "SINGLE_TOOL_LOST",
+    "DISCORDANT",
+    "CONSENSUS_LOST",
+    "CONSENSUS_LOH",
+    "LEGACY_LOST_CALL",
+}
+
 IMMUNE_ESCAPE_EVENT_FIELDS = [
     "sample_id", "mechanism", "gene_or_hla", "pathway", "alteration_type", "biallelic_status",
     "functional_status", "escape_event_source", "escape_event_source_event_ids",
@@ -391,9 +402,19 @@ def build_immune_escape_evidence(
             else:
                 status = "LOST_RESTRICTING_HLA_RETAINED_FOR_REVIEW"; mult = min(mult, 0.35); cap = "C_CAUTION"
             reasons.append("restricting_hla_lost")
-        elif allele_loh_status != "CONSENSUS_RETAINED":
+        elif allele_loh_status in _LOSS_FLAVORED_LOH_STATUSES:
             status = "HLA_LOH_INCOMPLETE" if status == "ESCAPE_PASS" else status
             cap = cap or "C_CAUTION"
+            reasons.append(f"restricting_hla_{allele_loh_status.lower()}")
+        elif allele_loh_status != "CONSENSUS_RETAINED":
+            # Review C5-01: missing or single-sided HLA-LOH evidence is not
+            # evidence of escape.  UNASSESSED (no LOH table, or this allele not
+            # in it) and SINGLE_TOOL_RETAINED previously capped every peptide
+            # at C_CAUTION, penalising absence of evidence as escape and, with
+            # single-tool input (the common case), capping the whole candidate
+            # list.  The states stay explicit in escape_reason for audit, and
+            # evidence_states still grades them HLA_LOH_UNASSESSED upstream,
+            # but only loss-flavoured evidence (above) drives a cap.
             reasons.append(f"restricting_hla_{allele_loh_status.lower()}")
         if mhc_i and b2m:
             status = "GLOBAL_MHC_I_LOSS"; mult = 0.0; cap = "D"; reasons.append("b2m_biallelic_loss")

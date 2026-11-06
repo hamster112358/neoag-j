@@ -317,10 +317,14 @@ def test_b3_unresolved_immunogenicity_downgrades_instead_of_silent_redistributio
     no_immuno_full = compute_peptide_efficacy(pep, ev, pres, prof100)
     assert no_immuno["immunogenicity_resolved"] == "no"
     assert float(no_immuno["efficacy_score"]) == round(0.90 * float(no_immuno_full["efficacy_score"]), 4)
-    resolved = compute_peptide_efficacy({**pep, "prime_score": "0.8000"}, ev, pres, prof)
-    resolved_full = compute_peptide_efficacy({**pep, "prime_score": "0.8000"}, ev, pres, prof100)
+    # C2-01 migrated this fixture: PRIME resolution requires %Rank; the raw
+    # log-odds score alone is no longer treated as a resolved component.
+    resolved = compute_peptide_efficacy({**pep, "prime_score": "0.8000", "prime_rank": "1.0"}, ev, pres, prof)
+    resolved_full = compute_peptide_efficacy({**pep, "prime_score": "0.8000", "prime_rank": "1.0"}, ev, pres, prof100)
     assert resolved["immunogenicity_resolved"] == "yes"
     assert resolved["efficacy_score"] == resolved_full["efficacy_score"]
+    score_only = compute_peptide_efficacy({**pep, "prime_score": "0.8000"}, ev, pres, prof)
+    assert score_only["immunogenicity_resolved"] == "no"
 
 
 def _ccf_rows(tmp_path, cnv_rows, events_rows, purity="0.70"):

@@ -4,14 +4,18 @@ from neoag.immunogenicity_composite import (
     combine_component_scores,
     component_scores,
     effective_source_weights,
+    normalize_prime_component,
     resolve_immunogenicity_score,
 )
 
 
 def test_composite_weighted_prime_and_bigmhc():
+    # Review C2-01 migrated this test: the prime component now comes from
+    # %Rank (the only cross-comparable PRIME scale), not the clamped score.
     profile = load_profile("default")
     row = {
         "prime_score": "0.40000",
+        "prime_rank": "5.0",
         "bigmhc_im_score": "0.80000",
         "hla_allele": "HLA-A*02:01",
     }
@@ -22,6 +26,21 @@ def test_composite_weighted_prime_and_bigmhc():
     assert score == combine_component_scores(parts, profile, hla_allele="HLA-A*02:01")
     assert meta["immunogenicity_source"] == "bigmhc_im+prime"
     assert parts["prime"] < score < parts["bigmhc_im"]
+
+
+def test_score_only_prime_component_stays_unassessed():
+    # Review C2-01: raw PRIME log-odds without a rank are not a 0-1 component;
+    # clamping them saturated every positive value at 1.0 and mixing that with
+    # rank-derived components was apples-to-oranges.
+    assert normalize_prime_component({"prime_score": "3.5"}) is None
+    assert normalize_prime_component({"prime_score": "3.5", "prime_rank": "1.0"}) is not None
+    profile = load_profile("default")
+    parts = component_scores(
+        {"prime_score": "3.5", "bigmhc_im_score": "0.6", "hla_allele": "HLA-A*02:01"},
+        profile,
+    )
+    assert "prime" not in parts
+    assert parts == {"bigmhc_im": 0.6}
 
 
 def test_weighted_composite_ignores_hla_multipliers():

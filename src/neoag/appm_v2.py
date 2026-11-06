@@ -613,7 +613,15 @@ def _status_from_score(prefix: str, score: float, assessed_any: bool) -> str:
     return f"{prefix}_INTACT"
 
 
-def _functional_validation_status(*, protein_assessed: bool = False, flow_assessed: bool = False, ligandome_assessed: bool = False) -> tuple[str, str, str]:
+def _functional_validation_status(
+    *,
+    protein_assessed: bool = False,
+    flow_assessed: bool = False,
+    ligandome_assessed: bool = False,
+    protein_input_provided: bool = False,
+    flow_input_provided: bool = False,
+    ligandome_input_provided: bool = False,
+) -> tuple[str, str, str]:
     sources: list[str] = []
     if protein_assessed:
         sources.append("protein")
@@ -627,6 +635,22 @@ def _functional_validation_status(*, protein_assessed: bool = False, flow_assess
         return "flow_supported", ";".join(sources), "validation_supported_hypothesis"
     if protein_assessed:
         return "protein_supported", ";".join(sources), "validation_supported_hypothesis"
+    # Review C5-02: a provided proteomics/flow/ligandome file is not by itself
+    # gene-level functional validation — nothing here maps assay identifiers
+    # onto gene rows.  Such input is now labelled input_only instead of being
+    # either ignored (old "computational_proxy" with the file invisible) or
+    # claimed as validation support.
+    provided = [
+        f"{name}_provided_without_gene_mapping"
+        for name, flag in (
+            ("protein", protein_input_provided),
+            ("flow", flow_input_provided),
+            ("ligandome", ligandome_input_provided),
+        )
+        if flag
+    ]
+    if provided:
+        return "input_only_coverage_unresolved", ";".join(provided), "no_gene_level_functional_validation"
     return "computational_proxy", "DNA_CNV_RNA_HLA_LOH_only", "computational_triage_only"
 
 
@@ -643,12 +667,23 @@ def _evidence_completeness(
     protein_assessed: bool = False,
     flow_assessed: bool = False,
     ligandome_assessed: bool = False,
+    protein_input_provided: bool = False,
+    flow_input_provided: bool = False,
+    ligandome_input_provided: bool = False,
 ) -> dict[str, str]:
     functional_status, validation_source, claim_strength = _functional_validation_status(
         protein_assessed=protein_assessed,
         flow_assessed=flow_assessed,
         ligandome_assessed=ligandome_assessed,
+        protein_input_provided=protein_input_provided,
+        flow_input_provided=flow_input_provided,
+        ligandome_input_provided=ligandome_input_provided,
     )
+    # Review C5-02: the *_assessed checks ask whether the axis was assessed AT
+    # GENE LEVEL (identifiers mapped onto the gene rows).  A provided assay
+    # file that was never mapped counts as missing evidence plus an explicit
+    # *_gene_mapping marker below — the cnv_gene_mapping precedent — instead of
+    # inflating completeness the way the old file-provided counting did.
     checks = {
         "mutation_assessed": bool(variants),
         "cnv_assessed": bool(cnv),
@@ -662,6 +697,12 @@ def _evidence_completeness(
     missing = [k.replace("_assessed", "") for k, v in checks.items() if not v]
     if cnv_status == "segment_level_unmapped":
         missing.append("cnv_gene_mapping")
+    if protein_input_provided and not protein_assessed:
+        missing.append("protein_gene_mapping")
+    if flow_input_provided and not flow_assessed:
+        missing.append("flow_gene_mapping")
+    if ligandome_input_provided and not ligandome_assessed:
+        missing.append("ligandome_gene_mapping")
     if score >= 0.67:
         status = "HIGH"
     elif score >= 0.34:
@@ -754,8 +795,13 @@ def build_appm_2(
         hla_ligandome_tsv=hla_ligandome_tsv,
         raw_peptides=raw_peptides,
     )
-    protein_assessed = _input_assessed(input_status_rows, "proteomics") or _input_assessed(input_status_rows, "phosphoproteomics")
-    ligandome_assessed = _input_assessed(input_status_rows, "hla_ligandome")
+    # Review C5-02: these flags mean "the assay input was provided and carries
+    # gene/peptide-like records" — not "validated at gene level".  A gene-level
+    # mapped state requires an identifier-mapping step that does not exist yet,
+    # so nothing counts as gene-assessed here; the provided state feeds the
+    # honest input_only labelling below.
+    protein_input_provided = _input_assessed(input_status_rows, "proteomics") or _input_assessed(input_status_rows, "phosphoproteomics")
+    ligandome_input_provided = _input_assessed(input_status_rows, "hla_ligandome")
     variants = load_variants(vep_tsv)
     variant_evidence_rows = load_variant_evidence(vep_tsv, sample_id=sample_id, ccf_tsv=ccf_tsv)
     variants_by_gene: dict[str, list[dict[str, str]]] = {}
@@ -796,7 +842,10 @@ def build_appm_2(
         biallelic, reason = _biallelic_status(g, variants, cnv, expr, expression_assessed, low_tpm)
         functional = _functional_status(biallelic)
         expr_tpm, expr_status = _expression_status(g, expr, expression_assessed, low_tpm)
-        gene_functional_validation_status, gene_validation_source, gene_claim_strength = _functional_validation_status()
+        gene_functional_validation_status, gene_validation_source, gene_claim_strength = _functional_validation_status(
+            protein_input_provided=protein_input_provided,
+            ligandome_input_provided=ligandome_input_provided,
+        )
         cn = cnv.get(g, {})
         pathway = _gene_pathway(g)
         gene_group = _gene_group(g)
@@ -838,8 +887,12 @@ def build_appm_2(
             "expression_status": expr_status,
             "expression_input_status": "gene_present" if g in expr else ("gene_missing" if expression_assessed else "not_assessed"),
             "rna_assay_status": rna_status,
-            "protein_status": "not_assessed",
-            "ligandome_support": "not_assessed",
+            # Review C5-02: not a hardcoded "not_assessed" any more.  When the
+            # assay input exists but was never mapped onto gene identifiers the
+            # honest per-gene state is "input_only_coverage_unresolved";
+            # "not_assessed" is reserved for runs without that input at all.
+            "protein_status": "input_only_coverage_unresolved" if protein_input_provided else "not_assessed",
+            "ligandome_support": "input_only_coverage_unresolved" if ligandome_input_provided else "not_assessed",
             "biallelic_status": biallelic,
             "functional_status": functional,
             "gene_integrity_status": integrity_status,
@@ -933,8 +986,8 @@ def build_appm_2(
         hla_loh_provided=hla_loh_provided,
         cnv_status=cnv_status,
         rna_status=rna_status,
-        protein_assessed=protein_assessed,
-        ligandome_assessed=ligandome_assessed,
+        protein_input_provided=protein_input_provided,
+        ligandome_input_provided=ligandome_input_provided,
     )
 
     module_rows = [
@@ -1062,7 +1115,11 @@ def build_appm_2(
         "cnv_input_status": cnv_status,
         "functional_validation_status": completeness["functional_validation_status"],
         "validation_evidence_source": completeness["validation_evidence_source"],
-        "claim_strength": "computational_triage_only",
+        "claim_strength": (
+            "no_gene_level_functional_validation"
+            if completeness["functional_validation_status"] == "input_only_coverage_unresolved"
+            else "computational_triage_only"
+        ),
         "appm_evidence_completeness": completeness["appm_evidence_completeness_status"],
         "appm_evidence_completeness_score": completeness["appm_evidence_completeness_score"],
         "evidence_conflict_flag": "yes" if any(r.get("evidence_conflict_flag") == "yes" for r in conflict_rows) else "no",
@@ -1075,7 +1132,10 @@ def build_appm_2(
         "appm_variant_evidence": str(out / "appm_variant_evidence.tsv"),
         "appm_pathway_status": str(out / "appm_pathway_status.tsv"),
         "appm_module_scores": str(out / "appm_module_scores.tsv"),
-        "appm_submodule_scores": str(out / "appm_submodule_scores.tsv"),
+        # Review C5-05: appm_submodule_scores used to be advertised here before
+        # the explainability step ran, so a failing enhance left paths pointing
+        # at files that were never written.  It (and every other explainability
+        # output) is only added below, after the write exists.
         "appm_immune_context": str(out / "appm_immune_context.tsv"),
         "appm_evidence_completeness": str(out / "appm_evidence_completeness.tsv"),
         "appm_input_status": str(out / "appm_input_status.tsv"),
@@ -1098,7 +1158,12 @@ def build_appm_2(
     # v0.4.2 P1: append APPM call confidence and submodule explainability sidecars.
     try:
         from .appm_explainability import enhance_appm_outputs_v042
-        paths.update(enhance_appm_outputs_v042(out, raw_peptides=raw_peptides, profile=profile))
+        for key, value in enhance_appm_outputs_v042(out, raw_peptides=raw_peptides, profile=profile).items():
+            # C5-05: advertise a path only when the file really exists, so a
+            # failing/partial explainability step can never hand consumers a
+            # dangling entry.
+            if Path(str(value)).is_file():
+                paths[key] = value
     except Exception as exc:  # pragma: no cover - explanatory sidecars must not break legacy APPM output
         write_tsv(out / "appm_explainability_warning.tsv", [{"warning": type(exc).__name__, "message": str(exc)}])
     return paths

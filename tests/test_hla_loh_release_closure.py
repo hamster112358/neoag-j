@@ -43,6 +43,9 @@ def test_immune_escape_projects_exact_allele_consensus(tmp_path: Path):
     flags = {row["peptide_id"]: row for row in read_tsv(paths["peptide_escape_flags"])}
     assert flags["P1"]["hla_loh_consensus_status"] == "CONSENSUS_RETAINED"
     assert flags["P1"]["escape_status"] == "ESCAPE_PASS"
+    # Review C5-01: single-tool retention is not evidence of escape; the state
+    # stays recorded in escape_reason, but it no longer caps the peptide.
     assert flags["P2"]["hla_loh_consensus_status"] == "SINGLE_TOOL_RETAINED"
-    assert flags["P2"]["escape_status"] == "HLA_LOH_INCOMPLETE"
-    assert flags["P2"]["priority_cap"] == "C_CAUTION"
+    assert flags["P2"]["escape_status"] == "ESCAPE_PASS"
+    assert flags["P2"]["priority_cap"] == ""
+    assert flags["P2"]["escape_reason"] == "restricting_hla_single_tool_retained"

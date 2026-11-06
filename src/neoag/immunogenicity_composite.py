@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -49,6 +51,18 @@ def _canonical_hla(hla_allele: str) -> str:
     return normalize_hla_allele(hla_allele) if hla_allele.strip() else ""
 
 
+def _merge_key(peptide: Any, hla: Any) -> tuple[str, str]:
+    """Canonical (peptide, HLA) join key for evidence merges (review C2-03).
+
+    The adapter side already indexes evidence rows by upper-cased peptide and
+    normalized HLA (adapters/prime._pair_key and friends); the merge side must
+    apply the identical normalization or notation drift such as A*02:01 versus
+    HLA-A*02:01 silently produces empty scores.  Original strings stay in the
+    rows themselves for traceability.
+    """
+    return str(peptide or "").strip().upper(), _canonical_hla(str(hla or ""))
+
+
 def effective_source_weights(
     hla_allele: str,
     parts: Mapping[str, float],
@@ -76,13 +90,33 @@ def normalize_iedb_score(raw: Any) -> float:
 
 
 def normalize_prime_component(row: Mapping[str, Any]) -> float | None:
+    # Review C2-01: only %Rank is on a scale comparable with the other
+    # components.  Raw PRIME scores are log-odds; clamping them saturated every
+    # positive value at 1.0, and no uncalibrated transform may replace that
+    # (review disposition: require empirical calibration or leave the
+    # component unassessed).  A row without a rank therefore yields no prime
+    # component instead of a fabricated one.
     rank_raw = str(row.get("prime_rank", "")).strip()
-    score_raw = str(row.get("prime_score", "")).strip()
     if rank_raw:
         return norm_rank(rank_raw)
-    if score_raw:
-        return clamp(to_float(score_raw, 0.0))
     return None
+
+
+def _is_neutral_or_blank(raw: str) -> bool:
+    """Blank or numeric-neutral (0.5) score string (review C2-06).
+
+    The old sentinel set {"", "0.5", "0.5000"} was string-compared, so the
+    heuristic's "%.5f" output ("0.50000") slipped through as a genuine call.
+    Interpretation must not depend on decimal formatting.  Unparseable values
+    count as unassessed too: converting them through to_float(..., 0.0) would
+    fabricate a component score from garbage.
+    """
+    if not raw:
+        return True
+    try:
+        return abs(float(raw) - 0.5) < 1e-9
+    except ValueError:
+        return True
 
 
 def normalize_bigmhc_im_component(row: Mapping[str, Any]) -> float | None:
@@ -122,12 +156,12 @@ def component_scores(row: Mapping[str, Any], profile: Mapping[str, Any]) -> dict
                 parts["deepimmuno"] = val
         elif src == "iedb":
             raw = str(row.get("iedb_immunogenicity_score", "")).strip()
-            if raw not in {"", "0.5", "0.5000"}:
+            if not _is_neutral_or_blank(raw):
                 parts["iedb"] = normalize_iedb_score(raw)
 
     if not parts and cfg["use_iedb_fallback"]:
         raw = str(row.get("iedb_immunogenicity_score", "")).strip()
-        if raw not in {"", "0.5", "0.5000"}:
+        if not _is_neutral_or_blank(raw):
             parts["iedb"] = normalize_iedb_score(raw)
     return parts
 
@@ -195,17 +229,11 @@ def combine_component_scores(
             den += w
         return clamp(num / den) if den > 0 else 0.0
 
-    canon = _canonical_hla(hla_allele)
-    hla_adj = canon and isinstance(cfg["hla_source_multipliers"].get(canon), Mapping)
-    if hla_adj:
-        num = 0.0
-        den = 0.0
-        for name, val in active.items():
-            w = weights[name]
-            num += w * val
-            den += w
-        return clamp(num / den) if den > 0 else 0.0
-
+    # Review C2-06: "mean" is a strict arithmetic mean over the active
+    # components.  It previously switched to weighting whenever HLA multipliers
+    # existed, violating the mode-name contract; weighted combination now only
+    # happens under its own named mode above.  Multipliers still gate sources
+    # in or out (a zero multiplier excludes the source via `active`).
     return clamp(sum(active.values()) / len(active))
 
 
@@ -235,7 +263,7 @@ def has_resolved_immunogenicity(
     if component_scores(row, profile):
         return True
     raw = str(peptide.get("immunogenicity_score", "")).strip()
-    if raw not in {"", "0.5", "0.5000"}:
+    if not _is_neutral_or_blank(raw):
         val = to_float(raw, 0.5)
         return abs(val - 0.5) >= 1e-6 and val > 0.0
     return False
@@ -251,11 +279,11 @@ def merge_prime(
     prime_by_pair: dict[tuple[str, str], dict[str, str]],
 ) -> None:
     for row in presentation_rows:
-        key = (row.get("peptide", ""), row.get("hla_allele", ""))
+        key = _merge_key(row.get("peptide", ""), row.get("hla_allele", ""))
         prime = prime_by_pair.get(key, {})
         row["prime_score"] = prime.get("prime_score", "")
         row["prime_rank"] = prime.get("prime_rank", "")
-        wt_key = (row.get("wildtype_peptide", ""), row.get("hla_allele", ""))
+        wt_key = _merge_key(row.get("wildtype_peptide", ""), row.get("hla_allele", ""))
         wt_prime = prime_by_pair.get(wt_key, {}) if wt_key[0] else {}
         row["prime_wt_score"] = wt_prime.get("prime_score", "")
         row["prime_wt_rank"] = wt_prime.get("prime_rank", "")
@@ -266,10 +294,10 @@ def merge_bigmhc_im(
     bigmhc_by_pair: dict[tuple[str, str], dict[str, str]],
 ) -> None:
     for row in presentation_rows:
-        key = (row.get("peptide", ""), row.get("hla_allele", ""))
+        key = _merge_key(row.get("peptide", ""), row.get("hla_allele", ""))
         hit = bigmhc_by_pair.get(key, {})
         row["bigmhc_im_score"] = hit.get("bigmhc_im_score", "")
-        wt_key = (row.get("wildtype_peptide", ""), row.get("hla_allele", ""))
+        wt_key = _merge_key(row.get("wildtype_peptide", ""), row.get("hla_allele", ""))
         wt_hit = bigmhc_by_pair.get(wt_key, {}) if wt_key[0] else {}
         row["bigmhc_im_wt_score"] = wt_hit.get("bigmhc_im_score", "")
 
@@ -279,7 +307,7 @@ def merge_deepimmuno(
     deepimmuno_by_pair: dict[tuple[str, str], dict[str, str]],
 ) -> None:
     for row in presentation_rows:
-        key = (row.get("peptide", ""), row.get("hla_allele", ""))
+        key = _merge_key(row.get("peptide", ""), row.get("hla_allele", ""))
         hit = deepimmuno_by_pair.get(key, {})
         row["deepimmuno_score"] = hit.get("deepimmuno_score", "")
 
@@ -290,6 +318,48 @@ def apply_immunogenicity_composite(
 ) -> None:
     for row in presentation_rows:
         enrich_row_immunogenicity(row, profile)
+
+
+def _evidence_fingerprint(raw_peptides: Path, name: str) -> dict[str, str]:
+    """What must not change for a stored *_evidence.tsv to stay reusable (C2-04).
+
+    Mirrors the C1-06 runner-sidecar contract: the peptide table bytes cover
+    the peptide set and HLA notation, the producer version covers the software
+    side.  A file-exists check alone silently applied stale predictions to
+    changed peptides or an upgraded predictor.
+    """
+    from .evidence_provenance import detect_tool_version
+
+    digest = hashlib.sha256()
+    pep = Path(raw_peptides)
+    if pep.is_file():
+        digest.update(pep.read_bytes())
+    return {
+        "tool": name,
+        "peptide_input_sha256": digest.hexdigest(),
+        "tool_version": str(detect_tool_version(name) or ""),
+    }
+
+
+def _evidence_fingerprint_path(evidence_path: Path) -> Path:
+    return evidence_path.with_name(evidence_path.name + ".inputs.json")
+
+
+def _evidence_fingerprint_matches(evidence_path: Path, fingerprint: dict[str, str]) -> bool:
+    """Stored sidecar must agree on every field; absent sidecar = no reuse."""
+    try:
+        stored = json.loads(_evidence_fingerprint_path(evidence_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    return all(str(stored.get(key, "")) == value for key, value in fingerprint.items())
+
+
+def _write_evidence_fingerprint(evidence_path: Path, fingerprint: dict[str, str]) -> None:
+    _evidence_fingerprint_path(evidence_path).write_text(
+        json.dumps(fingerprint, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def run_immunogenicity_predictors(
@@ -326,10 +396,18 @@ def run_immunogenicity_predictors(
 
     prime_tool = tools_dir / "prime.tsv"
     prime_reuse = pres_dir / "prime_evidence.tsv"
+    prime_fp = _evidence_fingerprint(raw_peptides, "prime")
     if "prime" in cfg["sources"] and "prime" not in skip_sources:
         if "prime" in reuse_sources and prime_reuse.is_file() and prime_reuse.stat().st_size > 0:
-            paths["prime"] = prime_reuse
-            registry.register_passthrough("prime", prime_reuse)
+            if _evidence_fingerprint_matches(prime_reuse, prime_fp):
+                paths["prime"] = prime_reuse
+                registry.register_passthrough("prime", prime_reuse)
+            else:
+                print(
+                    f"[neoag] prime: reuse declined for {prime_reuse} (no matching input "
+                    "fingerprint); recomputing instead of trusting stale evidence (review C2-04)",
+                    flush=True,
+                )
         prime_can_use_tool_output = skip or ctx.stub or _immunogenicity_tool_available("prime", ctx)
         if paths["prime"] is not None:
             pass
@@ -337,7 +415,10 @@ def run_immunogenicity_predictors(
             registry.register_missing("prime")
         elif not skip:
             run_prime(ctx, prime_tool)
-        if paths["prime"] is None and prime_can_use_tool_output and prime_tool.is_file():
+        if (
+            paths["prime"] is None and prime_can_use_tool_output and prime_tool.is_file()
+            and _evidence_fingerprint_matches(prime_tool, prime_fp)
+        ):
             prime_path = pres_dir / "prime_evidence.tsv"
             prime_rows = parse_prime(prime_tool, ctx.sample_id)
             # A non-strict fallback may have stubbed the whole tool output;
@@ -348,10 +429,25 @@ def run_immunogenicity_predictors(
                 prime_rows,
                 provenance=registry.register_stub("prime") if prime_is_stub else registry.register_real("prime", prime_tool),
             )
+            _write_evidence_fingerprint(prime_path, prime_fp)
             paths["prime"] = prime_path
-        elif (pres_dir / "prime_evidence.tsv").is_file():
-            paths["prime"] = pres_dir / "prime_evidence.tsv"
+        elif prime_reuse.is_file() and _evidence_fingerprint_matches(prime_reuse, prime_fp):
+            paths["prime"] = prime_reuse
             registry.register_passthrough("prime", paths["prime"])
+        elif prime_reuse.is_file():
+            print(
+                f"[neoag] prime: existing {prime_reuse} does not match this run's peptide input; "
+                "not reusing stale evidence (review C2-04)",
+                flush=True,
+            )
+            registry.register_missing("prime")
+        elif prime_can_use_tool_output and prime_tool.is_file():
+            print(
+                f"[neoag] prime: tool output {prime_tool} lacks a matching input fingerprint; "
+                "refusing to re-parse stale tool output (review C2-04)",
+                flush=True,
+            )
+            registry.register_missing("prime")
         elif ctx.stub:
             registry.register_stub("prime")
         else:
@@ -361,10 +457,18 @@ def run_immunogenicity_predictors(
 
     bigmhc_tool = tools_dir / "bigmhc_im.tsv"
     bigmhc_reuse = pres_dir / "bigmhc_im_evidence.tsv"
+    bigmhc_fp = _evidence_fingerprint(raw_peptides, "bigmhc_im")
     if "bigmhc_im" in cfg["sources"] and "bigmhc_im" not in skip_sources:
         if "bigmhc_im" in reuse_sources and bigmhc_reuse.is_file() and bigmhc_reuse.stat().st_size > 0:
-            paths["bigmhc_im"] = bigmhc_reuse
-            registry.register_passthrough("bigmhc_im", bigmhc_reuse)
+            if _evidence_fingerprint_matches(bigmhc_reuse, bigmhc_fp):
+                paths["bigmhc_im"] = bigmhc_reuse
+                registry.register_passthrough("bigmhc_im", bigmhc_reuse)
+            else:
+                print(
+                    f"[neoag] bigmhc_im: reuse declined for {bigmhc_reuse} (no matching input "
+                    "fingerprint); recomputing instead of trusting stale evidence (review C2-04)",
+                    flush=True,
+                )
         bigmhc_can_use_tool_output = skip or ctx.stub or _immunogenicity_tool_available("bigmhc_im", ctx)
         if paths["bigmhc_im"] is not None:
             pass
@@ -372,7 +476,10 @@ def run_immunogenicity_predictors(
             registry.register_missing("bigmhc_im")
         elif not skip:
             run_bigmhc_im(ctx, bigmhc_tool)
-        if paths["bigmhc_im"] is None and bigmhc_can_use_tool_output and bigmhc_tool.is_file():
+        if (
+            paths["bigmhc_im"] is None and bigmhc_can_use_tool_output and bigmhc_tool.is_file()
+            and _evidence_fingerprint_matches(bigmhc_tool, bigmhc_fp)
+        ):
             bigmhc_path = pres_dir / "bigmhc_im_evidence.tsv"
             bigmhc_rows = parse_bigmhc_im(bigmhc_tool, ctx.sample_id)
             bigmhc_is_stub = ctx.stub or _all_stub_source_rows(bigmhc_rows)
@@ -381,10 +488,25 @@ def run_immunogenicity_predictors(
                 bigmhc_rows,
                 provenance=registry.register_stub("bigmhc_im") if bigmhc_is_stub else registry.register_real("bigmhc_im", bigmhc_tool),
             )
+            _write_evidence_fingerprint(bigmhc_path, bigmhc_fp)
             paths["bigmhc_im"] = bigmhc_path
-        elif (pres_dir / "bigmhc_im_evidence.tsv").is_file():
-            paths["bigmhc_im"] = pres_dir / "bigmhc_im_evidence.tsv"
+        elif bigmhc_reuse.is_file() and _evidence_fingerprint_matches(bigmhc_reuse, bigmhc_fp):
+            paths["bigmhc_im"] = bigmhc_reuse
             registry.register_passthrough("bigmhc_im", paths["bigmhc_im"])
+        elif bigmhc_reuse.is_file():
+            print(
+                f"[neoag] bigmhc_im: existing {bigmhc_reuse} does not match this run's peptide input; "
+                "not reusing stale evidence (review C2-04)",
+                flush=True,
+            )
+            registry.register_missing("bigmhc_im")
+        elif bigmhc_can_use_tool_output and bigmhc_tool.is_file():
+            print(
+                f"[neoag] bigmhc_im: tool output {bigmhc_tool} lacks a matching input fingerprint; "
+                "refusing to re-parse stale tool output (review C2-04)",
+                flush=True,
+            )
+            registry.register_missing("bigmhc_im")
         elif ctx.stub:
             registry.register_stub("bigmhc_im")
         else:
@@ -394,10 +516,18 @@ def run_immunogenicity_predictors(
 
     deepimmuno_tool = tools_dir / "deepimmuno.tsv"
     deepimmuno_reuse = pres_dir / "deepimmuno_evidence.tsv"
+    deepimmuno_fp = _evidence_fingerprint(raw_peptides, "deepimmuno")
     if "deepimmuno" in cfg["sources"] and "deepimmuno" not in skip_sources:
         if "deepimmuno" in reuse_sources and deepimmuno_reuse.is_file() and deepimmuno_reuse.stat().st_size > 0:
-            paths["deepimmuno"] = deepimmuno_reuse
-            registry.register_passthrough("deepimmuno", deepimmuno_reuse)
+            if _evidence_fingerprint_matches(deepimmuno_reuse, deepimmuno_fp):
+                paths["deepimmuno"] = deepimmuno_reuse
+                registry.register_passthrough("deepimmuno", deepimmuno_reuse)
+            else:
+                print(
+                    f"[neoag] deepimmuno: reuse declined for {deepimmuno_reuse} (no matching input "
+                    "fingerprint); recomputing instead of trusting stale evidence (review C2-04)",
+                    flush=True,
+                )
         deepimmuno_can_use_tool_output = skip or ctx.stub or _immunogenicity_tool_available("deepimmuno", ctx)
         if paths["deepimmuno"] is not None:
             pass
@@ -405,7 +535,10 @@ def run_immunogenicity_predictors(
             registry.register_missing("deepimmuno")
         elif not skip:
             run_deepimmuno(ctx, deepimmuno_tool)
-        if paths["deepimmuno"] is None and deepimmuno_can_use_tool_output and deepimmuno_tool.is_file():
+        if (
+            paths["deepimmuno"] is None and deepimmuno_can_use_tool_output and deepimmuno_tool.is_file()
+            and _evidence_fingerprint_matches(deepimmuno_tool, deepimmuno_fp)
+        ):
             deepimmuno_path = pres_dir / "deepimmuno_evidence.tsv"
             deepimmuno_rows = parse_deepimmuno(deepimmuno_tool, ctx.sample_id)
             deepimmuno_is_stub = ctx.stub or _all_stub_source_rows(deepimmuno_rows)
@@ -414,10 +547,25 @@ def run_immunogenicity_predictors(
                 deepimmuno_rows,
                 provenance=registry.register_stub("deepimmuno") if deepimmuno_is_stub else registry.register_real("deepimmuno", deepimmuno_tool),
             )
+            _write_evidence_fingerprint(deepimmuno_path, deepimmuno_fp)
             paths["deepimmuno"] = deepimmuno_path
-        elif (pres_dir / "deepimmuno_evidence.tsv").is_file():
-            paths["deepimmuno"] = pres_dir / "deepimmuno_evidence.tsv"
+        elif deepimmuno_reuse.is_file() and _evidence_fingerprint_matches(deepimmuno_reuse, deepimmuno_fp):
+            paths["deepimmuno"] = deepimmuno_reuse
             registry.register_passthrough("deepimmuno", paths["deepimmuno"])
+        elif deepimmuno_reuse.is_file():
+            print(
+                f"[neoag] deepimmuno: existing {deepimmuno_reuse} does not match this run's peptide input; "
+                "not reusing stale evidence (review C2-04)",
+                flush=True,
+            )
+            registry.register_missing("deepimmuno")
+        elif deepimmuno_can_use_tool_output and deepimmuno_tool.is_file():
+            print(
+                f"[neoag] deepimmuno: tool output {deepimmuno_tool} lacks a matching input fingerprint; "
+                "refusing to re-parse stale tool output (review C2-04)",
+                flush=True,
+            )
+            registry.register_missing("deepimmuno")
         elif ctx.stub:
             registry.register_stub("deepimmuno")
         else:
@@ -427,6 +575,8 @@ def run_immunogenicity_predictors(
 
     iedb_path = pres_dir / "iedb_immunogenicity.tsv"
     if "iedb" in cfg["sources"] or cfg["use_iedb_fallback"]:
+        iedb_fp = _evidence_fingerprint(raw_peptides, "iedb")
+        iedb_rewritten = False
         if not skip and "iedb" in cfg["sources"]:
             from .tools.prep import unique_peptide_hla_pairs
             pairs = unique_peptide_hla_pairs(raw_peptides)
@@ -435,10 +585,18 @@ def run_immunogenicity_predictors(
                 predict_iedb_pairs(pairs),
                 provenance=registry.register_derived("iedb", iedb_path),
             )
-        if iedb_path.is_file():
+            _write_evidence_fingerprint(iedb_path, iedb_fp)
+            iedb_rewritten = True
+        if iedb_path.is_file() and (iedb_rewritten or _evidence_fingerprint_matches(iedb_path, iedb_fp)):
             paths["iedb"] = iedb_path
             if not registry.has("iedb"):
                 registry.register_derived("iedb", iedb_path)
+        elif iedb_path.is_file():
+            print(
+                f"[neoag] iedb: existing {iedb_path} does not match this run's peptide input; "
+                "not reusing stale derived evidence (review C2-04)",
+                flush=True,
+            )
         elif "iedb" in cfg["sources"]:
             registry.register_not_used("iedb")
     else:
@@ -464,10 +622,10 @@ def apply_immunogenicity_evidence(
         merge_deepimmuno(pres_rows, deepimmuno_by_pair(_non_stub_evidence_rows(read_tsv(immuno_paths["deepimmuno"]))))
     if immuno_paths.get("iedb"):
         iedb_by_pair = {
-            (r.get("peptide", ""), r.get("hla_allele", "")): r.get("iedb_immunogenicity_score", "")
+            _merge_key(r.get("peptide", ""), r.get("hla_allele", "")): r.get("iedb_immunogenicity_score", "")
             for r in read_tsv(immuno_paths["iedb"])
         }
         for row in pres_rows:
-            key = (row.get("peptide", ""), row.get("hla_allele", ""))
+            key = _merge_key(row.get("peptide", ""), row.get("hla_allele", ""))
             row["iedb_immunogenicity_score"] = iedb_by_pair.get(key, "")
     apply_immunogenicity_composite(pres_rows, profile)
