@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .utils import read_tsv, write_tsv, to_float, norm_tpm, clamp
+from .status_words import phasing_needs_resolution
 from .config import source_priority
 from .safety import (
     safety_multiplier, apply_event_safety, apply_peptide_safety,
@@ -306,7 +307,7 @@ def recommended(p, appm, ccf):
     if p.get("safety_status") == "CAUTION": notes.append("requires focused safety validation")
     if p.get("presentation_gate_status") == "FAIL":
         notes.append(f"presentation gate: {p.get('presentation_gate_reason','')}")
-    if p.get("haplotype_status") == "PHASING_REQUIRED":
+    if phasing_needs_resolution(p.get("haplotype_status")):
         notes.append("nearby variants require read-backed phasing and combined-mutant peptide reconstruction")
     if appm < 0.65: notes.append("APPM caution")
     if p.get("ccf_status") == "RNA_ONLY_UNRESOLVED":
@@ -437,7 +438,7 @@ def score_peptide(p, e, profile, pres, summary):
     specificity_cap = p.get("mutant_specificity_priority_cap", "")
     if specificity_cap:
         p["priority_cap"] = apply_priority_cap_value(p.get("priority_cap", "") or "A", specificity_cap)
-    if p.get("haplotype_status") == "PHASING_REQUIRED":
+    if phasing_needs_resolution(p.get("haplotype_status")):
         p["priority_cap"] = apply_priority_cap_value(p.get("priority_cap", "") or "A", "C_CAUTION")
     fusion_cfg = profile.get("fusion", {})
     is_fusion = str(p.get("event_type") or e.get("event_type") or "").lower() == "fusion"

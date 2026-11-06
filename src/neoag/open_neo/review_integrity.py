@@ -23,6 +23,15 @@ REQUIRED_ARTIFACTS = (
     "validation_plan",
 )
 
+# Review E-04: cap-reason codes carrying one of these tokens state that the
+# cap fired because evidence resources are absent or incomplete (an
+# unassessed reference, partial safety layers), as opposed to a negative
+# measurement (e.g. CAP_WT_BETTER).  Used only to summarise concentration.
+MISSING_ASSET_CAP_TOKENS = (
+    "UNASSESSED", "MISSING", "PARTIAL", "ABSENT", "UNMAPPED",
+    "UNESTABLISHED", "INCOMPLETE", "UNRESOLVED", "NOT_", "LOW",
+)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -280,6 +289,48 @@ def audit_review_inputs(artifacts: dict[str, str], outdir: str | Path) -> dict[s
         "WARNING",
         ";".join(f"{key}={grade_counts[key]}" for key in sorted(grade_counts))
         + ("; all candidates are R4: verify core evidence coverage before review" if all_r4 else ""),
+    )
+
+    # Review E-04: the all-R4 alert misses the practically important
+    # no-R1/R2 collapse (a systemic cap failure pushing everything to R3
+    # passes silently).  Such a cohort can also be scientifically valid, so
+    # this is a WARN that summarises cap reasons and the fraction capped by
+    # absent resources - it triggers human review, never automatic
+    # promotion or automatic rejection.
+    no_top_grade = len(peptides) >= 20 and grade_counts.get("R1", 0) + grade_counts.get("R2", 0) == 0
+    cap_reason_counts: dict[str, int] = {}
+    capped_rows = 0
+    missing_resource_capped = 0
+    for row in peptides:
+        reasons = [
+            part.strip().upper()
+            for part in str(row.get("evidence_grade_cap_reasons") or "").split(",")
+            if part.strip()
+        ]
+        if reasons:
+            capped_rows += 1
+        for reason in reasons:
+            cap_reason_counts[reason] = cap_reason_counts.get(reason, 0) + 1
+        if any(any(token in reason for token in MISSING_ASSET_CAP_TOKENS) for reason in reasons):
+            missing_resource_capped += 1
+    top_reasons = ";".join(
+        f"{key}={cap_reason_counts[key]}"
+        for key, _ in sorted(cap_reason_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+    )
+    missing_fraction = (missing_resource_capped / len(peptides)) if peptides else 0.0
+    _add(
+        checks,
+        "no_top_grade_concentration",
+        "WARN" if no_top_grade else "PASS",
+        "WARNING",
+        (
+            "no R1/R2 candidates: verify whether caps reflect missing assets rather than measured quality; "
+            if no_top_grade else ""
+        )
+        + f"grades={'/'.join(f'{key}={grade_counts[key]}' for key in sorted(grade_counts)) or 'none'};"
+        + f" capped={capped_rows}/{len(peptides)};"
+        + f" capped_by_absent_resource={missing_resource_capped} ({missing_fraction:.0%});"
+        + f" top_caps={top_reasons or 'none'}",
     )
 
     net_assessed = 0

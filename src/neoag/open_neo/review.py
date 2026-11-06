@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +12,7 @@ from neoag.controlled_execution.io_utils import load_limited_yaml, markdown_tabl
 from neoag.report_from_final import enrich_report_provenance
 from neoag.reports_dual import load_report_bundle, make_patient_report
 from neoag.vaccine_events import build_vaccine_event_tables
+from neoag.status_words import phasing_needs_resolution
 from neoag.skill_taxonomy.review_skills import (
     run_concept_explainer,
     run_experiment_design,
@@ -114,7 +116,7 @@ def _priority(grade: str, row: dict[str, str]) -> tuple[str, str, str]:
         return ("MANUAL_REVIEW", "MANUAL_REVIEW_ONLY", "REVIEW_DRIVER_OR_MECHANISM") if manual else ("HOLD", "HOLD", "REVIEW_R4_HOLD")
     if source_chain_tier == "C3":
         return "COMPLETE_EVIDENCE", "SOURCE_CHAIN_COMPLETION_FIRST", "REVIEW_SOURCE_CHAIN_C3_INCOMPLETE"
-    if "PHAS" in phase and any(token in phase for token in ("REQUIRED", "UNRESOLVED", "LOW")):
+    if phasing_needs_resolution(phase):
         return "COMPLETE_EVIDENCE", "PHASING_FIRST", "REVIEW_PHASING_REQUIRED"
     if kind == "FUSION" and ("SINGLE" in fusion or "ONE_CALLER" in fusion):
         return "COMPLETE_EVIDENCE", "FUSION_CONFIRMATION_FIRST", "REVIEW_FUSION_SINGLE_CALLER"
@@ -587,6 +589,25 @@ def _merge_review_context(
     return merged
 
 
+def _place_fusion_section(current: str, fusion_html: str) -> tuple[str, str]:
+    """Insert the fusion section before the closing body/html tag.
+
+    Review E-08: the exact "</body></html>" string replacement used to
+    silently no-op whenever the markup differed (attribute, case or
+    whitespace drift).  Match </body>, fall back to </html>, and if neither
+    closing tag exists keep the section at the end of the primary artifact
+    instead of dropping it; the returned placement label makes every drift
+    observable instead of quiet.
+    """
+    updated = re.sub(r"(?i)</body\s*>", lambda _m: fusion_html + "\n</body>", current, count=1)
+    if updated != current:
+        return updated, "INSERTED_BEFORE_BODY_END"
+    updated = re.sub(r"(?i)</html\s*>", lambda _m: fusion_html + "\n</html>", current, count=1)
+    if updated != current:
+        return updated, "INSERTED_BEFORE_HTML_END"
+    return current + "\n" + fusion_html, "APPENDED_NO_CLOSING_TAG"
+
+
 def _formal_patient_report(
     layout: RunLayout,
     result_dir: Path,
@@ -648,12 +669,28 @@ def _formal_patient_report(
         candidate_top_n=candidate_top_n,
     )
     fusion_html = _fusion_report_html(result_dir)
+    placement = "NO_FUSION_SECTION"
     if fusion_html:
         current = patient_html.read_text(encoding="utf-8")
-        if "融合基因检测结果" not in current:
-            current = current.replace("</body></html>", fusion_html + "\n</body></html>")
-            patient_html.write_text(current, encoding="utf-8")
-    return {"patient_report_html": str(patient_html)}
+        if "融合基因检测结果" in current:
+            placement = "ALREADY_PRESENT"
+        else:
+            # Review E-08: the exact "</body></html>" string replacement used
+            # to silently no-op whenever the markup differed (attribute, case
+            # or whitespace drift).  Match </body>, fall back to </html>, and
+            # if neither closing tag exists keep the section at the end of the
+            # primary artifact instead of dropping it; the placement is
+            # reported to the caller so a drift can never disappear quietly.
+            updated = re.sub(r"(?i)</body\s*>", lambda _m: fusion_html + "\n</body>", current, count=1)
+            placement = "INSERTED_BEFORE_BODY_END"
+            if updated == current:
+                updated = re.sub(r"(?i)</html\s*>", lambda _m: fusion_html + "\n</html>", current, count=1)
+                placement = "INSERTED_BEFORE_HTML_END"
+            if updated == current:
+                updated = current + "\n" + fusion_html
+                placement = "APPENDED_NO_CLOSING_TAG"
+            patient_html.write_text(updated, encoding="utf-8")
+    return {"patient_report_html": str(patient_html), "fusion_section_placement": placement}
 
 
 def _run_appm_ccf_reviews(layout: RunLayout, artifacts: dict[str, str]) -> dict[str, str]:

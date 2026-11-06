@@ -11,7 +11,7 @@ import tomllib
 from typing import Any, Mapping
 
 from .evidence_states import DERIVERS, derive_all_states, event_track
-from .status_words import contains_positive, first_text
+from .status_words import contains_positive, first_text, phasing_needs_resolution
 from .candidate_identity import IDENTITY_FIELDS, candidate_identity
 from .source_chain import derive_source_chain_confidence
 from .pareto import nondominated_fronts
@@ -562,7 +562,7 @@ def _next_steps(
     if not normal_junction or "UNASSESSED" in normal_junction:
         steps.append("normal tissue junction check")
     phasing = " ".join(str(source.get(field, "")).upper() for field in ("haplotype_status", "phase_confidence"))
-    if any(token in phasing for token in ("REQUIRED", "UNPHASED", "LOW_CONFIDENCE")):
+    if phasing_needs_resolution(phasing):
         steps.extend(["IGV phasing review", "read-backed phasing"])
     if states["mutant_specificity"]["state"] != "MT_SPECIFIC" and not _is_clear_novel_sequence(source):
         steps.append("complete MT/WT paired prediction")
@@ -629,7 +629,7 @@ def _derived_grade_caps(
     if states["safety"]["state"] == "SAFETY_PARTIAL":
         caps.append(("R3", "CAP_SAFETY_PARTIAL"))
     phasing = " ".join(str(source.get(field, "")).upper() for field in ("haplotype_status", "phase_confidence"))
-    if any(token in phasing for token in ("REQUIRED", "UNPHASED", "LOW_CONFIDENCE")):
+    if phasing_needs_resolution(phasing):
         caps.append(("R3", "CAP_PHASING_REQUIRED"))
     capture = " ".join(str(source.get(field, "")).upper() for field in ("evidence_scope", "capture_limited", "wes_confidence_tier"))
     if track == "DNA_SV" and ("CAPTURE" in capture or "TRUE" in capture or "WES" in capture):

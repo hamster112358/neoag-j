@@ -1900,12 +1900,29 @@ def load_report_bundle(
         elif len(tool_rows) > 1:
             purities = [str(item.get("purity") or "") for item in tool_rows if str(item.get("purity") or "").strip()]
             names = [str(item.get("tool") or "未记录") for item in tool_rows]
+            numeric = []
+            for value in purities:
+                try:
+                    numeric.append(float(value))
+                except ValueError:
+                    continue
+            numeric.sort()
+            # Review E-08: this fallback used to hand back purities[0] as the
+            # "recommended" value while its own basis text promised there was
+            # no silent single-tool choice.  It now matches the sibling
+            # recovery path: median as an explicitly-labelled review
+            # reference, discordant cohorts marked for human arbitration.
+            median_purity = f"{numeric[len(numeric) // 2]:.6g}" if numeric else ""
+            discordant = len(numeric) > 1 and (max(numeric) - min(numeric)) > 0.10
             prov["purity_cnv_consensus"] = {
-                "recommended_purity": purities[0] if purities else "",
+                "recommended_purity": median_purity,
                 "recommended_ploidy": next((str(item.get("ploidy") or "") for item in tool_rows if str(item.get("ploidy") or "").strip()), ""),
-                "selected_tool": "多工具并列",
-                "status": "MULTI_TOOL_REVIEW",
-                "basis": "已并列保留 " + "、".join(names) + " 结果，不静默选择单一工具。",
+                "selected_tool": "多工具中位数（审阅参考）" if numeric else "多工具并列",
+                "status": "MULTI_TOOL_ARBITRATION_REQUIRED" if discordant else "MULTI_TOOL_REVIEW",
+                "basis": "已并列保留 " + "、".join(names) + (
+                    " 结果；无人工裁定共识，推荐值取多工具中位数仅作审阅参考，不静默选择单一工具，不替代人工裁定。"
+                    if numeric else " 结果；无可解析的纯度数值，未给出推荐值。"
+                ),
             }
     if not prov.get("tumor_dna_depth"):
         prov["tumor_dna_depth"] = (
@@ -1923,8 +1940,10 @@ def load_report_bundle(
         normal_depth = str(prov.get("normal_dna_depth") or "").strip()
         if normal_depth:
             prov["pairing_status"] = "配对正常DNA证据已接入；样本身份一致性未由BAM Matcher单独确认"
+            prov.setdefault("pairing_evidence_level", "NORMAL_DNA_DEPTH_EVIDENCE")
         else:
             prov["pairing_status"] = "本次最终证据表未保留可判定的配对正常DNA位点证据；需回链配对VCF/BAM"
+            prov.setdefault("pairing_evidence_level", "NO_PAIRING_EVIDENCE")
     if not prov.get("genome_build"):
         for row in events + peptides:
             build = str(row.get("genome_build") or "").strip()
@@ -6308,6 +6327,32 @@ def _patient_profile_name(bundle: ReportBundle) -> str:
     )
 
 
+# Review E-02: the patient-facing path scan used to cover only /mnt/, /root/
+# and /home/, which missed the actual deployment roots (/data1, /data2) and
+# common private prefixes (/opt, /srv) while its check text claimed general
+# path coverage.  Static roots cover the common private prefixes; absolute
+# roots that appear in this run's own provenance/manifest are added on top,
+# so a deployment that lives somewhere else is still scanned.  A blacklist
+# can never *guarantee* there are no path leaks - primary prevention stays
+# "patient report emits logical file names only" (附录C); this check is a
+# backstop, and its text now says exactly what it scans.
+PATIENT_PRIVATE_PATH_ROOTS = ("/mnt/", "/root/", "/home/", "/data1/", "/data2/", "/opt/", "/srv/")
+
+
+def _patient_private_path_pattern(provenance: Mapping[str, Any]) -> re.Pattern:
+    roots = list(PATIENT_PRIVATE_PATH_ROOTS)
+    try:
+        text = json.dumps(provenance or {}, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = ""
+    for match in re.findall(r"/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/", text):
+        root = "/" + match.strip("/").split("/")[0] + "/"
+        if root not in roots:
+            roots.append(root)
+    alternatives = "|".join(re.escape(root) for root in roots)
+    return re.compile(rf"(?:{alternatives}|Traceback \(most recent call last\)|nohup:)")
+
+
 def _patient_release_audit(
     bundle: ReportBundle,
     displayed: list[dict[str, str]],
@@ -6346,7 +6391,17 @@ def _patient_release_audit(
         if _patient_conflict_summary(row) not in _patient_limitation(row, bundle)
         and _patient_conflict_summary(row) not in "；".join(_patient_key_gaps(row, bundle))
     ]
-    path_or_log = bool(re.search(r"(?:/mnt/|/root/|/home/|Traceback \(most recent call last\)|nohup:)", rendered_without_audit))
+    private_path_pattern = _patient_private_path_pattern(bundle.provenance)
+    path_or_log = bool(private_path_pattern.search(rendered_without_audit))
+    profile_status_raw = bundle.provenance.get("profile_status")
+    profile_status = str(
+        (profile_status_raw.get("status") if isinstance(profile_status_raw, Mapping) else profile_status_raw)
+        or "NOT_RECORDED"
+    ).strip().upper()
+    profile_requested = str(
+        (profile_status_raw.get("requested") if isinstance(profile_status_raw, Mapping) else "")
+        or _patient_profile_name(bundle)
+    )
     hla_appm_consistent = all(
         "HLA/APPM" not in _patient_evidence_summary(row, bundle)
         and _patient_restricting_hla_reliability(row, bundle)[0]
@@ -6363,12 +6418,21 @@ def _patient_release_audit(
         ("7", "Top候选不由单一工具分数决定", not score_only, "应用完整性门槛、事件等级和多维证据分流"),
         ("8", "记录run_id、规则版本和输入hash", all(metadata[key] != "未记录" for key in metadata), f"run_id={metadata['run_id']}；规则={metadata['rules_version']}；hash={metadata['input_sha256'][:16]}..."),
         ("9", "Top候选来源冲突均已解决或解释", not unexplained_conflicts, f"有冲突 {len(conflicting)} 条；未解释 {len(unexplained_conflicts)} 条"),
-        ("10", "患者版不含服务器路径或工具日志", not path_or_log, "已扫描绝对路径和常见日志标记"),
+        ("10", "患者版不含服务器路径或工具日志", not path_or_log, "已扫描私有根路径（静态私有前缀+本次运行清单中出现的绝对路径根）和常见日志标记；黑名单为兜底，患者版仍只输出逻辑文件名"),
         (
             "11",
             "队列规则合同已锁定且可横比",
             metadata["cohort_comparability"] == "LOCKED_COMPARABLE",
             f"规则集={metadata['cohort_rule_set']}；版本={metadata['cohort_rule_version']}；报告合同={metadata['report_contract_version']}；状态={metadata['cohort_comparability']}",
+        ),
+        (
+            "12",
+            "分析参数档案按请求加载，无静默回退",
+            profile_status in {"LOADED", "NOT_RECORDED"},
+            f"请求档案={profile_requested}；状态={profile_status}；"
+            + ("未记录档案加载状态，按现有运行清单口径评估" if profile_status == "NOT_RECORDED"
+               else "档案回退为内置默认值：只能作为草稿重渲染，需修复档案加载后重新生成" if profile_status == "FALLBACK_DEFAULTS"
+               else "已按请求档案渲染"),
         ),
     ]
     rows = [{"编号": number, "审计项": label, "状态": "通过" if passed else "失败", "说明": detail} for number, label, passed, detail in checks]
@@ -7000,7 +7064,18 @@ def make_patient_report(
     out.append(f"<p><b>审计结论：</b>{'通过，可进入正式患者报告发布流程' if release_status == 'PASS' else '未通过，仅可作为草稿或技术审阅材料'}</p>")
     out.append(_table(release_audit_rows, ["编号", "审计项", "状态", "说明"]) + "</div>")
     if release_status != "PASS":
-        out.insert(7, "<div class='warn'><b>发布状态：</b>自动审计未通过，本报告只能用于草稿或技术审阅，不能作为正式患者版发布。</div>")
+        banner = "<div class='warn'><b>发布状态：</b>自动审计未通过，本报告只能用于草稿或技术审阅，不能作为正式患者版发布。</div>"
+        # Review E-08: the banner used to be injected at a fixed list index,
+        # which silently drifted below the fold (or into a section body) as
+        # soon as any optional header banner was added or removed.  Anchor on
+        # the first section div instead, so the banner always sits between
+        # the header notices and section 1 no matter how many notices ran.
+        for anchor_index, anchor_line in enumerate(out):
+            if "class='section'" in anchor_line:
+                out.insert(anchor_index, banner)
+                break
+        else:
+            out.insert(0, banner)
     out.append("</body></html>")
     p.write_text("\n".join(out), encoding="utf-8")
     audit_path = p.with_suffix(".release_audit.json")

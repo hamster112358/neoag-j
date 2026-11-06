@@ -209,11 +209,18 @@ def _label_from_row(row: Mapping[str, Any]) -> int | None:
     return None
 
 
-def _score_from_row(row: Mapping[str, Any]) -> float:
+def _score_from_row(row: Mapping[str, Any]) -> float | None:
+    """Score carried by the row, or None when no score column exists.
+
+    Review E-08: returning 0.0 for "no score column" made an absent score
+    indistinguishable from a genuinely measured zero, and the join step then
+    overwrote real 0.0 scores with the ranked prediction.  Absence is now
+    stated as None / empty instead of a fabricated zero.
+    """
     for key in ["efficacy_score", "presentation_evidence_score", "presentation_score", "binding_evidence_score", "score"]:
         if str(row.get(key, "")).strip() != "":
             return to_float(row.get(key), 0.0)
-    return 0.0
+    return None
 
 
 def run_ligandome_ms_validation(*, outdir: str | Path, ligandome_ms: str | Path | None = None) -> Path:
@@ -223,7 +230,13 @@ def run_ligandome_ms_validation(*, outdir: str | Path, ligandome_ms: str | Path 
         write_tsv(out, [{"dataset": "ligandome_ms_external", "benchmark_status": "external_required", "claim_scope": "pending_external_ligandome_ms_validation", "input_path": "", "n": "0", "n_presented": "0", "predictor": "presentation_or_efficacy_score", "auroc": "", "auprc": "", "mean_score_presented": "", "mean_score_not_presented": "", "required_columns": required, "notes": "Provide a peptide-HLA ligandome/MS table to compute external validation metrics."}], LIGANDOME_FIELDS)
         return out
     path = Path(ligandome_ms)
-    pairs = [(label, _score_from_row(r)) for r in read_tsv(path) if (label := _label_from_row(r)) is not None]
+    # This standalone validator scores every labelled row; rows without any
+    # score column keep the historical 0.0 fill-in (documented behaviour).
+    pairs = [
+        (label, score if (score := _score_from_row(r)) is not None else 0.0)
+        for r in read_tsv(path)
+        if (label := _label_from_row(r)) is not None
+    ]
     if not pairs:
         write_tsv(out, [{"dataset": path.stem, "benchmark_status": "pending_labels_missing", "claim_scope": "pending_external_ligandome_ms_validation", "input_path": str(path), "n": "0", "n_presented": "0", "predictor": "presentation_or_efficacy_score", "auroc": "", "auprc": "", "mean_score_presented": "", "mean_score_not_presented": "", "required_columns": required, "notes": "Input was readable but no binary ligandome/MS labels were found."}], LIGANDOME_FIELDS)
         return out
@@ -264,7 +277,8 @@ def _labelled_ligand_rows(ligandome_ms: str | Path | None) -> tuple[list[dict[st
             continue
         rr = dict(r)
         rr["_label"] = str(lab)
-        rr["_score"] = str(_score_from_row(r))
+        carried = _score_from_row(r)
+        rr["_score"] = "" if carried is None else str(carried)
         labelled.append(rr)
     if not labelled:
         return [], "pending_labels_missing"
@@ -284,8 +298,15 @@ def _join_ranked_to_ligandome(ranked_peptides: str | Path | None, labelled: list
         rr=dict(r)
         match = by_pid.get(r.get("peptide_id", "")) or by_pair.get(_peptide_key(r)) or {}
         rr.update({f"ranked_{k}": v for k, v in match.items()})
-        if "_score" not in rr or rr.get("_score") in {"", "0.0"}:
-            rr["_score"] = match.get("efficacy_score", match.get("presentation_evidence_score", rr.get("_score", "0")))
+        # Review E-08: a genuine measured 0.0 score must survive the join;
+        # only a missing/empty score falls back to the ranked table.
+        score_text = str(rr.get("_score") or "").strip()
+        if not score_text:
+            rr["_score"] = str(
+                match.get("efficacy_score")
+                or match.get("presentation_evidence_score")
+                or "0"
+            )
         out.append(rr)
     return out
 
@@ -341,15 +362,32 @@ def run_appm_multiplier_delta(*, outdir: str | Path, ligandome_ms: str | Path | 
         write_tsv(out, [{"dataset": dataset, "metric": "AUPRC", "without_appm": "", "with_appm": "", "delta": "", "n": "0", "benchmark_status": status if status != "completed" else "pending_ranked_peptides", "interpretation": "Provide ligandome/MS labels and ranked_peptides to compute APPM multiplier delta."}], APPM_MULTIPLIER_DELTA_FIELDS)
         return out
     joined = _join_ranked_to_ligandome(ranked_peptides, labelled)
-    labels=[]; with_scores=[]; without_scores=[]
+    labels=[]; with_scores=[]; without_scores=[]; non_invertible=0
     for r in joined:
         y=int(r["_label"]); labels.append(y)
         eff=to_float(r.get("_score", r.get("ranked_efficacy_score", "0")), 0.0)
-        appm=to_float(r.get("ranked_appm_multiplier", "1.0"), 1.0) or 1.0
+        # Review E-08: `or 1.0` silently rewrote a genuine 0.0 multiplier as
+        # neutral, and the min(1.0, ...) clamp collapsed de-convolved ties.
+        # A *missing* multiplier stays neutral (1.0 -> without == eff); an
+        # observed non-positive multiplier cannot be inverted (score x 0
+        # does not recover the base), so the APPM-off leg keeps the observed
+        # score and the row is counted in the interpretation instead of
+        # being silently rewritten.  The clamp is removed: AUROC/AUPRC are
+        # rank-based and the clamp only destroyed rank information.
+        appm=to_float(r.get("ranked_appm_multiplier", ""), None)
         with_scores.append(eff)
-        without_scores.append(min(1.0, eff / appm))
+        if appm is not None and appm > 0.0:
+            without_scores.append(eff / appm)
+        else:
+            without_scores.append(eff)
+            if appm is not None:
+                non_invertible += 1
     metrics=[("AUROC", auroc(labels, without_scores), auroc(labels, with_scores)), ("AUPRC", auprc(labels, without_scores), auprc(labels, with_scores))]
-    rows=[{"dataset": dataset, "metric": m, "without_appm": f"{a:.4f}", "with_appm": f"{b:.4f}", "delta": f"{(b-a):.4f}", "n": str(len(labels)), "benchmark_status": "completed", "interpretation": "Positive delta means APPM multiplier improved this technical label ranking; no clinical outcome claim."} for m,a,b in metrics]
+    non_invertible_note = (
+        f" {non_invertible} row(s) had an observed non-positive APPM multiplier; their score could not be de-convolved and was kept unchanged in the APPM-off leg."
+        if non_invertible else ""
+    )
+    rows=[{"dataset": dataset, "metric": m, "without_appm": f"{a:.4f}", "with_appm": f"{b:.4f}", "delta": f"{(b-a):.4f}", "n": str(len(labels)), "benchmark_status": "completed", "interpretation": "Positive delta means APPM multiplier improved this technical label ranking; no clinical outcome claim." + non_invertible_note} for m,a,b in metrics]
     write_tsv(out, rows, APPM_MULTIPLIER_DELTA_FIELDS)
     return out
 

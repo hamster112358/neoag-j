@@ -43,23 +43,40 @@ def _stage_output(manifest: Mapping[str, Any], stage: str, key: str) -> str:
 
 
 def _purity_qc_status(tool: str, result_path: Path) -> str:
-    """Return tool QC without confusing evidence provenance with QC."""
+    """Return tool QC without confusing evidence provenance with QC.
+
+    Review E-06: this used to return "ASSESSED" whenever no QC artifact was
+    found, which reported the *absence* of QC evidence as a completed QC.
+    A parseable purity number is provenance for the number, not a QC verdict.
+    Now the missing-QC case is stated explicitly (QC_NOT_PROVIDED), a QC
+    marker that carries no status line says so (QC_MARKER_WITHOUT_STATUS),
+    and only an actually-read QC verdict comes back as assessed.
+    """
     if not result_path.exists():
         return "RESULT_PATH_MISSING"
     root = result_path if result_path.is_dir() else result_path.parent
     key = tool.upper()
     if key == "PURPLE":
+        marker_found = False
         for path in sorted(root.rglob("*.purple.qc")):
+            marker_found = True
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 parts = line.split("\t", 1)
                 if len(parts) == 2 and parts[0].strip().lower() == "qcstatus":
-                    return parts[1].strip() or "ASSESSED"
+                    return parts[1].strip() or "QC_MARKER_WITHOUT_STATUS"
+        return "QC_MARKER_WITHOUT_STATUS" if marker_found else "QC_NOT_PROVIDED"
     if key == "FACETS":
+        marker_found = False
         for path in sorted(root.rglob("facets_omni2p5_summary.tsv")):
+            marker_found = True
             for row in read_tsv(path):
                 if str(row.get("metric") or "").strip().lower() == "status":
-                    return str(row.get("value") or "ASSESSED").upper()
-    return "ASSESSED"
+                    return str(row.get("value") or "QC_MARKER_WITHOUT_STATUS").upper()
+        return "QC_MARKER_WITHOUT_STATUS" if marker_found else "QC_NOT_PROVIDED"
+    # No readable QC artifact convention exists for other purity tools
+    # (SEQUENZA/ASCAT and third-party tools); claiming ASSESSED here would
+    # assert a completed QC that was never read.
+    return "QC_NOT_PROVIDED"
 
 
 def _canonical_purity_tool(value: Any) -> str:
@@ -319,7 +336,12 @@ def enrich_report_provenance(
         has_tumor = any("tumor" in str(value).lower() or key in {"somatic_vcf", "purity", "cnv"} for key, value in inputs.items())
         has_normal = any("normal" in str(value).lower() or "blood" in str(value).lower() or key in {"hla_consensus", "hla_loh_consensus"} for key, value in inputs.items())
         if has_tumor and has_normal and not prov.get("pairing_status"):
-            prov["pairing_status"] = "已使用肿瘤和配对正常样本进行HLA分型、HLA LOH和纯度分析；指纹未评估"
+            # Review E-08: this pairing statement is derived from input file
+            # names and manifest stage keys only (tumor/normal/blood
+            # substrings); it must read as what it is - an inference from
+            # file naming, not a verified sample-identity pairing.
+            prov["pairing_status"] = "按输入文件名/清单键识别到肿瘤与配对正常样本（HLA分型、HLA LOH和纯度分析使用该配对）；文件名推断，未经指纹或BAM Matcher确认"
+            prov.setdefault("pairing_evidence_level", "FILENAME_INFERENCE_NOT_FINGERPRINT")
     profile = str(
         prov.get("profile")
         or (generated.get("sample") or {}).get("profile")
@@ -458,8 +480,24 @@ def write_reports_from_final(
     )
     try:
         profile = load_profile(profile_name)
-    except Exception:
-        profile = {"_profile_name": Path(profile_name).stem, "rules_version": str((provenance.get("parallel_rankings") or {}).get("rules_version") or "")}
+        provenance["profile_status"] = {"requested": profile_name, "status": "LOADED"}
+    except Exception as exc:
+        # Review E-07: a silently substituted stub profile let rebuilt
+        # reports render with built-in default thresholds while naming the
+        # requested profile.  The stub is kept (report rebuild stays
+        # possible), but the fallback is labelled in the profile itself and
+        # in provenance; the patient release audit now fails check 12 on
+        # FALLBACK_DEFAULTS, which suppresses the formal release.
+        profile = {
+            "_profile_name": Path(profile_name).stem,
+            "rules_version": str((provenance.get("parallel_rankings") or {}).get("rules_version") or ""),
+            "_profile_fallback": True,
+        }
+        provenance["profile_status"] = {
+            "requested": profile_name,
+            "status": "FALLBACK_DEFAULTS",
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }
     consensus_rule_path = Path(str((provenance.get("parallel_rankings") or {}).get("rules") or ""))
     consensus_rules = _toml_load(consensus_rule_path)
     manual_review = (

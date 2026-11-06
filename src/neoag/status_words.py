@@ -105,3 +105,39 @@ def first_text(row: Mapping[object, object], *fields: object, default: str = "")
             continue
         return str(row.get(field)).strip()
     return default
+
+
+# Review E-05: one phasing vocabulary shared by every stage that gates on
+# unresolved phasing (the D3 grade caps, the review priority gate, the
+# scoring-layer cap/note and the validation planner).  Before this the D3
+# caps matched REQUIRED/UNPHASED/LOW_CONFIDENCE while review matched
+# REQUIRED/UNRESOLVED/LOW, so "UNPHASED" escaped review gating and
+# "UNRESOLVED" escaped the D3 cap.
+PHASING_UNRESOLVED_TOKENS = ("REQUIRED", "UNPHASED", "UNRESOLVED", "LOW_CONFIDENCE")
+
+# Tokens that name phasing by themselves never need extra context; generic
+# tokens fire only inside phasing text (the value or joined phase row
+# mentions PHAS*), so an unrelated status such as "REPAIR_REQUIRED" cannot
+# jump onto the phasing ladder.  Bare "LOW" is deliberately NOT a token:
+# haplotype.py writes phase_confidence="low" for every resolved trans pair
+# (PHASED_NOT_CIS), and in the D3 joined row that would have silently put
+# every trans-phased event on the phasing ladder - an unassessed-confidence
+# signal, not an unresolved-phasing one.
+_PHASING_SELF_TOKENS = ("UNPHASED", "LOW_CONFIDENCE")
+_PHASING_CONTEXT_TOKENS = ("REQUIRED", "UNRESOLVED")
+
+
+def phasing_needs_resolution(value: object) -> bool:
+    """True when phasing-related text flags unresolved/insufficient phasing.
+
+    Single shared E-05 vocabulary for every stage that gates on phasing.
+    ``contains_positive`` keeps negated forms such as "PHASING_NOT_REQUIRED"
+    or "NOT_LOW_CONFIDENCE" from firing.
+    """
+
+    up = normalize_status(value)
+    if not up:
+        return False
+    if any(contains_positive(up, token) for token in _PHASING_SELF_TOKENS):
+        return True
+    return "PHAS" in up and any(contains_positive(up, token) for token in _PHASING_CONTEXT_TOKENS)

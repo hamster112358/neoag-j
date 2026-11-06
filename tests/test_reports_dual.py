@@ -1424,8 +1424,9 @@ def test_patient_report_writes_machine_readable_release_audit(tmp_path):
     audit = out.with_suffix(".release_audit.json")
     assert audit.is_file()
     payload = json.loads(audit.read_text(encoding="utf-8"))
-    assert len(payload["checks"]) == 11
-    assert {row["编号"] for row in payload["checks"]} == {str(i) for i in range(1, 12)}
+    # Review E-07 added check 12 (profile loaded, no silent fallback).
+    assert len(payload["checks"]) == 12
+    assert {row["编号"] for row in payload["checks"]} == {str(i) for i in range(1, 13)}
 
 
 def test_patient_limitation_keeps_hard_fail_and_missing_dimensions():

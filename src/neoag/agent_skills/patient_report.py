@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 from pathlib import Path
 from neoag.candidate_identity import identity_value
 from .common import count_by, ensure_dir, markdown_table, read_tsv, strip_html_text
@@ -118,10 +119,14 @@ def main(argv: list[str] | None = None) -> int:
     for h, b in sections:
         md_lines += [f"## {h}", b, ""]
     (outdir / "patient_report.md").write_text("\n".join(md_lines), encoding="utf-8")
-    html = "<html><head><meta charset='utf-8'><title>Patient Report</title></head><body>" + "\n".join(
-        [f"<h1>{args.title}</h1>"] + [f"<h2>{h}</h2><pre style='white-space:pre-wrap'>{b}</pre>" for h, b in sections]
+    # Review E-01: section bodies embed TSV-derived text (gene symbols,
+    # peptides, parsed evidence summaries), so every interpolated value is
+    # escaped like every other HTML writer in the repo; markup in a data
+    # field must render as text, never as active content.
+    page_html = "<html><head><meta charset='utf-8'><title>" + html.escape(args.title) + "</title></head><body>" + "\n".join(
+        [f"<h1>{html.escape(args.title)}</h1>"] + [f"<h2>{html.escape(h)}</h2><pre style='white-space:pre-wrap'>{html.escape(b)}</pre>" for h, b in sections]
     ) + "</body></html>"
-    (outdir / "patient_report.html").write_text(html, encoding="utf-8")
+    (outdir / "patient_report.html").write_text(page_html, encoding="utf-8")
     wrote = write_docx_if_available(outdir / "patient_report.docx", args.title, sections)
     (outdir / "patient_report_outputs.txt").write_text("\n".join([str(outdir / "patient_report.md"), str(outdir / "patient_report.html"), str(outdir / "patient_report.docx") if wrote else "DOCX not generated: python-docx unavailable"]) + "\n", encoding="utf-8")
     return 0

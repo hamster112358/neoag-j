@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+from .status_words import phasing_needs_resolution
 from .utils import read_tsv
 
 VALIDATION_PLAN_FIELDS = [
@@ -136,7 +137,7 @@ def classify_validation_mode(peptide: Mapping[str, Any]) -> str:
     consensus_nonblocking = evidence_grade.startswith(("R1", "R2", "R3")) and not hard_failure
     if priority == "D" and not consensus_nonblocking:
         return "do_not_advance"
-    if _norm(peptide.get("haplotype_status")).upper() == "PHASING_REQUIRED":
+    if phasing_needs_resolution(peptide.get("haplotype_status")):
         return "phasing_required"
     if "CAUTION" in priority and _norm(peptide.get("safety_status")).upper() != "PASS":
         return "safety_caution"
