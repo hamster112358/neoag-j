@@ -15,6 +15,21 @@ _RNA_GENERATORS = {"ImmunoPepper", "moPepGen"}
 # longer passes the gate.  P0 = never predicted, P1 = prediction performed,
 # no predictor result favorable; P2 = at least one result passes the
 # pre-declared strong-binding cutoff below.
+#
+# Review B3b-12 (round 2) - exactly which percentile this is: the fields
+# best_presentation_percentile / median_presentation_percentile are the
+# pVACbind columns "Best/Median Presentation Percentile" transcribed verbatim
+# by adapters/pvacbind.py (the companion score column in the same table is
+# "MHCflurryEL Presentation Score", i.e. the EL - expression/ligand-
+# availability - endpoint, not the BA binding endpoint; the separate binding
+# percentiles are carried in *_binding_percentile and are NOT consulted
+# here).  Percentile rank is computed by pVACbind against its own predictor
+# background, per HLA allele and epitope length - which is the row's own
+# hla_allele / epitope_length context - and lower is stronger.  The cutoff
+# 2.0 is a pre-declared exploratory rule of this pipeline, not a calibrated
+# clinical threshold: it only upgrades the consensus presentation grade to
+# P2 (never releases a candidate on its own, and the calibration study the
+# HANDOFF asks for remains open).
 FAVORABLE_PRESENTATION_PERCENTILE = 2.0
 
 

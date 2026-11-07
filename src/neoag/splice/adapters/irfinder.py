@@ -92,7 +92,11 @@ def parse_irfinder(
             "junction_ids": junction.junction_id, "reference_junction_ids": junction.junction_id,
             "alternative_junction_ids": "", "affected_exons": f"{chrom}:{start1}-{end1}:{strand}",
             "annotation_status": annotation, "cryptic_exon_status": "NOT_APPLICABLE",
-            "psi": ir_ratio, "delta_psi": "", "qvalue": "", "outlier_score": "",
+            # Review B3b-02 (round 2): IRFinder's IRratio is the fraction of
+            # transcripts RETAINING the intron - a different quantity from
+            # PSI (junction/exon usage) - so it keeps its own column and never
+            # mixes into psi under numeric merges or downstream PSI displays.
+            "psi": "", "ir_ratio": ir_ratio, "delta_psi": "", "qvalue": "", "outlier_score": "",
             "event_expression": depth, "event_confidence": "PASS" if not warnings else "REVIEW",
             "reference_path_status": "SPLICED_PATH_ANNOTATED", "cohort_analysis_status": "NOT_APPLICABLE",
             "source_tools": "IRFinder-S", "source_tool_versions": source_tool_version,

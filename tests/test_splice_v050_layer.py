@@ -160,7 +160,10 @@ def test_irfinder_registers_retained_and_spliced_hypotheses(tmp_path: Path):
     assert bundle["events"][0]["event_type"] == "RI"
     assert bundle["junctions"][0]["junction_id"] == "SJ|GRCh38|chr2|301|400|-"
     assert {row["path_role"] for row in bundle["transcripts"]} == {"SPLICED", "RETAINED"}
-    assert bundle["events"][0]["psi"] == "0.25"
+    # Review B3b-02: IRratio is NOT a PSI; it keeps its own column so IR
+    # quantification never enters psi merges or PSI displays.
+    assert bundle["events"][0]["ir_ratio"] == "0.25"
+    assert bundle["events"][0]["psi"] == ""
 
 
 def test_immunopepper_registers_partial_transcript_orf_and_origin(tmp_path: Path):

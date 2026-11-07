@@ -5,7 +5,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from neoag.schemas import EVENT_FIELDS as LEGACY_EVENT_FIELDS, PEPTIDE_FIELDS as LEGACY_PEPTIDE_FIELDS, RNA_JUNCTION_EVIDENCE_FIELDS
 from neoag.splice.causal_status import CAUSAL_STATUS_PRIORITY
@@ -58,14 +58,24 @@ _MAX_FIELDS = {
     "sample_count", "total_samples", "sample_prevalence", "kmer_prevalence", "uniqueness_rate",
     "normal_total_junction_reads", "normal_tissue_count",
     # Review B3b-02: these numeric fields used to fall through to the
-    # lexicographic _best(); stronger observation wins.
-    "psi", "outlier_score",
+    # lexicographic _best(); stronger observation wins.  ir_ratio is
+    # IRFinder's retained-intron fraction - its own column, kept out of psi
+    # so the two vocabularies never merge.
+    "psi", "outlier_score", "ir_ratio",
 }
 # Signed effect sizes: keep the largest absolute deviation, not the string that
 # sorts first and not the largest signed value (which would prefer +0.1 over -0.9).
 _MAXABS_FIELDS = {"delta_psi"}
 # p-value-like fields: smaller is stronger evidence.
 _MIN_FIELDS = {"qvalue"}
+# Review B3b-02 (round 2): the statistics fields are one reported tuple - a
+# tool computes its qvalue for the delta_psi carried by the SAME row.  Taking
+# field-wise winners across rows can emit a (delta_psi, qvalue) pair no test
+# ever produced, so a merged row keeps the whole tuple from one source row
+# (the donor), selected by smallest qvalue, then largest |delta_psi|.  The
+# per-field rules above remain as fallbacks for fields the donor lacks.
+_STATS_TUPLE_FIELDS = {"psi", "delta_psi", "qvalue", "outlier_score"}
+_STATS_SELECTION_RULE = "MIN_QVALUE_THEN_MAXABS_DELTA_PSI@v1"
 _IDENTITY_FIELDS = {
     "genome_build", "chrom", "intron_start_1based", "intron_end_1based", "strand",
     "donor_1based", "acceptor_1based", "event_type", "junction_ids", "gene", "gene_id",
@@ -139,6 +149,39 @@ def _status_best(field_name: str, values: set[str]) -> str:
     return max(values, key=lambda x: (priority.get(x, -1), x), default="")
 
 
+def _stats_float(row: Mapping[str, Any], field: str, default: float) -> float:
+    try:
+        return float(str(row.get(field, "")).strip())
+    except Exception:
+        return default
+
+
+def _stats_donor(group: list[dict[str, str]]) -> dict[str, str] | None:
+    """Pick the one row whose reported statistics tuple should survive a merge.
+
+    Smallest qvalue wins (missing qvalue = +inf so reported statistics beat
+    unreported ones); ties break on larger |delta_psi|, then |psi|, then the
+    source record ids for determinism.
+    """
+    rows = [
+        row for row in group
+        if any(str(row.get(field, "")).strip() for field in _STATS_TUPLE_FIELDS)
+    ]
+    if not rows:
+        return None
+
+    def rank(row: dict[str, str]) -> tuple[float, float, float, str]:
+        record_ids = str(row.get("source_record_ids") or row.get("source_record_id") or "")
+        return (
+            _stats_float(row, "qvalue", float("inf")),
+            -abs(_stats_float(row, "delta_psi", 0.0)),
+            -abs(_stats_float(row, "psi", 0.0)),
+            record_ids,
+        )
+
+    return min(rows, key=rank)
+
+
 @dataclass
 class SpliceLayer:
     sample_id: str
@@ -183,11 +226,17 @@ class SpliceLayer:
         for entity_id, group in sorted(grouped.items()):
             fields = TABLE_FIELDS.get(table, [])
             output: dict[str, str] = {id_field: entity_id}
+            # Review B3b-02: statistics travel as one tuple from a single
+            # donor row so a merged event never pairs fields that no tool
+            # reported together.
+            stats_donor = _stats_donor(group) if _STATS_TUPLE_FIELDS & set(fields) else None
             for field_name in fields:
                 if field_name == id_field:
                     continue
                 values = {str(row.get(field_name, "")).strip() for row in group if str(row.get(field_name, "")).strip()}
-                if field_name in _SET_FIELDS:
+                if field_name in _STATS_TUPLE_FIELDS and stats_donor is not None and str(stats_donor.get(field_name, "")).strip():
+                    output[field_name] = str(stats_donor[field_name]).strip()
+                elif field_name in _SET_FIELDS:
                     output[field_name] = ";".join(sorted({token for value in values for token in _tokens(value)}))
                 elif field_name in _MAX_FIELDS:
                     output[field_name] = _numeric_max(values)
@@ -215,6 +264,52 @@ class SpliceLayer:
                     conflict["conflict_id"] = stable_id("CFL", conflict)
                     self.tables.setdefault("conflicts", []).append(conflict)
                     output["evidence_conflict_status"] = "IDENTITY_FIELD_CONFLICT"
+            if stats_donor is not None and len(group) > 1:
+                reported_tuples = {
+                    (str(r.get("delta_psi", "")).strip(), str(r.get("qvalue", "")).strip())
+                    for r in group
+                    if str(r.get("delta_psi", "")).strip() or str(r.get("qvalue", "")).strip()
+                }
+                if len(reported_tuples) > 1:
+                    output["stats_source_record_ids"] = ";".join(sorted(_tokens(
+                        str(stats_donor.get("source_record_ids") or stats_donor.get("source_record_id") or "")
+                    )))
+                    output["stats_selection_rule"] = _STATS_SELECTION_RULE
+                    # If the donor is not the maxabs-delta_psi row, the old
+                    # per-column rule would have paired its qvalue with
+                    # another row's effect size - record that this was avoided.
+                    delta_values = {
+                        str(r.get("delta_psi", "")).strip() for r in group if _is_number(str(r.get("delta_psi", "")).strip())
+                    }
+                    donor_delta = str(stats_donor.get("delta_psi", "")).strip()
+                    if len(delta_values) > 1 and _is_number(donor_delta):
+                        fieldwise = _numeric_pick(delta_values, mode="maxabs")
+                        if abs(float(donor_delta) - float(fieldwise)) > 1e-12:
+                            conflict = {
+                                "entity_type": table.upper(), "entity_id": entity_id, "sample_id": self.sample_id,
+                                "conflict_type": "STATS_TUPLE_CROSS_PAIRING_AVOIDED",
+                                "field_name": "delta_psi/qvalue",
+                                "observed_values": ";".join(sorted(
+                                    f"{a}|{b}" if a and b else (a or b) for a, b in reported_tuples
+                                )),
+                                "source_tools": ";".join(sorted({
+                                    x for row in group
+                                    for x in _tokens(row.get("source_tools") or row.get("source_generator") or row.get("source_tool"))
+                                })),
+                                "source_record_ids": ";".join(sorted({
+                                    x for row in group
+                                    for x in _tokens(row.get("source_record_ids") or row.get("source_record_id"))
+                                })),
+                                "severity": "WARNING",
+                                "resolution_status": "COHERENT_TUPLE_SELECTED",
+                                "resolution_reason": (
+                                    f"Rows reported distinct (delta_psi,qvalue) pairs; kept the full tuple "
+                                    f"carrying delta_psi={donor_delta} instead of pairing its qvalue with the "
+                                    f"larger |delta_psi|={fieldwise} from a different row."
+                                ),
+                            }
+                            conflict["conflict_id"] = stable_id("CFL", conflict)
+                            self.tables.setdefault("conflicts", []).append(conflict)
             merged.append(output)
         return merged
 

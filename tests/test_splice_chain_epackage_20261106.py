@@ -10,6 +10,7 @@ import pytest
 
 from neoag.splice.adapters.easyquant import parse_easyquant
 from neoag.splice.adapters.irfinder import parse_irfinder
+from neoag.splice.adapters.splice2neo import parse_splice2neo
 from neoag.splice.adapters.spladder import parse_spladder_txt
 from neoag.splice.adapters.immunopepper import parse_immunopepper_kmers, parse_immunopepper_meta
 from neoag.splice.causal_status import CAUSAL_STATUS_PRIORITY
@@ -22,9 +23,12 @@ from neoag.splice.coordinates import (
 )
 from neoag.splice.evidence_chains import _CAUSAL_PRIORITY as CHAINS_PRIORITY
 from neoag.splice.pipeline import (
+    _STATS_SELECTION_RULE,
     _STATUS_PRIORITY,
+    SpliceLayer,
     _best,
     _numeric_pick,
+    _stats_donor,
     build_splice_provenance_layer,
 )
 from neoag.splice_prefilter import prefilter_splice_peptides
@@ -77,6 +81,76 @@ def test_best_numeric_conflict_picks_strongest_not_lexicographic():
 
 def test_best_keeps_lexicographic_pick_for_text_values():
     assert _best({"BETA", "ALPHA"}) == "ALPHA"
+
+
+def test_stats_donor_prefers_smallest_qvalue_then_strongest_effect():
+    row_a = {"delta_psi": "-0.9", "qvalue": "0.4", "psi": "0.5", "source_record_ids": "R1"}
+    row_b = {"delta_psi": "0.1", "qvalue": "0.00001", "psi": "0.6", "source_record_ids": "R2"}
+    assert _stats_donor([row_a, row_b]) is row_b
+    # Equal qvalues: the larger |delta_psi| row donates its whole tuple.
+    row_d = {"delta_psi": "0.1", "qvalue": "0.4", "psi": "0.6", "source_record_ids": "R2"}
+    assert _stats_donor([row_d, row_a]) is row_a
+    # A row reporting no statistics at all never donates a tuple.
+    row_e = {"qvalue": "", "delta_psi": "", "psi": "", "source_record_ids": "R3"}
+    assert _stats_donor([row_e, row_a]) is row_a
+    assert _stats_donor([row_e]) is None
+
+
+def test_same_event_statistics_stay_a_coherent_tuple(tmp_path):
+    # Operator test (round 2, review B3b-02): two splice2neo rows map to the
+    # SAME event but carry different (delta_psi, qvalue) pairs.  The merged
+    # row must preserve one row's complete pair - never the per-column
+    # winners - and must name the exact source record it came from.
+    txt = _write(
+        tmp_path / "splice2neo.tsv",
+        "junc_id\tevent_type\tgene\tpsi\tdelta_psi\tqvalue\n"
+        "chr1:151-200:+\tSE\tGENE1\t0.5\t-0.9\t0.4\n"
+        "chr1:151-200:+\tSE\tGENE1\t0.6\t0.1\t0.00001\n",
+    )
+    bundle = parse_splice2neo(txt, sample_id="S1")
+    assert len(bundle["events"]) == 2
+    assert bundle["events"][0]["splice_event_id"] == bundle["events"][1]["splice_event_id"]
+
+    layer = SpliceLayer(sample_id="S1")
+    layer.extend(bundle)
+    layer.consolidate()
+    events = layer.tables["events"]
+    assert len(events) == 1
+    merged = events[0]
+    source = bundle["events"][1]
+    # The statistically stronger pair belongs to row 2: q=0.00001 reported
+    # FOR delta_psi=0.1.  The old per-column merge fabricated (-0.9, 0.00001)
+    # - row 1's effect size paired with row 2's significance, a combination
+    # no test ever produced.
+    assert merged["delta_psi"] == source["delta_psi"]
+    assert merged["qvalue"] == source["qvalue"]
+    assert merged["psi"] == source["psi"]
+    assert merged["stats_selection_rule"] == _STATS_SELECTION_RULE
+    assert merged["stats_source_record_ids"] == source["source_record_ids"]
+    avoided = [
+        c for c in layer.tables["conflicts"] if c["conflict_type"] == "STATS_TUPLE_CROSS_PAIRING_AVOIDED"
+    ]
+    assert len(avoided) == 1
+    assert avoided[0]["severity"] == "WARNING"
+    assert avoided[0]["resolution_status"] == "COHERENT_TUPLE_SELECTED"
+    assert "delta_psi" in avoided[0]["resolution_reason"]
+
+
+def test_identical_stat_rows_merge_without_conflict(tmp_path):
+    txt = _write(
+        tmp_path / "splice2neo.tsv",
+        "junc_id\tevent_type\tgene\tpsi\tdelta_psi\tqvalue\n"
+        "chr1:151-200:+\tSE\tGENE1\t0.5\t-0.9\t0.4\n"
+        "chr1:151-200:+\tSE\tGENE1\t0.5\t-0.9\t0.4\n",
+    )
+    layer = SpliceLayer(sample_id="S1")
+    layer.extend(parse_splice2neo(txt, sample_id="S1"))
+    layer.consolidate()
+    merged = layer.tables["events"][0]
+    assert merged["stats_selection_rule"] == "" or "stats_selection_rule" not in merged
+    assert not any(
+        c["conflict_type"] == "STATS_TUPLE_CROSS_PAIRING_AVOIDED" for c in layer.tables["conflicts"]
+    )
 
 
 def test_typed_aggregation_helpers():
@@ -244,6 +318,33 @@ def test_incomplete_junction_qc_rejects_only_under_explicit_policy(tmp_path):
     statuses = read_tsv(tmp_path / "pf" / "splice_prefilter_decisions.tsv")
     assert statuses[0]["prefilter_status"] == "REJECT"
     assert "FORMAL_JUNCTION_READ_QC" in statuses[0]["failed_stages"]
+
+
+def test_incomplete_junction_qc_never_reads_as_verified(tmp_path):
+    # Review B3b-06 round-2 guard (HANDOFF acceptance): the REVIEW branch is
+    # reasonable, but no downstream consumer may misread INCOMPLETE QC as
+    # verified junction evidence.
+    from neoag.splice_prefilter import _junction_read_qc_decision
+
+    for value in ("INCOMPLETE", "INCOMPLETE:MAPQ_MISSING", "QC_INCOMPLETE_OVERHANG", "incomplete"):
+        for policy in ("review", "reject", "anything_else"):
+            verdict, _reason = _junction_read_qc_decision(
+                [{"junction_read_qc_status": value}], incomplete_policy=policy
+            )
+            assert verdict is not True, (value, policy)
+
+    _prefilter_status(tmp_path, {"junction_read_qc_status": "INCOMPLETE:MAPQ_MISSING"}, _PROFILE_REVIEW)
+    statuses = read_tsv(tmp_path / "pf" / "splice_prefilter_decisions.tsv")
+    row = statuses[0]
+    assert row["prefilter_status"] == "REVIEW"
+    # The pool is explicitly labelled exploratory, and the formal gate says
+    # no - nothing here claims a high-confidence source chain.
+    assert row["splice_candidate_pool"] == "EXPLORATION_EVIDENCE_INCOMPLETE"
+    assert row["splice_formal_gate_pass"] == "no"
+    # The stage detail keeps the raw status AND the insufficient marker, so
+    # later steps see why the QC is unverified, never a bare "PASS".
+    assert "INCOMPLETE:MAPQ_MISSING" in row["stage_details"]
+    assert "insufficient_junction_read_qc_review" in row["stage_details"]
 
 
 def test_o3_orf_grade_passes_credible_orf(tmp_path):

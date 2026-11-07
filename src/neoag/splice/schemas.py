@@ -35,10 +35,11 @@ JUNCTION_READ_QC_FIELDS = [
 EVENT_FIELDS = [
     "splice_event_id", "sample_id", "genome_build", "event_type", "gene", "gene_id", "strand",
     "junction_ids", "reference_junction_ids", "alternative_junction_ids", "affected_exons",
-    "annotation_status", "cryptic_exon_status", "psi", "delta_psi", "qvalue", "outlier_score",
+    "annotation_status", "cryptic_exon_status", "psi", "delta_psi", "qvalue", "outlier_score", "ir_ratio",
     "event_expression", "event_confidence", "reference_path_status", "cohort_analysis_status",
     "source_tools", "source_tool_versions", "source_files", "source_record_ids",
     "provenance_record_count", "event_resolution_status", "evidence_conflict_status",
+    "stats_source_record_ids", "stats_selection_rule",
 ]
 
 EVENT_JUNCTION_LINK_FIELDS = [
