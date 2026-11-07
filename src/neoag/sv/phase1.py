@@ -89,6 +89,28 @@ def _support_rollup(records, attr: str) -> str:
     return ""
 
 
+def _pair_donor(records, alt_attr: str, depth_attr: str, status_attr: str):
+    """Select the ONE record whose (alt, depth) pair is published for the event.
+
+    Documented criteria (rule tag SINGLE_RECORD_MAX_DEPTH@v1): prefer a
+    MEASURED support status, then the deepest local depth, then the larger
+    ALT count; ties break on record_id so the choice is invariant under input
+    permutation.  Returns None for an empty pool (caller falls back to the
+    representative).
+    """
+    if not records:
+        return None
+    return min(
+        records,
+        key=lambda r: (
+            0 if str(getattr(r, status_attr, "") or "") == "MEASURED" else 1,
+            -int(getattr(r, depth_attr, 0) or 0),
+            -int(getattr(r, alt_attr, 0) or 0),
+            str(getattr(r, "record_id", "") or ""),
+        ),
+    )
+
+
 def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], conf, protein: ProteinReconstruction | None, rna_reads: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     rep = cluster.representative
     # Review B4-10 (round 2): clustering is transitive, so a chained member
@@ -104,11 +126,25 @@ def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], 
     def compat_max(attr: str) -> int:
         return max((int(getattr(r, attr, 0) or 0) for r in compatible), default=0)
 
-    t_alt = max(compat_max("tumor_alt_support"), rep.tumor_alt_support)
-    t_depth = max(compat_max("tumor_local_depth"), rep.tumor_local_depth)
+    # Review B4-10 (round 3 follow-up): ALT support and depth are an
+    # inseparable source-specific pair.  Taking the two maxima INDEPENDENTLY
+    # could publish a ratio no caller observed (record A 40/50 = 0.80 and
+    # record B 5/80 = 0.0625 used to yield 40/80 = 0.50).  The tumor pair is
+    # therefore taken from ONE donor record selected by a documented rule -
+    # MEASURED tumor support status first, then the deepest local depth (the
+    # most informative allele-fraction measurement), then the larger ALT
+    # count, then record_id for determinism - and the donor's own ratio is
+    # published with its record_id and caller as provenance.  Reads are never
+    # summed or mixed across callers: different tools count the same reads.
+    tumor_donor = _pair_donor(compatible, "tumor_alt_support", "tumor_local_depth", "tumor_support_status") or rep
+    t_alt = int(tumor_donor.tumor_alt_support or 0)
+    t_depth = int(tumor_donor.tumor_local_depth or 0)
+    # The normal side keeps ANY-member existence semantics (an SV is normal-
+    # detected when one compatible member saw normal support), not a ratio;
+    # no normal VAF is computed from these columns downstream.
     n_alt = max(compat_max("normal_alt_support"), rep.normal_alt_support)
     n_depth = max(compat_max("normal_local_depth"), rep.normal_local_depth)
-    vaf = (t_alt / t_depth) if t_depth else rep.vaf_like
+    vaf = (t_alt / t_depth) if t_depth else tumor_donor.vaf_like
     extra = extra or {}
     return {
         "sv_event_id": event_id,
@@ -155,6 +191,9 @@ def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], 
         "sniffles_precise": rep.sniffles_precise,
         "sniffles_rnames_count": compat_max("sniffles_rnames_count"),
         "sv_vaf_like": f"{clamp(vaf):.4f}",
+        "vaf_evidence_record_id": tumor_donor.record_id,
+        "vaf_evidence_caller": tumor_donor.caller,
+        "vaf_pair_rule": "SINGLE_RECORD_MAX_DEPTH@v1",
         "pon_overlap": "not_assessed",
         "population_sv_overlap": "not_assessed",
         "blacklist_overlap": "not_assessed",
@@ -293,6 +332,13 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         "tumor_vaf": f"{vaf:.4f}",
         "tumor_depth": f"{t_depth:.0f}",
         "tumor_alt_count": f"{t_alt:.0f}",
+        # Review B4-10 round 3: the published tumor VAF is one record's own
+        # (alt, depth) pair; the donor record and caller stay recoverable.
+        "tumor_vaf_provenance": (
+            f"record={svrow.get('vaf_evidence_record_id', '')}"
+            f";caller={svrow.get('vaf_evidence_caller', '')}"
+            f";rule={svrow.get('vaf_pair_rule', '')}"
+        ) if str(svrow.get("vaf_pair_rule") or "") else "",
         "normal_depth": str(svrow.get("normal_local_depth") or ""),
         "normal_alt_count": str(svrow.get("normal_alt_support") or ""),
         "clonality": f"{clonality:.4f}",

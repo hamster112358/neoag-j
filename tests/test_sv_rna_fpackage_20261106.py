@@ -565,3 +565,125 @@ def test_b4_10_transitive_chain_counts_only_representative_compatible_evidence()
     assert plain_row["event_evidence_basis"] == "ALL_MEMBERS_COMPATIBLE"
     assert plain_row["excluded_incompatible_record_ids"] == ""
     assert "incompatible_cluster_members_excluded" not in plain_conf.reason
+
+
+# ------------------------- B4-10 round-3 follow-up (FURTHER_SUGGESTIONS WS1) --
+
+def test_b4_10_vaf_pair_never_crosses_records():
+    """Operator suggestion 1 (2026-11-08): max ALT and max depth may sit in
+    different records; the published VAF must be ONE record's own ratio.
+
+    A: GRIDSS 40/50 (0.80).  D: Manta 5/80 (0.0625), coordinates compatible
+    with A.  The old independent maxima would publish 40/80 = 0.50 - a ratio
+    neither caller observed.  The donor rule (MEASURED, then deepest depth)
+    selects D's own self-consistent pair.
+    """
+    a = SVRecord(
+        "A", "GRIDSS", "chr1", 100_000, "chr1", 200_000, "DEL",
+        strand1="+", strand2="+", tumor_sr=12, tumor_pe=30,
+        tumor_alt_support=40, tumor_local_depth=50, tumor_support_status="MEASURED",
+    )
+    d = SVRecord(
+        "D", "Manta", "chr1", 100_080, "chr1", 200_100, "DEL",
+        strand1="+", strand2="+", tumor_sr=4, tumor_pe=6,
+        tumor_alt_support=5, tumor_local_depth=80, tumor_support_status="MEASURED",
+    )
+    wrong_cross_vaf = max(a.tumor_alt_support, d.tumor_alt_support) / max(
+        a.tumor_local_depth, d.tumor_local_depth
+    )
+    assert wrong_cross_vaf == pytest.approx(0.50)  # the fabricated ratio
+
+    cluster = cluster_sv_records([a, d], distance=200)[0]
+    assert sorted(cluster.record_ids) == ["A", "D"]
+    conf = score_cluster_confidence(cluster)
+    row = _sv_event_row(cluster, "SV1", "S1", {}, conf, None, 0)
+    # VAF equals one real record's observed ratio, and the disclosed pair is
+    # the same record's - alt/depth on the row reproduce the VAF exactly.
+    assert row["sv_vaf_like"] == "0.0625"
+    assert row["tumor_alt_support"] == 5 and row["tumor_local_depth"] == 80
+    assert 5 / 80 == float(row["sv_vaf_like"])
+    # Provenance: the originating record and caller are recoverable.
+    assert row["vaf_evidence_record_id"] == "D"
+    assert row["vaf_evidence_caller"] == "Manta"
+    assert row["vaf_pair_rule"] == "SINGLE_RECORD_MAX_DEPTH@v1"
+    raw = _raw_event_from_sv(row, None, {}, {}, "default")
+    assert raw["tumor_vaf"] == "0.0625"
+    assert raw["tumor_vaf_provenance"] == (
+        "record=D;caller=Manta;rule=SINGLE_RECORD_MAX_DEPTH@v1"
+    )
+
+
+def test_b4_10_pair_donor_is_deterministic_under_permutation_and_criteria():
+    a = SVRecord(
+        "A", "GRIDSS", "chr1", 100_000, "chr1", 200_000, "DEL",
+        strand1="+", strand2="+", tumor_sr=12, tumor_pe=30,
+        tumor_alt_support=40, tumor_local_depth=50, tumor_support_status="MEASURED",
+    )
+    d = SVRecord(
+        "D", "Manta", "chr1", 100_080, "chr1", 200_100, "DEL",
+        strand1="+", strand2="+", tumor_sr=4, tumor_pe=6,
+        tumor_alt_support=5, tumor_local_depth=80, tumor_support_status="MEASURED",
+    )
+    seen = set()
+    for perm in itertools.permutations([a, d]):
+        cluster = cluster_sv_records(list(perm), distance=200)[0]
+        conf = score_cluster_confidence(cluster)
+        row = _sv_event_row(cluster, "SV1", "S1", {}, conf, None, 0)
+        seen.add((row["sv_vaf_like"], row["vaf_evidence_record_id"], row["vaf_evidence_caller"]))
+    assert seen == {("0.0625", "D", "Manta")}
+
+    # A MEASURED record outranks a deeper record whose counts were never
+    # measured: unmeasured FORMAT keys must not win the VAF slot.
+    d2 = SVRecord(
+        "D2", "Manta", "chr1", 100_080, "chr1", 200_100, "DEL",
+        strand1="+", strand2="+",
+        tumor_alt_support=5, tumor_local_depth=80, tumor_support_status="FORMAT_ABSENT",
+    )
+    cluster = cluster_sv_records([a, d2], distance=200)[0]
+    row = _sv_event_row(cluster, "SV1", "S1", {}, score_cluster_confidence(cluster), None, 0)
+    assert row["vaf_evidence_record_id"] == "A"
+    assert row["sv_vaf_like"] == "0.8000"
+
+    # Exact ties break on record_id, never on input order.
+    x = SVRecord("X", "GRIDSS", "chr1", 100_000, "chr1", 200_000, "DEL",
+                 strand1="+", strand2="+", tumor_alt_support=9, tumor_local_depth=40,
+                 tumor_support_status="MEASURED")
+    y = SVRecord("Y", "Manta", "chr1", 100_000, "chr1", 200_000, "DEL",
+                 strand1="+", strand2="+", tumor_alt_support=9, tumor_local_depth=40,
+                 tumor_support_status="MEASURED")
+    donors = set()
+    for perm in itertools.permutations([x, y]):
+        cluster = cluster_sv_records(list(perm), distance=200)[0]
+        row = _sv_event_row(cluster, "SV1", "S1", {}, score_cluster_confidence(cluster), None, 0)
+        donors.add(row["vaf_evidence_record_id"])
+    assert donors == {"X"}
+
+
+def test_b4_10_incompatible_member_cannot_win_the_pair():
+    """The three-record transitive chain from round 2: C (200/210) is the
+    deepest member but incompatible with the representative; it must not
+    affect the donor choice, the VAF, or the provenance."""
+    a = SVRecord(
+        "A", "GRIDSS", "chr1", 100_000, "chr1", 200_000, "DEL",
+        strand1="+", strand2="+", tumor_sr=12, tumor_pe=30,
+        tumor_alt_support=40, tumor_local_depth=50, tumor_support_status="MEASURED",
+    )
+    b = SVRecord(
+        "B", "Manta", "chr1", 100_150, "chr1", 200_120, "DEL",
+        strand1=".", strand2=".", tumor_sr=0, tumor_pe=1,
+        tumor_alt_support=2, tumor_local_depth=30, tumor_support_status="MEASURED",
+    )
+    c = SVRecord(
+        "C", "SvABA", "chr1", 100_300, "chr1", 200_300, "DEL",
+        strand1="-", strand2="-", tumor_sr=18, tumor_pe=90,
+        tumor_alt_support=200, tumor_local_depth=210, tumor_support_status="MEASURED",
+    )
+    for perm in itertools.permutations([a, b, c]):
+        cluster = cluster_sv_records(list(perm), distance=200)[0]
+        row = _sv_event_row(cluster, "SV1", "S1", {}, score_cluster_confidence(cluster), None, 0)
+        assert row["vaf_evidence_record_id"] == "A"  # deepest COMPATIBLE member
+        assert row["sv_vaf_like"] == "0.8000"
+        assert row["tumor_alt_support"] == 40 and row["tumor_local_depth"] == 50
+        assert row["excluded_incompatible_record_ids"] == "C"
+        # C's evidence stays DISCLOSED but contributes to nothing.
+        assert row["excluded_incompatible_tumor_alt_max"] == 200
