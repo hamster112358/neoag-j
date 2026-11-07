@@ -26,6 +26,7 @@ PEPTIDE_SAFETY_FIELDS = [
     'reference_match_position','reference_match_length','normal_hla_ligand_exact_match','normal_ligand_tissue',
     'normal_ligand_hla','normal_ligand_source_protein','normal_ligand_class','normal_tissue_max_tpm',
     'normal_tissue_max_tissue','critical_tissue_max_tpm','normal_hspc_tpm','normal_hspc_unit','critical_tissue_hit','critical_tissue_name','normal_junction_seen',
+    'normal_junction_match_level',
     'normal_junction_source','normal_junction_max_reads','normal_junction_tissue','wildtype_peptide','mt_binding_rank',
     'wt_binding_rank','mt_wt_fold_change','mutation_position_in_peptide','mutation_anchor_only','anchor_risk_status',
     'closest_self_peptide','closest_self_gene','closest_self_similarity','closest_self_hla_binding_rank',
@@ -41,6 +42,7 @@ PEPTIDE_SAFETY_FIELDS = [
 
 EVENT_SAFETY_FIELDS = [
     'event_id','sample_id','gene','event_type','mutation_source','normal_expression_status','normal_junction_status',
+    'normal_junction_match_level',
     'matched_normal_status','event_safety_status','event_safety_reason',
     'normal_hspc_status','reference_proteome_status','normal_ligandome_status','anchor_assessment_status',
     'normal_tissue_max_tpm','normal_tissue_max_tissue','critical_tissue_max_tpm','critical_tissue_name',
@@ -469,6 +471,11 @@ def build_peptide_safety_gate(
     safety_cfg = (profile or {}).get('safety', {})
     ref_reject = str(safety_cfg.get('reference_proteome_exact_match_action','FAIL')).upper() in {'FAIL','REJECT'}
     normal_lig_action = str(safety_cfg.get('normal_hla_ligand_overlap_action','CAUTION')).upper()
+    # Review C6-03: a normal junction keyed only by the candidate's gene pair
+    # is context, not proof of the candidate's exact junction. "reject" (the
+    # default) keeps the historical production behavior but labels the match
+    # level honestly; "review" caps gene-pair-only matches at CAUTION/review.
+    gene_pair_action = str(safety_cfg.get('normal_junction_gene_pair_only_action','reject')).lower()
     rows=[]; event_rows=[]
     for p in peptides:
         e = events.get(p.get('event_id',''), {})
@@ -492,9 +499,19 @@ def build_peptide_safety_gate(
                 reasons.append('normal_hla_ligand_overlap')
         gene_pair = e.get('gene','')
         candidate_junction_keys = _candidate_junction_keys(p, e)
-        jrow = next((junctions.get(key) for key in candidate_junction_keys if junctions.get(key)), None)
-        if not jrow:
-            jrow = junctions.get(gene_pair)
+        jrow = None
+        junction_match_level = ''
+        for key in candidate_junction_keys:
+            if junctions.get(key):
+                jrow = junctions[key]
+                junction_match_level = 'EXACT_NORMAL_JUNCTION_MATCH'
+                break
+        if not jrow and gene_pair and junctions.get(gene_pair):
+            # Review C6-03: keyed only by the gene pair, this normal junction
+            # cannot prove the candidate's specific breakpoint occurs in
+            # normal tissue - it only says the pair is junction-capable.
+            jrow = junctions[gene_pair]
+            junction_match_level = 'GENE_PAIR_ONLY_CONTEXT'
         junction_kind = _normal_junction_kind(p, e)
         is_junction_type = junction_kind != 'not_applicable'
         if junction_kind == 'fusion':
@@ -505,11 +522,16 @@ def build_peptide_safety_gate(
             junction_assessed = False
         if jrow and is_junction_type:
             max_reads = to_float(first(jrow, ['normal_reads','normal_sample_count','junction_reads','reads'], '0'), 0.0)
-            if max_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
-                status='SAFETY_REJECT'; reasons.append('normal_junction_seen')
+            gene_pair_only = junction_match_level == 'GENE_PAIR_ONLY_CONTEXT'
+            if gene_pair_only and gene_pair_action == 'review':
+                if status == 'SAFETY_PASS': status='SAFETY_REVIEW'
+                reasons.append('gene_pair_only_normal_junction_context')
+            elif max_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
+                status='SAFETY_REJECT'
+                reasons.append('normal_junction_seen_gene_pair_only' if gene_pair_only else 'normal_junction_seen')
             else:
                 if status == 'SAFETY_PASS': status='SAFETY_REVIEW'
-                reasons.append('low_level_normal_junction_seen')
+                reasons.append('low_level_normal_junction_gene_pair_only' if gene_pair_only else 'low_level_normal_junction_seen')
         expression_aliases = _normal_expression_aliases(p, e, norm_expr)
         expr = _normal_expr_for_genes(expression_aliases, norm_expr)
         wt_rank = to_float(p.get('wildtype_binding_rank') or p.get('netmhcpan_wt_rank_el') or p.get('netmhcpan_wt_rank_ba'), 99.0)
@@ -576,6 +598,10 @@ def build_peptide_safety_gate(
             'normal_hla_ligand_overlap', 'normal_junction_seen',
             'low_level_normal_junction_seen', 'high_self_similarity_critical_tissue',
             'matched_normal_support',
+            # Review C6-03 labels for gene-pair-only matches.
+            'normal_junction_seen_gene_pair_only',
+            'low_level_normal_junction_gene_pair_only',
+            'gene_pair_only_normal_junction_context',
         }
         if status == 'SAFETY_REJECT':
             final_safety_conclusion = 'REJECT_DIRECT_SAFETY_EVIDENCE'
@@ -614,6 +640,7 @@ def build_peptide_safety_gate(
             'normal_junction_source': first(jrow or {}, ['source','dataset'], '') if is_junction_type else '',
             'normal_junction_max_reads': first(jrow or {}, ['normal_reads','normal_sample_count','junction_reads','reads'], ''),
             'normal_junction_tissue': first(jrow or {}, ['tissue','normal_tissue'], ''),
+            'normal_junction_match_level': junction_match_level if (jrow and is_junction_type) else '',
             'wildtype_peptide': p.get('wildtype_peptide',''), 'mt_binding_rank': f'{mt_rank:.4f}', 'wt_binding_rank': f'{wt_rank:.4f}',
             'mt_wt_fold_change': '', 'mutation_position_in_peptide': mut_pos, 'mutation_anchor_only': anchor_only,
             'anchor_risk_status': anchor_status, 'closest_self_peptide': '', 'closest_self_gene': '',
@@ -666,9 +693,18 @@ def build_peptide_safety_gate(
             worst = worst_safety_status(worst, 'FAIL')
             reasons.append('matched_normal_support')
         junction_rows = [r for r in rs if r.get('normal_junction_seen') == 'yes']
+        # Review C6-03: the rollup keeps the strongest match level seen.
+        exact_junction_rows = [
+            r for r in junction_rows
+            if r.get('normal_junction_match_level') == 'EXACT_NORMAL_JUNCTION_MATCH'
+        ]
         if junction_rows:
             max_normal_junction_reads = max(to_float(r.get('normal_junction_max_reads'), 0.0) for r in junction_rows)
-            if max_normal_junction_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
+            demoted = gene_pair_action == 'review' and not exact_junction_rows
+            if demoted:
+                worst = worst_safety_status(worst, 'CAUTION')
+                reasons.append('gene_pair_only_normal_junction_context')
+            elif max_normal_junction_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
                 worst = worst_safety_status(worst, 'FAIL')
                 reasons.append('normal_junction_seen')
             else:
@@ -679,6 +715,10 @@ def build_peptide_safety_gate(
             'event_id': eid, 'sample_id': e.get('sample_id',''), 'gene': e.get('gene',''), 'event_type': e.get('event_type',''),
             'mutation_source': e.get('mutation_source',''), 'normal_expression_status': rs[0].get('normal_expression_status','UNASSESSED'),
             'normal_junction_status': rs[0].get('normal_junction_assessment_status','UNASSESSED'),
+            'normal_junction_match_level': (
+                'EXACT_NORMAL_JUNCTION_MATCH' if exact_junction_rows
+                else 'GENE_PAIR_ONLY_CONTEXT' if junction_rows else ''
+            ),
             'matched_normal_status': 'normal_alt_support' if matched_normal else rs[0].get('matched_normal_status',''),
             'normal_hspc_status': rs[0].get('normal_hspc_status','UNASSESSED'),
             'reference_proteome_status': rs[0].get('reference_proteome_status','UNASSESSED'),

@@ -42,6 +42,7 @@ EVENT_FIELDS = [
     "tumor_vaf","tumor_depth","tumor_alt_count",
     "rna_vaf","rna_alt_reads","rna_depth","rna_vaf_source",
     "clonality","persistence","event_component_status","tumor_specificity","tumor_specificity_status",
+    "tumor_specificity_policy",
     "cohort_analysis_status",
     "raw_ccf","ccf_estimate","ccf_best","ccf_min","ccf_max","ccf_ci_low","ccf_ci_high",
     "ccf_status","ccf_confidence","ccf_warning","ccf_method","ccf_interval_method",
@@ -293,6 +294,7 @@ PEPTIDE_SAFETY_FIELDS = [
     "normal_tissue_max_tpm","normal_tissue_max_tissue","critical_tissue_max_tpm",
     "normal_hspc_tpm","normal_hspc_unit","critical_tissue_hit",
     "normal_junction_seen","normal_junction_source","normal_junction_max_reads","normal_junction_tissue",
+    "normal_junction_match_level",
     "wildtype_peptide","mt_binding_rank","wt_binding_rank","mt_wt_fold_change",
     "mutation_position_in_peptide","mutation_anchor_only","anchor_risk_status",
     "closest_self_peptide","closest_self_gene","closest_self_similarity","closest_self_hla_binding_rank","closest_self_normal_expression_tpm",
@@ -304,7 +306,7 @@ PEPTIDE_SAFETY_FIELDS = [
 
 EVENT_SAFETY_FIELDS = [
     "event_id","sample_id","gene","event_type","mutation_source",
-    "normal_expression_status","normal_junction_status","matched_normal_status",
+    "normal_expression_status","normal_junction_status","normal_junction_match_level","matched_normal_status",
     "event_safety_status","event_safety_reason","normal_hspc_status",
     "reference_proteome_status","normal_ligandome_status","anchor_assessment_status",
     "normal_tissue_max_tpm","normal_tissue_max_tissue","critical_tissue_max_tpm",

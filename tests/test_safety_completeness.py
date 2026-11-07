@@ -347,3 +347,96 @@ def test_missing_gene_in_available_normal_reference_has_specific_reason(tmp_path
 
     assert "normal_expression_gene_not_in_reference" in rows[0]["safety_reason"]
     assert "normal_hspc_gene_not_in_reference" in rows[0]["safety_reason"]
+
+
+def _fusion_inputs(tmp_path):
+    events = tmp_path / "f_events.tsv"
+    peptides = tmp_path / "f_peptides.tsv"
+    write_tsv(events, [{
+        "event_id": "E1", "sample_id": "S1", "event_type": "Fusion",
+        "mutation_source": "SV", "gene": "GENE1::GENE2", "event_confidence": "0.9",
+    }])
+    write_tsv(peptides, [{
+        "peptide_id": "P1", "event_id": "E1", "sample_id": "S1",
+        "event_type": "Fusion", "mutation_source": "SV", "gene": "GENE1::GENE2",
+        "peptide": "ABCDEFGHIJK", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+        "binding_rank": "0.2", "el_rank": "0.2",
+    }])
+    return events, peptides
+
+
+def test_c6_03_gene_pair_only_normal_junction_is_labelled_as_context(tmp_path):
+    # Round-2 (HANDOFF section I, C6-03): a normal junction found under the
+    # candidate's gene pair alone does not prove THIS candidate's breakpoint
+    # occurs in normal tissue. The reject action may stay (conservative), but
+    # the match level must say GENE_PAIR_ONLY_CONTEXT everywhere it is read.
+    events, peptides = _fusion_inputs(tmp_path)
+    junctions = tmp_path / "normal_junctions.tsv"
+    write_tsv(junctions, [{"gene1": "GENE1", "gene2": "GENE2", "normal_reads": "9"}])
+    rows, event_rows = build_peptide_safety_gate(
+        raw_events=events,
+        raw_peptides=peptides,
+        out_peptide_safety=tmp_path / "peptide_safety.tsv",
+        out_event_safety=tmp_path / "event_safety.tsv",
+        profile=load_profile("default"),
+        normal_junctions=junctions,
+    )
+    assert rows[0]["safety_status"] == "FAIL"
+    assert "normal_junction_seen_gene_pair_only" in rows[0]["safety_reason"]
+    assert rows[0]["normal_junction_match_level"] == "GENE_PAIR_ONLY_CONTEXT"
+    assert event_rows[0]["normal_junction_match_level"] == "GENE_PAIR_ONLY_CONTEXT"
+
+    # The knob: "review" caps gene-pair-only context at review/CAUTION
+    # instead of a hard reject - the choice is explicit, not silent.
+    profile = dict(load_profile("default"))
+    safety = dict(profile.get("safety", {}))
+    safety["normal_junction_gene_pair_only_action"] = "review"
+    profile["safety"] = safety
+    rows2, event_rows2 = build_peptide_safety_gate(
+        raw_events=events,
+        raw_peptides=peptides,
+        out_peptide_safety=tmp_path / "peptide_safety2.tsv",
+        out_event_safety=tmp_path / "event_safety2.tsv",
+        profile=profile,
+        normal_junctions=junctions,
+    )
+    assert rows2[0]["safety_status"] == "CAUTION"
+    assert "gene_pair_only_normal_junction_context" in rows2[0]["safety_reason"]
+    assert event_rows2[0]["event_safety_status"] != "FAIL"
+
+
+def test_c6_03_exact_coordinate_match_keeps_its_own_level(tmp_path):
+    # The honest split only matters if the exact match keeps its own label:
+    # with matching coordinates the level is EXACT_NORMAL_JUNCTION_MATCH and
+    # the plain reject reason applies under both knob settings.
+    events = tmp_path / "x_events.tsv"
+    peptides = tmp_path / "x_peptides.tsv"
+    write_tsv(events, [{
+        "event_id": "E1", "sample_id": "S1", "event_type": "Fusion",
+        "mutation_source": "SV", "gene": "GENE1::GENE2",
+        "chrom": "chr1", "junction_start": "100", "junction_end": "200",
+    }])
+    write_tsv(peptides, [{
+        "peptide_id": "P1", "event_id": "E1", "sample_id": "S1",
+        "event_type": "Fusion", "mutation_source": "SV", "gene": "GENE1::GENE2",
+        "peptide": "ABCDEFGHIJK", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+        "binding_rank": "0.2", "el_rank": "0.2",
+    }])
+    junctions = tmp_path / "x_junctions.tsv"
+    write_tsv(junctions, [{
+        "chromosome": "chr1", "junction_start": "100", "junction_end": "200",
+        "normal_reads": "9",
+    }])
+    rows, event_rows = build_peptide_safety_gate(
+        raw_events=events,
+        raw_peptides=peptides,
+        out_peptide_safety=tmp_path / "x_peptide_safety.tsv",
+        out_event_safety=tmp_path / "x_event_safety.tsv",
+        profile=load_profile("default"),
+        normal_junctions=junctions,
+    )
+    assert rows[0]["safety_status"] == "FAIL"
+    assert rows[0]["normal_junction_match_level"] == "EXACT_NORMAL_JUNCTION_MATCH"
+    assert "normal_junction_seen" in rows[0]["safety_reason"]
+    assert "normal_junction_seen_gene_pair_only" not in rows[0]["safety_reason"]
+    assert event_rows[0]["normal_junction_match_level"] == "EXACT_NORMAL_JUNCTION_MATCH"
