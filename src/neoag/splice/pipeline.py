@@ -230,12 +230,24 @@ class SpliceLayer:
             # donor row so a merged event never pairs fields that no tool
             # reported together.
             stats_donor = _stats_donor(group) if _STATS_TUPLE_FIELDS & set(fields) else None
+            # Review B3b-02 (round 3): complementary statistics that the
+            # donor itself did not report are collected here and preserved
+            # with provenance instead of being inserted into the tuple.
+            stats_complement: dict[str, set[str]] = {}
             for field_name in fields:
                 if field_name == id_field:
                     continue
                 values = {str(row.get(field_name, "")).strip() for row in group if str(row.get(field_name, "")).strip()}
-                if field_name in _STATS_TUPLE_FIELDS and stats_donor is not None and str(stats_donor.get(field_name, "")).strip():
-                    output[field_name] = str(stats_donor[field_name]).strip()
+                if field_name in _STATS_TUPLE_FIELDS and stats_donor is not None:
+                    # The donor tuple stays INTACT, missing values included:
+                    # a blank donor field is published blank, never backfilled
+                    # from another row (row A's delta_psi=0.40 must not be
+                    # paired with row B's qvalue=0.001 - no test produced that
+                    # combination).  Complementary values from other rows are
+                    # disclosed separately below.
+                    output[field_name] = str(stats_donor.get(field_name, "")).strip()
+                    if not output[field_name] and values:
+                        stats_complement[field_name] = values
                 elif field_name in _SET_FIELDS:
                     output[field_name] = ";".join(sorted({token for value in values for token in _tokens(value)}))
                 elif field_name in _MAX_FIELDS:
@@ -264,6 +276,41 @@ class SpliceLayer:
                     conflict["conflict_id"] = stable_id("CFL", conflict)
                     self.tables.setdefault("conflicts", []).append(conflict)
                     output["evidence_conflict_status"] = "IDENTITY_FIELD_CONFLICT"
+            if stats_complement:
+                # The merged tuple carries holes where the donor had holes;
+                # what other rows measured survives as a named, auditable
+                # disclosure instead of silently becoming primary evidence.
+                output["stats_missing_fields"] = ";".join(sorted(stats_complement))
+                output["stats_source_record_ids"] = ";".join(sorted(_tokens(
+                    str(stats_donor.get("source_record_ids") or stats_donor.get("source_record_id") or "")
+                ))) if stats_donor is not None else ""
+                output["stats_selection_rule"] = _STATS_SELECTION_RULE
+                for field_name, field_values in sorted(stats_complement.items()):
+                    conflict = {
+                        "entity_type": table.upper(), "entity_id": entity_id, "sample_id": self.sample_id,
+                        "conflict_type": "STATS_TUPLE_MISSING_FIELD_NOT_BACKFILLED",
+                        "field_name": field_name,
+                        "observed_values": ";".join(sorted(field_values)),
+                        "source_tools": ";".join(sorted({
+                            x for row in group
+                            for x in _tokens(row.get("source_tools") or row.get("source_generator") or row.get("source_tool"))
+                        })),
+                        "source_record_ids": ";".join(sorted({
+                            token
+                            for row in group
+                            if str(row.get(field_name, "")).strip()
+                            for token in _tokens(str(row.get("source_record_ids") or row.get("source_record_id") or ""))
+                        })),
+                        "severity": "WARNING",
+                        "resolution_status": "DONOR_TUPLE_KEPT_INTACT",
+                        "resolution_reason": (
+                            f"The selected donor row did not report {field_name}; other rows reported "
+                            f"{';'.join(sorted(field_values))} but were NOT merged into the selected "
+                            "statistics tuple - the donor's tuple stays intact, missing values included."
+                        ),
+                    }
+                    conflict["conflict_id"] = stable_id("CFL", conflict)
+                    self.tables.setdefault("conflicts", []).append(conflict)
             if stats_donor is not None and len(group) > 1:
                 reported_tuples = {
                     (str(r.get("delta_psi", "")).strip(), str(r.get("qvalue", "")).strip())

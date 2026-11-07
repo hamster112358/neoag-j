@@ -504,3 +504,80 @@ def test_one_shared_causal_ladder_everywhere():
         > CAUSAL_STATUS_PRIORITY["TARGETED_SPANNING_ONLY"]
         > CAUSAL_STATUS_PRIORITY["DNA_RNA_CIS_SUPPORTED"]
     )
+
+
+# ------------------------- B3b-02 round-3 follow-up (FURTHER_SUGGESTIONS WS1) --
+
+def _missing_field_layer(tmp_path, swapped: bool):
+    rows = [
+        "chr1:151-200:+\tSE\tGENE1\t0.5\t0.4\t\n",
+        "chr1:151-200:+\tSE\tGENE1\t0.6\t\t0.001\n",
+    ]
+    if swapped:
+        rows.reverse()
+    txt = _write(
+        tmp_path / f"s2n_missing_{int(swapped)}.tsv",
+        "junc_id\tevent_type\tgene\tpsi\tdelta_psi\tqvalue\n" + "".join(rows),
+    )
+    bundle = parse_splice2neo(txt, sample_id="S1")
+    layer = SpliceLayer(sample_id="S1")
+    layer.extend(bundle)
+    layer.consolidate()
+    return bundle, layer
+
+
+def test_b3b_02_round3_missing_donor_field_is_never_backfilled(tmp_path):
+    """Operator suggestion 2 (2026-11-08): row A reports delta_psi=0.4 with
+    NO qvalue; row B reports qvalue=0.001 with NO delta_psi.  The merged
+    primary tuple must not become (0.4, 0.001) - once a donor is selected
+    its tuple stays intact, missing values included, and the complementary
+    measurement survives only as a named disclosure with provenance."""
+    for swapped in (False, True):  # donor choice invariant under permutation
+        bundle, layer = _missing_field_layer(tmp_path, swapped)
+        assert len(layer.tables["events"]) == 1
+        merged = layer.tables["events"][0]
+        # Row B owns the tuple (smallest reported qvalue wins).
+        donor = [r for r in bundle["events"] if str(r.get("qvalue", "")).strip() == "0.001"][0]
+        assert merged["qvalue"] == "0.001"
+        # Row B never reported delta_psi, so the merged row carries NO effect
+        # size - never row A's 0.4 dressed up as the donor's own measurement.
+        assert merged["delta_psi"] == ""
+        assert (merged["delta_psi"], merged["qvalue"]) != ("0.4", "0.001")
+        # Missingness and donor identity are preserved in the output...
+        assert merged["stats_missing_fields"] == "delta_psi"
+        assert merged["stats_source_record_ids"] == donor["source_record_ids"]
+        assert merged["stats_selection_rule"] == _STATS_SELECTION_RULE
+        # ...and the complementary measurement is preserved separately.
+        not_backfilled = [
+            c for c in layer.tables["conflicts"]
+            if c["conflict_type"] == "STATS_TUPLE_MISSING_FIELD_NOT_BACKFILLED"
+        ]
+        assert len(not_backfilled) == 1
+        entry = not_backfilled[0]
+        assert entry["field_name"] == "delta_psi"
+        assert entry["observed_values"] == "0.4"
+        assert entry["severity"] == "WARNING"
+        assert entry["resolution_status"] == "DONOR_TUPLE_KEPT_INTACT"
+        reporting = [r for r in bundle["events"] if str(r.get("delta_psi", "")).strip()][0]
+        assert reporting["source_record_ids"] in entry["source_record_ids"]
+
+
+def test_b3b_02_round3_complete_donor_tuple_has_no_missing_disclosure(tmp_path):
+    # Both statistics present in the donor row: the tuple is intact by
+    # construction, so no missing-field disclosure or conflict is emitted.
+    txt = _write(
+        tmp_path / "s2n_complete.tsv",
+        "junc_id\tevent_type\tgene\tpsi\tdelta_psi\tqvalue\n"
+        "chr1:151-200:+\tSE\tGENE1\t0.5\t-0.9\t0.4\n"
+        "chr1:151-200:+\tSE\tGENE1\t0.6\t0.1\t0.00001\n",
+    )
+    layer = SpliceLayer(sample_id="S1")
+    layer.extend(parse_splice2neo(txt, sample_id="S1"))
+    layer.consolidate()
+    merged = layer.tables["events"][0]
+    assert float(merged["delta_psi"]) == 0.1 and float(merged["qvalue"]) == 0.00001
+    assert merged.get("stats_missing_fields", "") == ""
+    assert not any(
+        c["conflict_type"] == "STATS_TUPLE_MISSING_FIELD_NOT_BACKFILLED"
+        for c in layer.tables["conflicts"]
+    )
