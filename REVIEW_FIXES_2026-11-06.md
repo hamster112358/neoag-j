@@ -1485,6 +1485,326 @@ all twelve commits are on the dev tree's main branch. The fourteen operator
 deployment edits were never staged; each package commit lists only its own
 files.
 
+## 7. Round-2 follow-up campaign (2026-11-07)
+
+The follow-up document NEOAG_FIX_CAMPAIGN_OPEN_CONCERNS_HANDOFF_2026-11-07.md
+re-examined the campaign's own remedies (ten scrutiny items, a re-examination
+table, and a deferral list). The rebuttals for the disputed items were issued
+the same day in HANDOFF_RESPONSE_2026-11-07.md; everything the campaign did
+not rebut was then implemented in the dev tree, plus two specifically
+requested end-to-end tests (B4-10 and B3b-02). Nine commits landed in the
+order below (971bcb8 .. c00d220); the full suite after each, and the final
+state, are in the verification note at the end of this section.
+
+---
+
+### C3-04 - RNA count statuses now survive the adapter (commit 971bcb8)
+
+Files: src/neoag/adapters/rna_vaf.py, src/neoag/evidence_layer.py,
+src/neoag/evidence_states.py; tests: tests/test_evidence_consensus.py
+(+1 test).
+
+Problem: the allele-counting script emits per-variant count_status values
+(ERROR, CONTIG_NOT_IN_BAM, UNASSESSED_COMPLEX) that describe a failed or
+skipped assessment, but the rna_vaf adapter dropped that field, so the
+consumer saw counts indistinguishable from a measured site: a pileup that
+crashed on one variant was read as RNA_NEGATIVE - "the site was read and no
+mutant RNA was seen" - or the legacy status string was trusted over the
+numbers. In plain terms, "we could not look" was laundered into "we looked
+and saw nothing".
+Fix: RNAVafSupport carries count_status/count_error through as
+rna_count_status / rna_count_error; evidence_layer's _rna_support_status and
+evidence_states' derive_rna_support treat the three technical states as
+unassessed in both directions (they also block the status-string-only
+confirmation path), while junction support - which does not depend on the
+failed ALT pileup - still counts.
+Test: test_c3_04_technical_rna_count_states_never_read_as_measured pins all
+four readings (technical negative, blocked string confirmation, blocked
+numbers, clean counts still confirmed) plus the two _rna_support_status
+boundary rules.
+
+---
+
+### B5-04 + D2-02 + D2-05 - join disclosure and two fallback corrections (commit abba2cf)
+
+Files: src/neoag/comprehensive_evidence.py, src/neoag/scoring.py; tests:
+tests/test_gpackage_ge_20261106.py (+1 test), tests/test_score_appm_modifiers.py
+(+2 tests).
+
+B5-04. Problem: when one source file carried two different values for one
+key (two runs, two ORFs, two allele spellings), the join index kept the
+first non-empty value and dropped the rest silently. Fix: the merge choice
+is unchanged (first value wins), but every kept/dropped pair is now written
+to a conflict ledger (INTRA_DUPLICATE_FIELDS columns: source, key_field,
+key_value, field, kept_value, dropped_value), so a hidden ambiguity becomes
+a visible row.
+D2-02. Problem: a priority-cap token outside the A..D ladder was ignored
+rather than applied - the permissive reading of a likely schema mismatch.
+Fix: an off-ladder cap token now holds the candidate at D (the most
+restrictive rung) and names itself in priority_cap_status as
+OFF_LADDER_CAP:<LABEL> via unknown_priority_cap_label(); a renamed producer
+vocabulary now fails loudly instead of silently un-capping.
+D2-05. Problem: the immunogenicity fallback keyed on magnitude, so a
+resolved composite of exactly 0.0 was treated as "no data" and a legacy
+field could resurrect it. Fix: availability decides - the fallback runs only
+when immunogenicity_source is "none"; a measured 0.0 stays authoritative.
+The sample-summary HLA-LOH penalty additionally names its provenance
+(appm_multiplier_reason starts sample_level_appm_summary+hla_loh_allele_string:),
+distinguishing it from a per-candidate APPM modifier row.
+Test: one cap-algebra test and two scoring tests in the named files.
+
+---
+
+### C3-01 - genome-build fingerprint preflight (commit 180385c)
+
+Files: scripts/rna_allele_counts_pysam.py; tests:
+tests/test_rna_allele_counts_script.py (8 -> 11 tests).
+
+Problem: the BAM-vs-reference preflight checked contig names only. GRCh37
+and GRCh38 use the same chr1..22/X/Y spellings, so a 38-labelled BAM over a
+37 reference (or vice versa) passed preflight and produced silently wrong
+coordinates. Fix: GENOME_BUILD_FINGERPRINTS holds exact primary-assembly
+contig lengths for GRCh37 and GRCh38; the preflight votes on observed BAM
+lengths and classifies build_check= as BUILD_CONFIRMED / BUILD_MISMATCH /
+BUILD_INFERRED / BUILD_UNASSESSED; --expected-build (aliases hg19/b37/grch37,
+hg38/b38/grch38) is enforced and a confirmed mismatch aborts unless the
+audited --allow-build-mismatch override is given; the status also lands in
+the final wrote-line. An ambiguous or novel assembly (e.g. T2T-CHM13 chr1
+length 207734681, which matches neither fingerprint) is reported as no-match
+rather than guessed.
+Test: fingerprint voting (exact, ambiguous mix, unknown assembly), honest
+inference paths, and the abort-on-confirmed-mismatch path (3 new tests).
+
+---
+
+### C6-03 - junction match levels: exact coordinates vs gene-pair context (commit ac7f1d3)
+
+Files: src/neoag/peptide_safety_gate.py, src/neoag/schemas.py; tests:
+tests/test_safety_completeness.py (+2 tests).
+
+Problem: the normal-junction lookup keys candidates by their exact junction
+coordinates and - as a fallback - by the event's gene pair. A hit through the
+gene-pair fallback alone (which only says the gene pair is junction-capable
+in normal tissue) drove the same hard reject as an exact coordinate match,
+letting context stand in for proof. Fix: both the peptide row and the event
+rollup now carry normal_junction_match_level = EXACT_NORMAL_JUNCTION_MATCH /
+GENE_PAIR_ONLY_CONTEXT; the reject reason distinguishes the two
+(normal_junction_seen[_gene_pair_only], low_level_ variants); the profile
+knob safety.normal_junction_gene_pair_only_action = reject (default - keeps
+the historical production behavior, now honestly labelled) or review (caps
+the context-only case at CAUTION/review). The new columns are declared in
+PEPTIDE_SAFETY_FIELDS / EVENT_SAFETY_FIELDS here and in schemas.py.
+Test: gene-pair-only case under both knob settings, and the exact-coordinate
+case keeping its own level and reason under both.
+
+---
+
+### B4-10 + B4-07 - SV cluster evidence restricted to representative-compatible members (commit 65a7521) - requested test 1
+
+Files: src/neoag/sv/sv_merge.py, src/neoag/sv/sv_filter.py,
+src/neoag/sv/phase1.py, src/neoag/sv/schemas_sv.py; tests:
+tests/test_sv_rna_fpackage_20261106.py (22 -> 23 tests).
+
+Problem: SV clustering is a transitive closure, so a chain
+A~B~C can put C in the cluster even when C is incompatible with the
+representative A (opposite strand, or breakpoints beyond the cluster
+distance). Every aggregate then mixed incompatible evidence: VAF, caller
+agreement, split-read/precision support, the sniffles channel and the normal
+penalty. Decision requested: should only representative-compatible evidence
+count? Yes - implemented that way, symmetric across all channels.
+Fix: SVCluster keeps the permutation-invariant union-find clustering, but
+aggregation uses only records pairwise _compatible with the representative
+under the cluster's own rule (same type family, both canonical endpoints
+within the distance, equal strand where both known). New disclosure columns
+keep the exclusions visible: cluster_record_count, compatible_record_count,
+cluster_all_callers, excluded_incompatible_record_ids,
+excluded_incompatible_tumor_alt_max, and event_evidence_basis =
+REPRESENTATIVE_COMPATIBLE@v1 (exclusions present) vs ALL_MEMBERS_COMPATIBLE;
+the confidence scorer gains the reason token
+incompatible_cluster_members_excluded.
+Demonstration (the requested chain, one permutation-invariant cluster):
+A = GRIDSS +/+ 100000-200000 alt 40/depth 50, B = Manta ././ 100150-200120
+alt 2/depth 30 (compatible), C = SvABA -/- 100300-200300 alt 200/depth 210
+(incompatible strand and distance). Representative A. VAF is now
+(40+2)/(50+30) = 0.8000 instead of (40+2+200)/(50+30+210) = 0.952381; the
+event-confidence score falls from 0.85 to 0.75 (caller agreement 2/2
+compatible instead of C's third caller counted); the downstream clonality
+and tumor-specificity rollup reads the corrected row (1.0 / 0.8500). C stays
+disclosed (excluded record id, its alt max 200, basis label).
+B4-07: the tumor-specificity rules are emitted as a versioned policy string
+specificity_rules@v1:... per raw SV event so the scoring contract is in the
+data, not only in the code.
+
+---
+
+### B3b-02 - merged splice statistics stay a coherent donor tuple (commit b69657e) - requested test 2
+
+Files: src/neoag/splice/pipeline.py, src/neoag/splice/schemas.py,
+src/neoag/splice/adapters/irfinder.py, src/neoag/splice/consensus.py; tests:
+tests/test_splice_chain_epackage_20261106.py (27 -> 31 tests),
+tests/test_splice_v050_layer.py (vocabulary pins updated).
+
+Problem: rows of one event were merged field-by-field with max-absolute
+values, so {psi, delta_psi, qvalue} could come from three different rows - a
+statistical statement no caller ever produced. Requested test: two rows with
+different delta-PSI/q-value pairs must merge to a biologically coherent,
+exactly-sourced result.
+Fix: the statistics fields {psi, delta_psi, qvalue, outlier_score} are taken
+whole from one donor row, chosen by min over the rank tuple
+(qvalue or +inf, -|delta_psi|, -|psi|, source_record_ids) - rule
+MIN_QVALUE_THEN_MAXABS_DELTA_PSI@v1 (smallest q-value wins, strongest effect
+breaks ties, deterministic id tiebreak). The merged row names the donor
+(stats_source_record_ids) and the rule (stats_selection_rule); when the old
+per-field merge would have produced a different (cross-paired) result, a
+conflicts-table entry STATS_TUPLE_CROSS_PAIRING_AVOIDED (severity WARNING,
+action COHERENT_TUPLE_SELECTED) documents what was avoided. Identical rows
+merge without any conflict.
+Demonstration (the requested pair): rows chr1:151-200:+ GENE1 with
+(psi 0.5, delta_psi -0.9, q 0.4) and (psi 0.6, delta_psi 0.1, q 0.00001)
+merge to the second row's tuple verbatim (q 1e-5 wins) with
+stats_source_record_ids equal to that row's source_record_ids; the cross-
+pairing avoided entry names the tuple the per-field rule would have built.
+Related in the same file: IRFinder's IRratio is vocabulary-separated into
+its own ir_ratio column (psi left empty) - an intron-retention ratio is not
+a PSI; the B3b-06 guard test pins that INCOMPLETE junction QC never reads as
+verified (decision stays REVIEW + EXPLORATION_EVIDENCE_INCOMPLETE under both
+policies); B3b-12's FAVORABLE_PRESENTATION_PERCENTILE = 2.0 gained its full
+provenance comment (pVACbind EL presentation percentiles per allele x
+epitope-length background, companion EL score field, pre-declared
+exploratory threshold).
+
+---
+
+### D4-04 + B2-01 - identity derivation labels; loud WT-context loss (commit fc11fcd)
+
+Files: src/neoag/candidate_identity.py, src/neoag/vep/extract_peptides.py;
+tests: tests/test_candidate_identity.py (+1 test, fixture corrected),
+tests/test_extract_bpackage_20261106.py (+1 test).
+
+D4-04. Every candidate identity row now names how its identity was derived:
+event_identity_status = EXACT_PRIMARY_ID / COORDINATE_DERIVED_ID /
+UNRESOLVED_ROW_FALLBACK, so a fallback identifier can no longer be mistaken
+for a primary one. The third pre-existing suite failure was closed here: the
+stale August identity fixture predates the :: display-key redesign (7474afc,
+4a22add) and lacked the gene pair real fusion rows carry; with the gene field
+added it pins the intended collapse (two rows, one display key) and the
+identity status remains green. The known-failure count is therefore 2 from
+this commit on.
+B2-01. Variants dropped for missing protein context were only a counter.
+The extractor now emits a stderr WARNING and a sensitivity_warning summary
+key, and the message names the scope: row-level ("see
+variants_no_peptides_by_consequence for the per-reason funnel") when the CSQ
+has a WildtypeProtein column, versus batch-wide ("the protein VEP plugin
+likely did not run ... re-annotate before trusting sensitivity") when the
+column is absent - the difference between one broken row and a silently
+missing annotation stage. B2-01's never-fabricate-WT behavior itself is
+unchanged and stays pinned by its package-B tests.
+
+---
+
+### B4-02 - FASTA reader follows the real htslib .fai convention (commit c8550f9)
+
+Files: src/neoag/sv/reference.py; tests: tests/test_gpackage_gd_20261106.py
+(35 -> 42 tests).
+
+Problem: the byte-offset index treated .fai column 4 as the line width
+including the newline (chars_per_line = col4 - 1). samtools faidx puts
+bases-per-line in column 4 and the byte width in column 5, so against any
+real samtools-indexed reference the reader strode one base early from line 2
+onwards - every micro-homology and protein-reconstruction fetch would read
+shifted sequence, silently. The shipped tests passed because their helper
+wrote the same nonstandard convention (col4 = col5 = width + 1); the
+HANDOFF's real-reference-compatibility concern was correct.
+Fix: the parser now implements the spec (col4 bases per line, col5 = col4 +
+1 or + 2 separator width), refuses anything else, and verifies the sidecar
+against the file - an over-declared length (file truncated after indexing)
+or an under-declared one (bases continuing past the declared end) falls back
+to the honest streaming scan instead of fetching garbage. Content beginning
+with the gzip magic is never byte-addressed regardless of file name (whole-
+file fallback, which decodes correctly); a genuine single-line plain FASTA
+(-1 -1 columns) addresses directly; the scanner rejects ragged line layouts
+(non-uniform widths or blank lines inside sequence) for byte arithmetic and
+falls back honestly. The old 71/71 sidecar convention is now refused rather
+than trusted.
+Tests: samtools LF and CRLF indices (asserting the parsed stride),
+single-line -1/-1, gzip-magic-under-plain-name, stale/malformed sidecar
+fallback in both directions, first/last/base-boundary/empty/out-of-range
+fetches under indexed mode, ragged-layout fallback, and the no-materialisation
+memory guard.
+
+---
+
+### E-03 + E-04 - typed hard-fail scopes; risk-gated no-R1/R2 summary (commit c00d220)
+
+Files: src/neoag/hard_fail_scopes.py (new), src/neoag/evidence_consensus.py,
+src/neoag/open_neo/review.py, src/neoag/open_neo/review_integrity.py; tests:
+tests/test_open_neo_macro_skills.py (+4 tests).
+
+E-03. Problem: a hard failure on one peptide - exact normal-proteome match,
+one lost restricting allele - blocked the whole event, including defect-free
+siblings, through the event rollup (any hard-failed peptide made a promoted
+event an integrity violation) and the review's representative check.
+Conversely, genuinely global failures (sample identity, invalid coordinates)
+must keep blocking everything.
+Fix: every hard-fail code is typed with one of five scopes - SAMPLE_GLOBAL,
+EVENT_GLOBAL, ORF_SPECIFIC, PEPTIDE_SPECIFIC, PEPTIDE_HLA_SPEC; unknown codes
+default to EVENT_GLOBAL, so a new reason never loosens safety by omission
+(the registry also proves no binder/prediction code is hard-fail at all:
+weak presentation caps the grade, it does not invalidate siblings).
+Propagation: peptide rows carry hard_failure_scopes (CODE:SCOPE pairs); the
+event rollup reports hard_failure_event_blocking, hard_failure_event_scope_
+codes, hard_failure_peptide_local_codes and hard_failure_event_block_basis
+(EVENT_OR_SAMPLE_SCOPE_CODE / ALL_PEPTIDES_HARD_FAIL / PEPTIDE_LOCAL_ONLY /
+NONE - local defects still block when no clean candidate remains). Review
+excludes the event only when the rollup (or a rep-level event-scope code)
+says so; a defect confined to the representative holds it
+(HOLD / REVIEW_REPRESENTATIVE_LOCAL_HARD_FAIL - it may not be promoted, but
+the event survives, and select_first_batch only admits it through the single
+manual-review lane); a clean event with a defective sibling advances with
+the sibling named in the reason (EVENT_SIBLING_LOCAL_HARD_FAIL=...).
+review_integrity's hard_fail_not_promoted check follows the typed rollup,
+keeps the per-peptide check, counts promoted events with visible sibling
+defects (promoted_events_with_sibling_local_hard_fail=N) so non-blocking is
+provably disclosed, and keeps the pre-E-03 rollup gate for artifacts without
+typed columns. All four required scenarios are tested: exact-normal-match
+sibling, invalid event identity (still excludes and integrity-BLOCKS if
+promoted anyway), different-HLA-loss, and every-peptide-defective.
+E-04. The "no top-grade candidate" summary now warns only when the batch is
+actually exposed - no R1/R2 AND (>= 20 peptides, or missing-resource caps in
+play, or the top-ranked candidate itself capped) - instead of on every quiet
+batch; the cap-completeness counts stay unconditional.
+
+---
+
+### Round-2 verification note
+
+Full suite after every commit (same command as section 6). Final state:
+1235 passed / 119 skipped / 2 known failures. The known-failure count dropped
+from 3 to 2 because the third failure (the stale identity fixture) was fixed
+in fc11fcd with the :: display-key root cause already proven at section 6;
+the two remaining failures are the same environment-dependent pair (the
+easyquant wrapper against this host's bp_quant state, and the tools.env
+external-root test passing in a clean worktree only). Suite growth: 1208 ->
+1235 (+27). New/updated pins this round: +1 C3-04 consumer test, +1 cap
+test and +2 D2-05 tests, +3 C3-01 tests, +2 C6-03 tests, +1 B4-10 chain
+test, +4 splice tests (coherent tuple, identical-row merge, guard, and the
+updated v050 ir_ratio pins), +1 identity status test, +1 B2-01 warning test,
++7 B4-02 FASTA boundary tests, +4 E-03 scope tests. Four round-2 changes
+(C3-04 consumer branch, D2-05, C6-03, B2-01) initially landed from the
+earlier session without pins; those pins were written this round before
+landing and are included in the counts above. Targeted integration runs
+alongside the full suite: macro-skills 100 passed, consensus + GF + fusion +
+parallel-consensus 103 passed, extract + safety set 48 passed (+ the five
+appended pins green).
+
+Nine commits: 971bcb8 (C3-04), abba2cf (B5-04/D2-02/D2-05), 180385c (C3-01),
+ac7f1d3 (C6-03), 65a7521 (B4-10/B4-07), b69657e (B3b-02), fc11fcd
+(D4-04/B2-01), c8550f9 (B4-02), c00d220 (E-03/E-04). The fourteen operator
+deployment edits were again never staged; each commit lists only its own
+files; the control tree was not touched.
+
+---
+
 This report is mirrored to /data1/neoag/install_logs/REVIEW_FIXES_2026-11-06.md
 with an md5 comparison on delivery.
 
