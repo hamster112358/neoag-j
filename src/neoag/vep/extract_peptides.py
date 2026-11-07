@@ -159,6 +159,15 @@ OUTPUT_FIELDS = [
     "fusion_orf_comparison_status",
 ]
 
+# Review B1-01 (round 3): opt-in multitranscript VEP shadow mode.
+#   single - deployed baseline: one best-ranked acceptable CSQ transcript per
+#            variant; output must stay byte-reproducible.
+#   multi  - shadow: every acceptable transcript contributes; distinct
+#            mutant peptides stay separate hypotheses, identical ones merge
+#            with transcript provenance in a mode-only extra column.
+TRANSCRIPT_SELECTION_MODES = ("single", "multi")
+MULTI_TRANSCRIPT_PROVENANCE_FIELD = "multi_transcript_sources"
+
 
 def parse_peptide_lengths(
     lengths_str: str = "",
@@ -397,14 +406,21 @@ def _csq_rank(parts: list[str], idx: dict[str, int]) -> tuple[int, int]:
     )
 
 
-def pick_csq_transcript(
+def pick_csq_transcripts(
     csq_entries: list[list[str]],
     idx: dict[str, int],
     *,
     consequence_filter: str | None = None,
-) -> list[str] | None:
-    candidates: list[tuple[tuple[int, int], list[str]]] = []
-    for parts in csq_entries:
+) -> list[list[str]]:
+    """All protein-altering CSQ entries with usable protein context, best first.
+
+    Review B1-01 (round 3): the multitranscript shadow mode consumes every
+    acceptable transcript, so the ranking has to be exposed as a list.
+    Order is the historical one (MANE, then canonical, then stable CSQ
+    entry order), so the single-transcript baseline is unchanged.
+    """
+    candidates: list[tuple[tuple[int, int], int, list[str]]] = []
+    for order, parts in enumerate(csq_entries):
         cons = _field(parts, idx["Consequence"])
         if not _is_protein_altering(cons, consequence_filter=consequence_filter):
             continue
@@ -415,11 +431,19 @@ def pick_csq_transcript(
         # minimum a simple amino-acid substitution for VEP-only missense calls.
         if not wt and not fs and (not aa or "/" not in aa):
             continue
-        candidates.append((_csq_rank(parts, idx), parts))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
+        candidates.append((_csq_rank(parts, idx), order, parts))
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return [parts for _, _, parts in candidates]
+
+
+def pick_csq_transcript(
+    csq_entries: list[list[str]],
+    idx: dict[str, int],
+    *,
+    consequence_filter: str | None = None,
+) -> list[str] | None:
+    entries = pick_csq_transcripts(csq_entries, idx, consequence_filter=consequence_filter)
+    return entries[0] if entries else None
 
 
 def _clean_protein(seq: str) -> str:
@@ -847,11 +871,20 @@ def extract_variant_peptides_from_vcf(
     normal_sample_name: str | None = None,
     rna_sample_name: str | None = None,
     consequence_filter: str | None = None,
+    transcript_selection: str = "single",
 ) -> dict[str, Any]:
     """Parse VEP-annotated VCF and write variant short peptides with metadata."""
     path = Path(input_vcf).resolve()
     out = Path(output_tsv).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    transcript_selection = str(transcript_selection or "single").lower()
+    if transcript_selection not in TRANSCRIPT_SELECTION_MODES:
+        raise ValueError(
+            f"unknown transcript_selection {transcript_selection!r}; "
+            f"expected one of {list(TRANSCRIPT_SELECTION_MODES)}"
+        )
+    multi_transcript = transcript_selection == "multi"
 
     if mini_len < 0:
         raise ValueError(f"mini_len must be >= 0, got {mini_len}")
@@ -871,6 +904,10 @@ def extract_variant_peptides_from_vcf(
         filter_normal_proteome=filter_normal_proteome and proteome_index is not None,
         minigene_total_len=minigene_total_len,
     )
+    if multi_transcript:
+        # The baseline method string is untouched; only shadow runs disclose
+        # the multitranscript semantics.
+        method += "transcript_selection=multi;dedup=identical_mutant_peptide_keeps_best_rank_provenance;"
 
     csq_idx: dict[str, int] | None = None
     tumor_sample_idx: int | None = None
@@ -887,6 +924,8 @@ def extract_variant_peptides_from_vcf(
     flag_counts: dict[str, int] = {}
     filter_counts: dict[str, int] = {}
     variants_no_peptides_by_consequence: dict[str, int] = {}
+    variants_with_alternate_transcripts = 0
+    multitranscript_deduplicated_peptides = 0
 
     with _open_vcf(path) as fh:
         for line in fh:
@@ -933,180 +972,229 @@ def extract_variant_peptides_from_vcf(
             if not csq_raw:
                 continue
 
-            picked = pick_csq_transcript(
-                _csq_entries(csq_raw),
-                csq_idx,
-                consequence_filter=consequence_filter,
-            )
-            if not picked:
+            csq_entries = _csq_entries(csq_raw)
+            # Review B1-01 (round 3): the single-transcript baseline picks the
+            # best-ranked acceptable transcript exactly as before; the opt-in
+            # multitranscript shadow mode walks every acceptable transcript.
+            if multi_transcript:
+                picked_entries = pick_csq_transcripts(
+                    csq_entries, csq_idx, consequence_filter=consequence_filter,
+                )
+            else:
+                single_pick = pick_csq_transcript(
+                    csq_entries, csq_idx, consequence_filter=consequence_filter,
+                )
+                picked_entries = [single_pick] if single_pick else []
+            if not picked_entries:
                 continue
-
-            # Review B2-02: tie FORMAT metrics to the ALT allele the picked
-            # CSQ entry describes.  At a multiallelic site the peptide may
-            # come from ALT[1]; AD/DP/VAF must be read at that index, not
-            # silently at ALT[0].
-            alt_list = [a.strip() for a in alt.split(",")]
-            alt_index = 0
-            if len(alt_list) > 1:
-                csq_allele = _field(picked, csq_idx.get("Allele", 0))
-                if csq_allele in alt_list:
-                    alt_index = alt_list.index(csq_allele)
-
-            vaf = ""
-            tumor_depth = ""
-            tumor_alt_count = ""
-            normal_alt_vaf = ""
-            normal_depth = ""
-            normal_alt_count = ""
-            rna_vaf = ""
-            rna_alt_reads = ""
-            rna_depth = ""
-            if tumor_sample_idx is not None and len(parts) > tumor_sample_idx:
-                vaf, tumor_depth, tumor_alt_count = _parse_allele_metrics_from_format(
-                    parts[8], parts[tumor_sample_idx], alt_index=alt_index
-                )
-            if normal_sample_idx is not None and len(parts) > normal_sample_idx:
-                normal_alt_vaf, normal_depth, normal_alt_count = _parse_allele_metrics_from_format(
-                    parts[8], parts[normal_sample_idx], alt_index=alt_index
-                )
-            if rna_sample_idx is not None and len(parts) > rna_sample_idx:
-                rna_vaf, rna_depth, rna_alt_reads = _parse_allele_metrics_from_format(
-                    parts[8], parts[rna_sample_idx], alt_index=alt_index
-                )
-
             variants_seen += 1
-            gene = _field(picked, csq_idx["SYMBOL"])
-            ensembl_gene = _field(picked, csq_idx["Gene"])
-            transcript = _field(picked, csq_idx["Feature"])
-            hgvsc = _field(picked, csq_idx["HGVSc"])
-            hgvsp = _field(picked, csq_idx["HGVSp"])
-            consequence = _field(picked, csq_idx["Consequence"])
-            protein_position_raw = _field(picked, csq_idx["Protein_position"])
-            amino_acids = _field(picked, csq_idx["Amino_acids"])
-            wt_protein = _field(picked, csq_idx.get("WildtypeProtein", -1))
-            fs_protein = _field(picked, csq_idx.get("FrameshiftSequence", -1))
+            if len(picked_entries) > 1:
+                variants_with_alternate_transcripts += 1
+            variant_emitted = False
+            variant_multi_aa_skipped = False
+            variant_no_protein_context = False
+            emitted_row_by_peptide: dict[str, int] = {}
+            for picked in picked_entries:
+                # Review B2-02: tie FORMAT metrics to the ALT allele the picked
+                # CSQ entry describes.  At a multiallelic site the peptide may
+                # come from ALT[1]; AD/DP/VAF must be read at that index, not
+                # silently at ALT[0].  In multitranscript mode each entry
+                # resolves its own allele index.
+                alt_list = [a.strip() for a in alt.split(",")]
+                alt_index = 0
+                if len(alt_list) > 1:
+                    csq_allele = _field(picked, csq_idx.get("Allele", 0))
+                    if csq_allele in alt_list:
+                        alt_index = alt_list.index(csq_allele)
 
-            multi_aa_flag = classify_multi_aa_flag(consequence, amino_acids, protein_position_raw)
-            flag_counts[multi_aa_flag] = flag_counts.get(multi_aa_flag, 0) + 1
-
-            if exclude_multi_aa and multi_aa_flag in MULTI_AA_EXCLUDED_FLAGS:
-                variants_skipped_multi_aa += 1
-                continue
-            if single_aa_only and multi_aa_flag != MULTI_AA_SINGLE:
-                variants_skipped_multi_aa += 1
-                continue
-
-            mut_protein, anchor_start, anchor_end = build_mutant_protein(
-                consequence,
-                wt_protein,
-                protein_position_raw=protein_position_raw,
-                amino_acids=amino_acids,
-                frameshift_sequence=fs_protein,
-            )
-            if not mut_protein:
-                variants_dropped_no_protein_context += 1
-                continue
-
-            fs_mode = sliding_full_mutant_mode(consequence, multi_aa_flag)
-            variant_peps = list(
-                sliding_variant_peptides(
-                    mut_protein,
-                    wt_protein,
-                    anchor_start=anchor_start,
-                    anchor_end=anchor_end,
-                    lengths=lengths,
-                    frameshift_mode=fs_mode,
-                )
-            )
-            if not variant_peps:
-                # Coverage fact, not an error (review B2-03): a pure
-                # stop_gained produces no novel junction peptide by
-                # construction; record it instead of staying silent.
-                variants_no_peptides_by_consequence[consequence] = (
-                    variants_no_peptides_by_consequence.get(consequence, 0) + 1
-                )
-                continue
-
-            peptide_centered_minigene = multi_aa_flag in {
-                MULTI_AA_INFRAME,
-                MULTI_AA_FRAMESHIFT,
-                MULTI_AA_COMPLEX,
-            }
-
-            variants_with_peptides += 1
-            vkey = _variant_key(gene, chrom, pos, ref, alt)
-            for pep in variant_peps:
-                minigene, minigene_nt = build_minigene(
-                    wt_protein,
-                    mut_protein,
-                    anchor_start=anchor_start,
-                    anchor_end=anchor_end,
-                    amino_acids=amino_acids,
-                    frameshift=multi_aa_flag == MULTI_AA_FRAMESHIFT,
-                    mini_len=mini_len,
-                    minigene_total_len=minigene_total_len,
-                    peptide_start_aa=pep.get("peptide_start_aa"),
-                    peptide_end_aa=pep.get("peptide_end_aa"),
-                    peptide_centered=peptide_centered_minigene,
-                )
-                in_normal = "no"
-                if proteome_index is not None:
-                    in_normal = (
-                        "yes"
-                        if peptide_in_normal_proteome(pep["mutant_peptide"], proteome_index)
-                        else "no"
+                vaf = ""
+                tumor_depth = ""
+                tumor_alt_count = ""
+                normal_alt_vaf = ""
+                normal_depth = ""
+                normal_alt_count = ""
+                rna_vaf = ""
+                rna_alt_reads = ""
+                rna_depth = ""
+                if tumor_sample_idx is not None and len(parts) > tumor_sample_idx:
+                    vaf, tumor_depth, tumor_alt_count = _parse_allele_metrics_from_format(
+                        parts[8], parts[tumor_sample_idx], alt_index=alt_index
                     )
-                    if filter_normal_proteome and in_normal == "yes":
-                        peptides_filtered_normal_proteome += 1
-                        continue
+                if normal_sample_idx is not None and len(parts) > normal_sample_idx:
+                    normal_alt_vaf, normal_depth, normal_alt_count = _parse_allele_metrics_from_format(
+                        parts[8], parts[normal_sample_idx], alt_index=alt_index
+                    )
+                if rna_sample_idx is not None and len(parts) > rna_sample_idx:
+                    rna_vaf, rna_depth, rna_alt_reads = _parse_allele_metrics_from_format(
+                        parts[8], parts[rna_sample_idx], alt_index=alt_index
+                    )
 
-                peptide_counter += 1
-                rows.append({
-                    "peptide_id": f"{sample_id}.{peptide_counter}",
-                    "gene": gene,
-                    "ensembl_gene_id": ensembl_gene,
-                    "transcript_id": transcript,
-                    "hgvsc": hgvsc,
-                    "hgvsp": hgvsp,
-                    "chrom": chrom,
-                    "pos": pos,
-                    "ref": ref,
-                    "alt": alt,
-                    "vaf": vaf,
-                    "tumor_depth": tumor_depth,
-                    "tumor_alt_count": tumor_alt_count,
-                    "normal_alt_vaf": normal_alt_vaf,
-                    "normal_depth": normal_depth,
-                    "normal_alt_count": normal_alt_count,
-                    "rna_vaf": rna_vaf,
-                    "rna_alt_reads": rna_alt_reads,
-                    "rna_depth": rna_depth,
-                    "consequence": consequence,
-                    "protein_position": protein_position_raw,
-                    "amino_acids": amino_acids,
-                    "multi_aa_flag": multi_aa_flag,
-                    # Review B2-01: WT-dependent judgments (MT/WT binding,
-                    # specificity, safety) must see why no WT twin exists
-                    # rather than infer it from an empty field.
-                    "wt_peptide_status": "WT_AVAILABLE" if pep["wildtype_peptide"] else "WT_UNAVAILABLE",
-                    "minigene": minigene,
-                    "minigene_nt": minigene_nt,
-                    "in_normal_proteome": in_normal,
-                    "variant_key": vkey,
-                    "peptide_source": "snv",
-                    "generation_method": method,
-                    "peptide_label": _peptide_label(
-                        gene=gene,
-                        transcript_id=transcript,
-                        variant_key=vkey,
-                        hgvsp=hgvsp,
-                        consequence=consequence,
-                        multi_aa_flag=multi_aa_flag,
-                        mutant_peptide=pep["mutant_peptide"],
-                        wildtype_peptide=pep["wildtype_peptide"],
-                    ),
-                    **pep,
-                })
+                gene = _field(picked, csq_idx["SYMBOL"])
+                ensembl_gene = _field(picked, csq_idx["Gene"])
+                transcript = _field(picked, csq_idx["Feature"])
+                hgvsc = _field(picked, csq_idx["HGVSc"])
+                hgvsp = _field(picked, csq_idx["HGVSp"])
+                consequence = _field(picked, csq_idx["Consequence"])
+                protein_position_raw = _field(picked, csq_idx["Protein_position"])
+                amino_acids = _field(picked, csq_idx["Amino_acids"])
+                wt_protein = _field(picked, csq_idx.get("WildtypeProtein", -1))
+                fs_protein = _field(picked, csq_idx.get("FrameshiftSequence", -1))
+
+                multi_aa_flag = classify_multi_aa_flag(consequence, amino_acids, protein_position_raw)
+                flag_counts[multi_aa_flag] = flag_counts.get(multi_aa_flag, 0) + 1
+
+                if exclude_multi_aa and multi_aa_flag in MULTI_AA_EXCLUDED_FLAGS:
+                    variant_multi_aa_skipped = True
+                    continue
+                if single_aa_only and multi_aa_flag != MULTI_AA_SINGLE:
+                    variant_multi_aa_skipped = True
+                    continue
+
+                mut_protein, anchor_start, anchor_end = build_mutant_protein(
+                    consequence,
+                    wt_protein,
+                    protein_position_raw=protein_position_raw,
+                    amino_acids=amino_acids,
+                    frameshift_sequence=fs_protein,
+                )
+                if not mut_protein:
+                    variant_no_protein_context = True
+                    continue
+
+                fs_mode = sliding_full_mutant_mode(consequence, multi_aa_flag)
+                variant_peps = list(
+                    sliding_variant_peptides(
+                        mut_protein,
+                        wt_protein,
+                        anchor_start=anchor_start,
+                        anchor_end=anchor_end,
+                        lengths=lengths,
+                        frameshift_mode=fs_mode,
+                    )
+                )
+                if not variant_peps:
+                    # Coverage fact, not an error (review B2-03): a pure
+                    # stop_gained produces no novel junction peptide by
+                    # construction; record it instead of staying silent.
+                    variants_no_peptides_by_consequence[consequence] = (
+                        variants_no_peptides_by_consequence.get(consequence, 0) + 1
+                    )
+                    continue
+
+                peptide_centered_minigene = multi_aa_flag in {
+                    MULTI_AA_INFRAME,
+                    MULTI_AA_FRAMESHIFT,
+                    MULTI_AA_COMPLEX,
+                }
+
+                variant_emitted = True
+                provenance = f"TX={transcript or '.'}|HGVSp={hgvsp or '.'}"
+                vkey = _variant_key(gene, chrom, pos, ref, alt)
+                for pep in variant_peps:
+                    minigene, minigene_nt = build_minigene(
+                        wt_protein,
+                        mut_protein,
+                        anchor_start=anchor_start,
+                        anchor_end=anchor_end,
+                        amino_acids=amino_acids,
+                        frameshift=multi_aa_flag == MULTI_AA_FRAMESHIFT,
+                        mini_len=mini_len,
+                        minigene_total_len=minigene_total_len,
+                        peptide_start_aa=pep.get("peptide_start_aa"),
+                        peptide_end_aa=pep.get("peptide_end_aa"),
+                        peptide_centered=peptide_centered_minigene,
+                    )
+                    in_normal = "no"
+                    if proteome_index is not None:
+                        in_normal = (
+                            "yes"
+                            if peptide_in_normal_proteome(pep["mutant_peptide"], proteome_index)
+                            else "no"
+                        )
+                        if filter_normal_proteome and in_normal == "yes":
+                            peptides_filtered_normal_proteome += 1
+                            continue
+
+                    # Review B1-01 (round 3): an identical mutant peptide from
+                    # a second transcript is the SAME peptide hypothesis, not
+                    # a second one - keep the best-ranked row and merge the
+                    # transcript provenance.  Distinct mutant peptides stay
+                    # separate rows (separate hypotheses).  A duplicate copy
+                    # already dropped by the normal-proteome filter above
+                    # stays dropped: the surviving row's own filter verdict
+                    # governs the hypothesis.
+                    if multi_transcript:
+                        dup_index = emitted_row_by_peptide.get(pep["mutant_peptide"])
+                        if dup_index is not None:
+                            existing = rows[dup_index]
+                            prev = existing.get(MULTI_TRANSCRIPT_PROVENANCE_FIELD, "")
+                            if provenance not in prev.split(";"):
+                                existing[MULTI_TRANSCRIPT_PROVENANCE_FIELD] = (
+                                    f"{prev};{provenance}" if prev else provenance
+                                )
+                            multitranscript_deduplicated_peptides += 1
+                            continue
+
+                    peptide_counter += 1
+                    row = {
+                        "peptide_id": f"{sample_id}.{peptide_counter}",
+                        "gene": gene,
+                        "ensembl_gene_id": ensembl_gene,
+                        "transcript_id": transcript,
+                        "hgvsc": hgvsc,
+                        "hgvsp": hgvsp,
+                        "chrom": chrom,
+                        "pos": pos,
+                        "ref": ref,
+                        "alt": alt,
+                        "vaf": vaf,
+                        "tumor_depth": tumor_depth,
+                        "tumor_alt_count": tumor_alt_count,
+                        "normal_alt_vaf": normal_alt_vaf,
+                        "normal_depth": normal_depth,
+                        "normal_alt_count": normal_alt_count,
+                        "rna_vaf": rna_vaf,
+                        "rna_alt_reads": rna_alt_reads,
+                        "rna_depth": rna_depth,
+                        "consequence": consequence,
+                        "protein_position": protein_position_raw,
+                        "amino_acids": amino_acids,
+                        "multi_aa_flag": multi_aa_flag,
+                        # Review B2-01: WT-dependent judgments (MT/WT binding,
+                        # specificity, safety) must see why no WT twin exists
+                        # rather than infer it from an empty field.
+                        "wt_peptide_status": "WT_AVAILABLE" if pep["wildtype_peptide"] else "WT_UNAVAILABLE",
+                        "minigene": minigene,
+                        "minigene_nt": minigene_nt,
+                        "in_normal_proteome": in_normal,
+                        "variant_key": vkey,
+                        "peptide_source": "snv",
+                        "generation_method": method,
+                        "peptide_label": _peptide_label(
+                            gene=gene,
+                            transcript_id=transcript,
+                            variant_key=vkey,
+                            hgvsp=hgvsp,
+                            consequence=consequence,
+                            multi_aa_flag=multi_aa_flag,
+                            mutant_peptide=pep["mutant_peptide"],
+                            wildtype_peptide=pep["wildtype_peptide"],
+                        ),
+                        **pep,
+                    }
+                    if multi_transcript:
+                        row[MULTI_TRANSCRIPT_PROVENANCE_FIELD] = provenance
+                        emitted_row_by_peptide[pep["mutant_peptide"]] = len(rows)
+                    rows.append(row)
+            # Per-variant funnel counters: a variant that produced peptides on
+            # some transcript is neither skipped nor dropped, even if another
+            # acceptable transcript had no protein context.
+            if variant_emitted:
+                variants_with_peptides += 1
+            elif variant_multi_aa_skipped and not variant_no_protein_context:
+                variants_skipped_multi_aa += 1
+            if variant_no_protein_context and not variant_emitted:
+                variants_dropped_no_protein_context += 1
 
     if hla_alleles and (annotate_netmhcpan or netmhcpan_xls or mhcflurry_csv):
         from ..adapters.peptide_netmhcpan import annotate_variant_peptide_rows
@@ -1119,7 +1207,10 @@ def extract_variant_peptides_from_vcf(
             fetch_missing=annotate_netmhcpan and not netmhcpan_xls,
         )
 
-    write_tsv(out, rows, OUTPUT_FIELDS)
+    out_fields = list(OUTPUT_FIELDS)
+    if multi_transcript:
+        out_fields.append(MULTI_TRANSCRIPT_PROVENANCE_FIELD)
+    write_tsv(out, rows, out_fields)
     # Review B2-01 (round 2): WT-context loss is a sensitivity risk, so it
     # must be loud, not just counted.  The CSQ header check is the preflight:
     # no WildtypeProtein column means the protein-sequence VEP plugin did
@@ -1138,7 +1229,7 @@ def extract_variant_peptides_from_vcf(
             )
         )
         print(f"WARNING: {sensitivity_warning}", file=sys.stderr)
-    return {
+    summary: dict[str, Any] = {
         "input_vcf": str(path),
         "output_tsv": str(out),
         "variants_parsed": variants_seen,
@@ -1167,3 +1258,10 @@ def extract_variant_peptides_from_vcf(
         "netmhcpan_annotated": bool(hla_alleles and (annotate_netmhcpan or netmhcpan_xls)),
         "mhcflurry_annotated": bool(hla_alleles and mhcflurry_csv),
     }
+    if multi_transcript:
+        # Summary additions are mode-gated: single-mode run manifests keep
+        # their exact key set (byte-reproducible baseline).
+        summary["transcript_selection"] = transcript_selection
+        summary["variants_with_alternate_transcripts"] = variants_with_alternate_transcripts
+        summary["multitranscript_deduplicated_peptides"] = multitranscript_deduplicated_peptides
+    return summary

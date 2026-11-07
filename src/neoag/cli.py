@@ -432,6 +432,7 @@ def cmd_extract_variant_peptides(args):
         mhcflurry_csv=args.mhcflurry_csv,
         annotate_netmhcpan=args.annotate_netmhcpan,
         tumor_sample_name=args.tumor_sample_name,
+        transcript_selection=args.transcript_selection,
     )
     print("Variant short peptides extracted (sliding window, no MHC binding).")
     print(f"  Method: {result['generation_method']}")
@@ -1492,6 +1493,15 @@ def build_parser():
         "--single-aa-only",
         action="store_true",
         help="Keep only single_aa missense variants (strictest filter)",
+    )
+    evp.add_argument(
+        "--transcript-selection",
+        choices=["single", "multi"],
+        default="single",
+        help="VEP transcript selection (review B1-01): 'single' (default) is "
+             "the deployed single-transcript baseline; 'multi' opts into the "
+             "multitranscript shadow mode that enumerates peptides from every "
+             "acceptable transcript and records transcript provenance.",
     )
     evp.add_argument(
         "--hla-alleles",

@@ -191,6 +191,11 @@ def resolve_variant_peptide_options(cfg: dict[str, Any], *, root: Path | None = 
         # explicit, profile-visible setting that adapters forward — not a
         # hard-coded drop the caller cannot see or override intentionally.
         "pass_only": bool(inputs.get("variant_peptide_pass_only", True)),
+        # Review B1-01 (round 3): opt-in multitranscript VEP shadow mode;
+        # the single-transcript baseline is the default everywhere.
+        "transcript_selection": str(
+            inputs.get("variant_peptide_transcript_selection", "single")
+        ).lower(),
         "normal_proteome_fasta": str(normal_fasta) if normal_fasta else None,
         "filter_normal_proteome": bool(filter_normal),
         "annotate_normal_proteome_only": annotate_only,
@@ -336,6 +341,7 @@ def run_variant_peptide_upstream(
             tumor_sample_name=str(tumor_sample_name) if tumor_sample_name else None,
             normal_sample_name=str(normal_sample_name) if normal_sample_name else None,
             rna_sample_name=str(rna_sample_name) if rna_sample_name else None,
+            transcript_selection=opts["transcript_selection"],
         )
         vcf_rows = read_tsv(variant_tsv)
 
