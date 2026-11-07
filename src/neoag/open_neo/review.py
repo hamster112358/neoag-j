@@ -12,6 +12,7 @@ from neoag.controlled_execution.io_utils import load_limited_yaml, markdown_tabl
 from neoag.report_from_final import enrich_report_provenance
 from neoag.reports_dual import load_report_bundle, make_patient_report
 from neoag.vaccine_events import build_vaccine_event_tables
+from neoag.hard_fail_scopes import event_blocking_codes
 from neoag.status_words import phasing_needs_resolution
 from neoag.skill_taxonomy.review_skills import (
     run_concept_explainer,
@@ -98,7 +99,8 @@ def _recommended_validation(kind: str) -> str:
 def _priority(grade: str, row: dict[str, str]) -> tuple[str, str, str]:
     grade = grade.upper() or "R4"
     reasons: list[str] = []
-    hard = _truthy(row.get("hard_failure")) or bool(_get(row, "hard_failure_codes"))
+    rep_codes = [code.strip() for code in _get(row, "hard_failure_codes").replace(";", ",").split(",") if code.strip()]
+    rep_hard = _truthy(row.get("hard_failure")) or bool(rep_codes)
     manual = _truthy(row.get("manual_review_required"))
     kind = _event_kind(_get(row, "event_type", "evidence_track"), _get(row, "consequence"))
     rna = _get(row, "rna_support_state", "rna_support_status", default="RNA_UNASSESSED").upper()
@@ -108,10 +110,26 @@ def _priority(grade: str, row: dict[str, str]) -> tuple[str, str, str]:
     fusion = _get(row, "fusion_consensus_status", "event_authenticity_state", "tools_detected").upper()
     source_chain_tier = _get(row, "source_chain_confidence_tier").upper()
 
+    # Review E-03: hard-fail codes carry typed scopes.  The consensus event
+    # rollup's hard_failure_event_blocking flag (scope-aware) decides whether
+    # the event is excluded; ORF/peptide/peptide-HLA-scope defects affect only
+    # the row they were found on.  Rows without typed scope columns (pre-E-03
+    # artifacts) keep the previous hard-fail-equals-exclusion semantics.
+    sc_codes = [code.strip() for code in _get(row, "source_chain_hard_failure_codes").replace(";", ",").split(",") if code.strip()]
+    event_blocking_field = _get(row, "hard_failure_event_blocking").strip().lower()
+    hard = event_blocking_field in {"yes", "true", "1"} if event_blocking_field else rep_hard
+
     if source_chain_tier == "C4":
-        return "EXCLUDE_HARD_FAIL", "NOT_FOR_EXPERIMENT", "REVIEW_SOURCE_CHAIN_C4"
+        if not sc_codes or event_blocking_codes(sc_codes):
+            return "EXCLUDE_HARD_FAIL", "NOT_FOR_EXPERIMENT", "REVIEW_SOURCE_CHAIN_C4"
+        rep_hard = True  # local source-chain defect: affects this row only
     if hard:
         return "EXCLUDE_HARD_FAIL", "NOT_FOR_EXPERIMENT", "REVIEW_HARD_FAIL"
+    if rep_hard:
+        # Only the representative (or its peptide-HLA pair) carries the
+        # defect: it cannot be promoted, but the event and its clean sibling
+        # peptides stay in play.
+        return "HOLD", "MANUAL_REVIEW_ONLY", "REVIEW_REPRESENTATIVE_LOCAL_HARD_FAIL"
     if grade == "R4":
         return ("MANUAL_REVIEW", "MANUAL_REVIEW_ONLY", "REVIEW_DRIVER_OR_MECHANISM") if manual else ("HOLD", "HOLD", "REVIEW_R4_HOLD")
     if source_chain_tier == "C3":
@@ -157,6 +175,11 @@ def build_review_rows(events: list[dict[str, str]], peptides: list[dict[str, str
         grade = _get(event, "best_evidence_grade", "evidence_grade", default=_get(rep1, "evidence_grade", default="R4"))
         merged = {**event, **rep1}
         status, priority, reason = _priority(grade, merged)
+        sibling_local = [code.strip() for code in _get(event, "hard_failure_peptide_local_codes").replace(";", ",").split(",") if code.strip()]
+        if sibling_local and status != "EXCLUDE_HARD_FAIL":
+            # Review E-03: a sibling peptide carries a defect that does not
+            # extend to this event's clean candidates - disclose, do not block.
+            reason = reason + ";EVENT_SIBLING_LOCAL_HARD_FAIL=" + ",".join(sibling_local)
         event_type = _get(event, "event_type", "biological_event_track", "evidence_track", default=_get(rep1, "event_type"))
         kind = _event_kind(event_type, _get(rep1, "consequence"))
         output.append({
@@ -199,6 +222,11 @@ def build_review_rows(events: list[dict[str, str]], peptides: list[dict[str, str
             "evidence_conflict_fields": _get(rep1, "evidence_conflict_fields"),
             "hard_failure": _get(rep1, "hard_failure", default="no"),
             "hard_failure_codes": _get(rep1, "hard_failure_codes"),
+            "hard_failure_scopes": _get(rep1, "hard_failure_scopes"),
+            "hard_failure_event_blocking": _get(event, "hard_failure_event_blocking"),
+            "hard_failure_event_scope_codes": _get(event, "hard_failure_event_scope_codes"),
+            "hard_failure_peptide_local_codes": _get(event, "hard_failure_peptide_local_codes"),
+            "hard_failure_event_block_basis": _get(event, "hard_failure_event_block_basis"),
             "priority_cap": _get(rep1, "priority_cap"),
             "priority_cap_reason_codes": _get(rep1, "priority_cap_reason_codes"),
             "manual_review_required": _get(event, "manual_review_required", default=_get(rep1, "manual_review_required", default="no")),

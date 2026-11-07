@@ -268,12 +268,31 @@ def audit_review_inputs(artifacts: dict[str, str], outdir: str | Path) -> dict[s
         if (_truthy(row.get("hard_failure")) or str(row.get("hard_failure_codes") or "").strip())
         and str(row.get("evidence_grade") or "").upper() in {"R1", "R2"}
     ]
-    promoted_hard_fail.extend(
-        row for row in events
-        if _safe_int(row.get("hard_failure_peptide_count")) > 0
-        and str(row.get("best_evidence_grade") or "").upper() in {"R1", "R2"}
+    # Review E-03: the event-level gate follows the typed-scope rollup.  An
+    # event promoted with a sample/event-scope hard failure is a violation; a
+    # sibling peptide's peptide-local hard failure does NOT block the event
+    # (its peptide row was already excluded above) but is counted here so the
+    # non-blocking is provably visible.  Event rows without typed scope
+    # columns (pre-E-03 artifacts) keep the old peptide-count rollup gate.
+    promoted_local_visible = 0
+    for event_row in events:
+        if str(event_row.get("best_evidence_grade") or "").upper() not in {"R1", "R2"}:
+            continue
+        blocking = str(event_row.get("hard_failure_event_blocking") or "").strip().lower()
+        if blocking:
+            if blocking in {"yes", "true", "1"}:
+                promoted_hard_fail.append(event_row)
+            elif str(event_row.get("hard_failure_peptide_local_codes") or "").strip():
+                promoted_local_visible += 1
+        elif _safe_int(event_row.get("hard_failure_peptide_count")) > 0:
+            promoted_hard_fail.append(event_row)
+    _add(
+        checks,
+        "hard_fail_not_promoted",
+        "FAIL" if promoted_hard_fail else "PASS",
+        "ERROR",
+        f"violations={len(promoted_hard_fail)};promoted_events_with_sibling_local_hard_fail={promoted_local_visible}",
     )
-    _add(checks, "hard_fail_not_promoted", "FAIL" if promoted_hard_fail else "PASS", "ERROR", f"violations={len(promoted_hard_fail)}")
     if promoted_hard_fail:
         overall = "BLOCKED"
 
@@ -297,7 +316,6 @@ def audit_review_inputs(artifacts: dict[str, str], outdir: str | Path) -> dict[s
     # this is a WARN that summarises cap reasons and the fraction capped by
     # absent resources - it triggers human review, never automatic
     # promotion or automatic rejection.
-    no_top_grade = len(peptides) >= 20 and grade_counts.get("R1", 0) + grade_counts.get("R2", 0) == 0
     cap_reason_counts: dict[str, int] = {}
     capped_rows = 0
     missing_resource_capped = 0
@@ -318,6 +336,21 @@ def audit_review_inputs(artifacts: dict[str, str], outdir: str | Path) -> dict[s
         for key, _ in sorted(cap_reason_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
     )
     missing_fraction = (missing_resource_capped / len(peptides)) if peptides else 0.0
+    # Review E-04 (round 2): documented risk-sensitive rule replaces the
+    # bare sample-size cutoff.  The WARN fires when NO candidate carries an
+    # R1/R2 grade (grade concentration by definition) and any of:
+    #   * the run has >=20 peptides (the historical size condition), or
+    #   * at least one cap is attributable to an absent resource (a systemic
+    #     asset failure worth review however few peptides it touches), or
+    #   * the top-ranked candidate itself carries a cap reason (the final
+    #     ranking's head is directly limited).
+    # The grade/cap summary itself is emitted for every run, warned or not.
+    top_ranked_capped = bool(peptides) and bool(
+        str(peptides[0].get("evidence_grade_cap_reasons") or "").strip()
+    )
+    no_top_grade = bool(peptides) and grade_counts.get("R1", 0) + grade_counts.get("R2", 0) == 0 and (
+        len(peptides) >= 20 or missing_resource_capped > 0 or top_ranked_capped
+    )
     _add(
         checks,
         "no_top_grade_concentration",

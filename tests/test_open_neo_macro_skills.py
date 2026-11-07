@@ -1960,6 +1960,204 @@ def test_review_priority_uses_evidence_reason_codes_and_phase_deduplication():
     assert len([row for row in selected if row.get("phase_group_id") == "PH1"]) <= 1
 
 
+# ---------------------------------------------------------------------------
+# Review E-03 (2026-11-07): hard-fail reasons carry typed scopes so a defect
+# on one peptide/ORF/peptide-HLA pair cannot silence the clean sibling
+# peptides of the same event, while sample/event-scope failures still block
+# every candidate of the event.
+# ---------------------------------------------------------------------------
+
+
+def _e03_consensus_row(**overrides: str) -> dict:
+    row = {
+        "evidence_rank": "1", "peptide_id": "P1", "event_id": "E1", "gene": "GENE1",
+        "event_type": "SNV", "hla_allele": "HLA-A*02:01", "peptide": "SYFPEITHI",
+        "evidence_track": "SNV", "evidence_grade": "R1", "pareto_front": "1",
+        "evidence_rank_key": "1", "consensus_action": "advance",
+        "consensus_trace": "complete", "hard_failure": "no", "hard_failure_codes": "",
+        "manual_review_required": "no", "recommended_next_steps": "",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_e03_scope_taxonomy_defaults_unknown_codes_conservatively():
+    from neoag.hard_fail_scopes import HARD_FAIL_SCOPES, event_blocking_codes, hard_fail_scope, local_only_codes
+
+    assert hard_fail_scope("HARD_REFERENCE_PROTEOME_MATCH") == "PEPTIDE_SPECIFIC"
+    assert hard_fail_scope("HARD_RESTRICTING_HLA_LOST") == "PEPTIDE_HLA_SPEC"
+    assert hard_fail_scope("HARD_NON_MUTANT_SEQUENCE") == "ORF_SPECIFIC"
+    assert hard_fail_scope("SC_SAMPLE_IDENTITY_INVALID") == "SAMPLE_GLOBAL"
+    assert hard_fail_scope("SC_COORDINATE_OR_ALLELE_INVALID") == "EVENT_GLOBAL"
+    # A new hard-fail reason keeps blocking the whole event until it is typed
+    # deliberately: the taxonomy never loosens safety by omission.
+    assert hard_fail_scope("HARD_BRAND_NEW_REASON") == "EVENT_GLOBAL"
+    assert event_blocking_codes("hard_reference_proteome_match,SC_COORDINATE_OR_ALLELE_INVALID") == ["SC_COORDINATE_OR_ALLELE_INVALID"]
+    assert local_only_codes("HARD_REFERENCE_PROTEOME_MATCH,HARD_EVENT_ARTIFACT") == ["HARD_REFERENCE_PROTEOME_MATCH"]
+    # A failed binder prediction must not be a hard-fail reason at all: weak
+    # presentation caps the grade, it does not invalidate sibling peptides.
+    assert not [code for code in HARD_FAIL_SCOPES if "PREDICT" in code or "BINDER" in code or "PRESENTATION" in code]
+
+
+def test_e03_event_rollup_blocks_only_for_sample_or_event_scope_codes():
+    from neoag.evidence_consensus import _event_output
+
+    sibling_defect = _event_output(
+        [
+            _e03_consensus_row(),
+            _e03_consensus_row(
+                evidence_rank="2", peptide_id="P2", hla_allele="HLA-B*07:02",
+                evidence_grade="R4", hard_failure="yes",
+                hard_failure_codes="HARD_REFERENCE_PROTEOME_MATCH",
+            ),
+        ],
+        True,
+    )
+    assert len(sibling_defect) == 1
+    event = sibling_defect[0]
+    assert event["hard_failure_peptide_count"] == "1"
+    assert event["hard_failure_event_blocking"] == "no"
+    assert event["hard_failure_event_scope_codes"] == ""
+    assert event["hard_failure_peptide_local_codes"] == "HARD_REFERENCE_PROTEOME_MATCH"
+    assert event["hard_failure_event_block_basis"] == "PEPTIDE_LOCAL_ONLY"
+
+    invalid_identity = _event_output(
+        [
+            _e03_consensus_row(),
+            _e03_consensus_row(
+                evidence_rank="2", peptide_id="P2", evidence_grade="R4",
+                hard_failure="yes", hard_failure_codes="SC_COORDINATE_OR_ALLELE_INVALID",
+            ),
+        ],
+        True,
+    )[0]
+    assert invalid_identity["hard_failure_event_blocking"] == "yes"
+    assert invalid_identity["hard_failure_event_scope_codes"] == "SC_COORDINATE_OR_ALLELE_INVALID"
+    assert invalid_identity["hard_failure_event_block_basis"] == "EVENT_OR_SAMPLE_SCOPE_CODE"
+
+    every_peptide_defective = _event_output(
+        [
+            _e03_consensus_row(
+                evidence_grade="R4", hard_failure="yes",
+                hard_failure_codes="HARD_REFERENCE_PROTEOME_MATCH",
+            ),
+            _e03_consensus_row(
+                evidence_rank="2", peptide_id="P2", hla_allele="HLA-B*07:02",
+                evidence_grade="R4", hard_failure="yes",
+                hard_failure_codes="HARD_RESTRICTING_HLA_LOST",
+            ),
+        ],
+        True,
+    )[0]
+    # Local defects, but no clean candidate remains: the event is blocked
+    # after all, with the exhaustion basis stated explicitly.
+    assert every_peptide_defective["hard_failure_event_blocking"] == "yes"
+    assert every_peptide_defective["hard_failure_event_block_basis"] == "ALL_PEPTIDES_HARD_FAIL"
+
+
+def test_e03_review_keeps_event_for_clean_sibling_and_holds_local_defect():
+    events = [
+        {
+            "event_evidence_rank": "1", "event_group_id": "G1", "event_id": "E1",
+            "gene": "GENE1", "event_type": "SNV", "best_evidence_grade": "R1",
+            "representative_1_peptide_id": "P1",
+            "hard_failure_event_blocking": "no",
+            "hard_failure_peptide_local_codes": "HARD_REFERENCE_PROTEOME_MATCH",
+            "hard_failure_event_block_basis": "PEPTIDE_LOCAL_ONLY",
+        },
+        {
+            "event_evidence_rank": "2", "event_group_id": "G2", "event_id": "E2",
+            "gene": "GENE2", "event_type": "SNV", "best_evidence_grade": "R1",
+            "representative_1_peptide_id": "P2",
+            "hard_failure_event_blocking": "no",
+            "hard_failure_peptide_local_codes": "HARD_RESTRICTING_HLA_LOST",
+            "hard_failure_event_block_basis": "PEPTIDE_LOCAL_ONLY",
+        },
+        {
+            "event_evidence_rank": "3", "event_group_id": "G3", "event_id": "E3",
+            "gene": "GENE3", "event_type": "SNV", "best_evidence_grade": "R1",
+            "representative_1_peptide_id": "P3",
+            "hard_failure_event_blocking": "yes",
+            "hard_failure_event_scope_codes": "HARD_MATCHED_NORMAL_SUPPORT",
+            "hard_failure_event_block_basis": "EVENT_OR_SAMPLE_SCOPE_CODE",
+        },
+    ]
+    peptides = [
+        {"peptide_id": "P1", "rna_support_state": "RNA_CONFIRMED", "safety_state": "SAFETY_PASS",
+         "presentation_consensus_state": "PRESENTATION_CONSISTENT_STRONG"},
+        {"peptide_id": "P2", "rna_support_state": "RNA_CONFIRMED", "safety_state": "SAFETY_PASS",
+         "presentation_consensus_state": "PRESENTATION_CONSISTENT_STRONG",
+         "hard_failure": "yes", "hard_failure_codes": "HARD_RESTRICTING_HLA_LOST",
+         "hard_failure_scopes": "HARD_RESTRICTING_HLA_LOST:PEPTIDE_HLA_SPEC"},
+        {"peptide_id": "P3", "rna_support_state": "RNA_CONFIRMED", "safety_state": "SAFETY_PASS",
+         "presentation_consensus_state": "PRESENTATION_CONSISTENT_STRONG"},
+    ]
+    rows = build_review_rows(events, peptides, [])
+    clean, held, blocked = rows
+    # Clean representative: the sibling's peptide-scope defect is disclosed in
+    # the reason but does not block the event.
+    assert clean["review_status"] != "EXCLUDE_HARD_FAIL"
+    assert "EVENT_SIBLING_LOCAL_HARD_FAIL=HARD_REFERENCE_PROTEOME_MATCH" in clean["review_reason"]
+    # The representative itself carries the peptide-HLA-scope defect: it may
+    # not be promoted, yet the event is not hard-excluded.
+    assert held["review_status"] == "HOLD"
+    assert held["review_reason"].startswith("REVIEW_REPRESENTATIVE_LOCAL_HARD_FAIL")
+    assert held["hard_failure_scopes"] == "HARD_RESTRICTING_HLA_LOST:PEPTIDE_HLA_SPEC"
+    # A sample/event-scope failure still excludes the whole event.
+    assert blocked["review_status"] == "EXCLUDE_HARD_FAIL"
+    assert blocked["review_reason"] == "REVIEW_HARD_FAIL"
+    selected = select_first_batch(rows, 12)
+    # E1 advances normally; E2 may only appear through the single manual-
+    # review lane, never as an auto-promoted candidate; E3 never appears.
+    assert {row["event_id"]: row.get("selection_method", "") for row in selected} == {
+        "E1": "deterministic_grade_event_phase_redundancy_hla_type_diversity",
+        "E2": "single_manual_review_lane_not_auto_promoted",
+    }
+
+
+def test_e03_integrity_proves_scope_aware_hard_fail_gate(tmp_path: Path):
+    result_dir = tmp_path / "result"
+    _write_review_fixture(result_dir)
+    scoring = result_dir / "scoring"
+    header = (
+        "event_evidence_rank\tevent_group_id\tevent_id\tgene\tevent_type\tbest_evidence_grade\t"
+        "best_pareto_front\tmanual_review_required\trecommended_next_steps\tevent_consensus_trace\t"
+        "representative_1_peptide_id\trepresentative_1_peptide\trepresentative_1_hla_allele\t"
+        "hard_failure_peptide_count\thard_failure_event_blocking\t"
+        "hard_failure_event_scope_codes\thard_failure_peptide_local_codes\n"
+    )
+    sibling_local_row = (
+        "1\tEVENT:E1\tE1\tGENE1\tSNV\tR1\t1\tno\tMT/WT peptide assay\tcomplete\t"
+        "P1\tSYFPEITHI\tHLA-A*02:01\t1\tno\t\tHARD_REFERENCE_PROTEOME_MATCH\n"
+    )
+    artifacts = {
+        "run_manifest": str(scoring / "run_manifest.json"),
+        "consensus_events": str(scoring / "ranked_events.evidence_consensus.tsv"),
+        "consensus_peptides": str(scoring / "ranked_peptides.evidence_consensus.tsv"),
+        "weighted_baseline": str(scoring / "ranked_peptides.weighted_baseline.tsv"),
+        "all_tool_results": str(scoring / "all_tool_results.tsv"),
+        "validation_plan": str(scoring / "validation_plan.tsv"),
+    }
+
+    (scoring / "ranked_events.evidence_consensus.tsv").write_text(header + sibling_local_row, encoding="utf-8")
+    result = audit_review_inputs(artifacts, tmp_path / "audit-visible")
+    checks = {row["check"]: row for row in result["checks"]}
+    # The hard-failed sibling's own row was excluded upstream; promoting the
+    # clean event is legitimate and the non-blocking is provably visible.
+    assert checks["hard_fail_not_promoted"]["status"] == "PASS"
+    assert "promoted_events_with_sibling_local_hard_fail=1" in checks["hard_fail_not_promoted"]["detail"]
+
+    event_scope_row = sibling_local_row.replace(
+        "\tno\t\tHARD_REFERENCE_PROTEOME_MATCH",
+        "\tyes\tHARD_EVENT_ARTIFACT\tHARD_REFERENCE_PROTEOME_MATCH",
+    )
+    (scoring / "ranked_events.evidence_consensus.tsv").write_text(header + event_scope_row, encoding="utf-8")
+    result = audit_review_inputs(artifacts, tmp_path / "audit-blocked")
+    checks = {row["check"]: row for row in result["checks"]}
+    assert checks["hard_fail_not_promoted"]["status"] == "FAIL"
+    assert result["status"] == "BLOCKED"
+
+
 def test_open_neo_review_blocks_source_output_mutation(tmp_path: Path):
     result_dir = tmp_path / "result"
     _write_review_fixture(result_dir)

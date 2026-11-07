@@ -16,6 +16,7 @@ from .candidate_identity import IDENTITY_FIELDS, candidate_identity
 from .source_chain import derive_source_chain_confidence
 from .pareto import nondominated_fronts
 from .utils import read_tsv, write_tsv
+from .hard_fail_scopes import event_blocking_codes, local_only_codes, scopes_text
 from .vaccine_events import build_vaccine_event_tables
 
 
@@ -159,7 +160,7 @@ CONSENSUS_FIELDS = (
     "peptide_hla_rank", "peptide_hla_representative", "peptide_hla_duplicate_count",
     "peptide_hla_member_event_ids", "peptide_hla_member_protein_change_ids",
     "legacy_weighted_rank", "biological_event_track", "evidence_track", "pareto_dimensions",
-    "hard_failure", "hard_failure_codes", "hard_failure_reasons",
+    "hard_failure", "hard_failure_codes", "hard_failure_scopes", "hard_failure_reasons",
     "legacy_priority_cap", "consensus_priority_cap", "evidence_grade_cap", "evidence_grade_cap_reasons",
     "manual_review_required", "manual_review_reason",
     *STATE_OUTPUT_FIELDS, *STATE_REASON_CODE_FIELDS, *STATE_REASON_FIELDS,
@@ -785,6 +786,7 @@ def _normalized_row(
     row.update({
         "hard_failure": "yes" if hard else "no",
         "hard_failure_codes": ",".join(dict.fromkeys(hard_codes)),
+        "hard_failure_scopes": scopes_text(hard_codes),
         "hard_failure_reasons": ";".join(hard),
         "legacy_priority_cap": cap,
         "consensus_priority_cap": grade_cap,
@@ -854,7 +856,8 @@ def _normalized_row(
         "source_chain_requirement_statuses", "source_chain_requirement_details", "source_chain_integration_mode",
         "fusion_orf_gate_status", "fusion_candidate_pool", "fusion_orf_gate_reason_code",
         "fusion_orf_gate_grade",
-        "hard_failure", "hard_failure_codes", "hard_failure_reasons", "legacy_priority_cap", "consensus_priority_cap",
+        "hard_failure", "hard_failure_codes", "hard_failure_scopes", "hard_failure_reasons",
+        "legacy_priority_cap", "consensus_priority_cap",
         "evidence_grade_cap", "evidence_grade_cap_reasons",
         "manual_review_required", "manual_review_reason", "evidence_grade_uncapped",
         "evidence_grade", "evidence_consensus_score", "evidence_completeness_score",
@@ -1135,6 +1138,13 @@ def _event_output(peptides: list[dict[str, str]], deduplicate: bool) -> list[dic
             representatives = ordered[:1]
 
         best = representatives[0]
+        group_hard_codes = list(dict.fromkeys(
+            code.strip().upper()
+            for row in group
+            for code in str(row.get("hard_failure_codes", "")).replace(";", ",").split(",")
+            if code.strip()
+        ))
+        all_hard = bool(group) and all(row["hard_failure"] == "yes" for row in group)
         member_event_ids = sorted({_row_text(row, "event_id") for row in group if _row_text(row, "event_id")})
         phase_groups = sorted({_row_text(row, "phase_group_id", "haplotype_group_id") for row in group if _row_text(row, "phase_group_id", "haplotype_group_id")})
         event_row = {
@@ -1171,6 +1181,21 @@ def _event_output(peptides: list[dict[str, str]], deduplicate: bool) -> list[dic
             "representative_count": str(len(representatives)),
             "representative_selection_rule": "best per event_id+HLA; deduplicate redundancy_group; maximum 2 per event/phase group",
             "hard_failure_peptide_count": str(sum(row["hard_failure"] == "yes" for row in group)),
+            # Review E-03: hard-fail codes carry typed scopes so a defect in
+            # one peptide/ORF/peptide-HLA pair does not silently block clean
+            # sibling peptides, while sample- and event-scope failures still
+            # exclude the whole event.  The event is hard-blocking only when
+            # a sample/event-scope code is present or every peptide hard
+            # failed; peptide-local codes are disclosed without exclusion.
+            "hard_failure_event_scope_codes": ",".join(event_blocking_codes(group_hard_codes)),
+            "hard_failure_peptide_local_codes": ",".join(local_only_codes(group_hard_codes)),
+            "hard_failure_event_blocking": "yes" if (event_blocking_codes(group_hard_codes) or all_hard) else "no",
+            "hard_failure_event_block_basis": (
+                "EVENT_OR_SAMPLE_SCOPE_CODE" if event_blocking_codes(group_hard_codes)
+                else "ALL_PEPTIDES_HARD_FAIL" if all_hard
+                else "PEPTIDE_LOCAL_ONLY" if local_only_codes(group_hard_codes)
+                else "NONE"
+            ),
             "manual_review_required": "yes" if any(row["manual_review_required"] == "yes" for row in group) else "no",
             "consensus_action": best["consensus_action"],
             "recommended_next_steps": best["recommended_next_steps"],
