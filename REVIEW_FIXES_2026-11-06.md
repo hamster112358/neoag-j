@@ -181,13 +181,14 @@ Fix: metrics are read at the ALT index the picked CSQ entry describes.
 Test: asymmetric AD fixture - the ALT[1] peptide must carry the ALT[1]
 numbers.
 
-**B2-03 - stop_gained variants produced invented junction peptides.**
-Problem: a nonsense variant was given synthetic "junction" peptides that no
-translation mechanism produces.
-Fix: a pure stop_gained stays peptide-negative (no invented peptides - the
-review explicitly rejected a generic truncation-junction source), but is now
-counted in variants_no_peptides_by_consequence so the funnel explains where
-it went.
+**B2-03 - stop_gained variants emitted WT-identical windows, invisible to the funnel.**
+Problem: the truncation-edge path returned the WT prefix (wt[:pos0]) as the
+"mutant" window, so a pure stop_gained emitted a window identical to WT -
+no novel sequence, but a non-zero emission, and the consequence-level funnel
+had no accounting for these variants at all.
+Fix: a pure stop_gained stays peptide-negative (no invented truncation-
+junction source - the review explicitly rejected one), and is now counted in
+variants_no_peptides_by_consequence so the funnel explains where it went.
 Test: peptide count zero for stop_gained, counter incremented.
 
 **B2-04 - tumor sample guessed as column 10.**
@@ -217,12 +218,15 @@ variant_peptide_pass_only (default unchanged = PASS-only, so no behaviour
 change by default).
 Test: counts present even with pass_only on; knob flips retention.
 
-**B2-07 - dead sort constant; ties order-dependent.**
+**B2-07 - dead sort constant; ties fell through to input order.**
 Problem: the CSQ sort key carried a constant third element (dead code) and
-tied entries had no defined order.
-Fix: dead constant removed; ties keep CSQ order, making the pick
-deterministic.
-Test: shuffled-but-tied CSQ input yields the same pick.
+tied entries had no key of their own beyond entry position.
+Fix: dead constant removed; the rank is a two-slot tuple (MANE, CANONICAL)
+and ties keep CSQ entry order through a stable sort - deterministic for a
+fixed VCF, with the input-order dependence documented at the sort site.
+Test: rank tuple has two slots; equal-key entries in fixed CSQ order pick the
+first entry (no shuffle is asserted - reordering the input is accepted to
+reorder the pick).
 
 **B1-04 - the pipeline trusted that a plugin run added the WT column.**
 Problem: after running pvactools with the WT-protein plugin, the code assumed
@@ -406,10 +410,11 @@ absence can never be rendered as a measured zero.
 Test: SVRecord fixtures with each key family parse; a sample without FORMAT
 gets FORMAT_ABSENT, not zero (22-test file).
 
-**B4-06 - FILTER="." (no decision made) treated like PASS.**
+**B4-06 - FILTER="." (no decision made) was silently dropped.**
 Problem: a VCF record whose FILTER field is "." records that no filter
-decision was made; the pipeline let those through with no record, mixing
-unfiltered calls into the filtered pool invisibly.
+decision was made; under the default PASS-only policy those records were
+dropped with no record at all - the funnel showed neither how many nor that
+a "no-decision" class existed.
 Fix: FILTER="." records are excluded by default but written to a ledger
 (parsed/sv_vcf_filter_exclusions.tsv, written every run) with reason
 EXCLUDED_FILTER_NOT_ASSESSED, and kept when unfiltered_policy=include;
@@ -1431,12 +1436,25 @@ E-09 deferred - compound ("track each subissue separately"):
 Full pytest after every work package (command:
 PYTHONPATH=src python -m pytest from the dev tree). Where the package commit
 message recorded the totals: A 962, B 968, C 980, F 1048, G-f 1208 passed;
-intermediate packages each ran the full suite green as well. Known failures
-throughout: exactly the three pre-existing environment-dependent tests
-(test_candidate_identity.py::
-test_four_level_identity_keeps_events_but_collapses_same_peptide_hla,
-test_easyquant_wrapper, test_tools_env_config) - present before the campaign
-started, unrelated to any package, unchanged after.
+intermediate packages each ran the full suite green apart from these three.
+Known failures throughout: exactly the same three tests, all pre-existing and
+untouched by the campaign (verified: identical tracebacks at the pre-campaign
+baseline 0dc5391^ and at HEAD). Two are environment-dependent:
+test_easyquant_wrapper runs scripts/run_easyquant_sample.sh against bp_quant
+and dies with exit 3 on this host's wrapper/binary state;
+test_tools_env_config fails in the working tree only because the uncommitted
+deployment edit to conf/tools.env.sh redirects NEOAG_PROJECT_ROOT to the
+deployed tree (it passes in a clean worktree of the same commit). The third,
+test_candidate_identity.py::
+test_four_level_identity_keeps_events_but_collapses_same_peptide_hla, is
+deterministic, not environmental: the August fixture (05e7b34) expects the
+patient-report representative to collapse two fusion rows by normalized
+peptide-HLA identity, but a later pre-campaign redesign of
+_patient_display_candidate_key (7474afc, 4a22add) keys Fusion display rows by
+the :: gene pair precisely to avoid collapsing technical events, and the
+minimal fixture has no gene field so both rows fall through to distinct
+event-ID keys. Production fusion rows carry gene pairs and do collapse.
+The campaign diff never touches either function.
 
 Baseline before the campaign: 954 passed / 119 skipped / 3 known.
 Final after G-f: 1208 passed / 119 skipped / 3 known.
