@@ -22,6 +22,7 @@ from .adapters.peptide_input import normalize_hla_allele
 PEPTIDE_SAFETY_FIELDS = [
     'peptide_id','event_id','sample_id','event_type','mutation_source','peptide_consequence','gene',
     'peptide','hla_allele','mhc_class','matched_normal_status','normal_alt_reads','normal_vaf','tumor_only_flag',
+    'normal_support_evidence_basis','normal_support_integrity','safety_decision_basis',
     'reference_proteome_exact_match','reference_proteome_match_type','reference_match_gene','reference_match_protein',
     'reference_match_position','reference_match_length','normal_hla_ligand_exact_match','normal_ligand_tissue',
     'normal_ligand_hla','normal_ligand_source_protein','normal_ligand_class','normal_tissue_max_tpm',
@@ -278,6 +279,20 @@ def _normal_junction_kind(
     return 'not_applicable'
 
 
+_JUNCTION_COORD_KEY_RE = re.compile(r'^(chr[0-9A-Za-z]+:\d+-\d+)(?::([+?.-]))?$')
+
+
+def _junction_row_strand(row: Mapping[str, Any]) -> str:
+    """Strand of a normal-junction row: explicit column, then an embedded
+    :+ / :- suffix in the junction identifier (review B3b-08)."""
+    strand = str(first(row, ['strand', 'junction_strand'], '') or '').strip()
+    if strand in {'+', '-'}:
+        return strand
+    embedded = str(first(row, ['junction_id', 'event_id'], '') or '')
+    m = re.search(r':([+-])(?::|$)', embedded)
+    return m.group(1) if m else ''
+
+
 def _candidate_junction_keys(
     peptide: Mapping[str, Any],
     event: Mapping[str, Any],
@@ -394,15 +409,97 @@ def _find_normal_ligand(
     return exact[0]
 
 
-def _event_normal_support(event: Mapping[str, Any]) -> tuple[bool, str, str, str]:
-    has_evidence = any(str(event.get(key, '')).strip() for key in ('normal_alt_count','normal_alt_support','normal_vaf','normal_depth'))
-    if not has_evidence:
-        return False, '', '', 'not_assessed'
-    n_alt = to_float(event.get('normal_alt_count') or event.get('normal_alt_support'), 0.0)
-    n_vaf = to_float(event.get('normal_vaf'), 0.0)
-    if n_alt >= 3 and (n_vaf >= 0.02 or n_vaf == 0.0):
-        return True, str(int(n_alt)), f'{n_vaf:.4f}', 'normal_alt_support'
-    return False, str(int(n_alt)), f'{n_vaf:.4f}', 'no_clear_normal_support'
+def _event_normal_support(
+    event: Mapping[str, Any],
+    cfg: Mapping[str, Any] | None = None,
+) -> tuple[bool, str, str, str, bool, str, str]:
+    """Classify matched-normal ALT evidence (review C6-04, round 3).
+
+    The old reader coerced a MISSING normal VAF to 0.0, so an ALT-positive
+    record with no VAF was automatically classified as normal-positive, and
+    a thin normal depth read as a measured normal-negative.  Missing,
+    measured, thin and contradictory inputs are now distinct states:
+
+    - not_assessed               no normal evidence column is present at all
+    - normal_alt_support         reliable matched-normal support: ALT reads at
+                                 or above the read threshold with a reported
+                                 or explicitly recalculated VAF at or above
+                                 the VAF threshold (same allele's counts)
+    - NORMAL_SUPPORT_REVIEW      ALT-positive record whose VAF is not
+                                 available and cannot be recalculated, or
+                                 whose measured VAF contradicts the read
+                                 count (>= threshold reads, sub-threshold
+                                 VAF) - neither a normal negative nor a
+                                 confirmed normal positive until validated
+    - NORMAL_VAF_CONTRADICTION   reported VAF and counts cannot both be true
+                                 (explicit integrity warning, never resolved
+                                 silently in either direction)
+    - NORMAL_COVERAGE_INADEQUATE normal depth present but below the minimum:
+                                 no claim either way (missing evidence is not
+                                 a measured negative)
+    - no_clear_normal_support    measured and below the positive threshold
+
+    Returns (support, alt, vaf, status, review, integrity, evidence_basis).
+    """
+    cfg = cfg or {}
+    alt_raw = str(event.get('normal_alt_count') or event.get('normal_alt_support') or '').strip()
+    depth_raw = str(event.get('normal_depth') or '').strip()
+    vaf_raw = str(event.get('normal_vaf') or event.get('normal_alt_vaf') or '').strip()
+    if not (alt_raw or depth_raw or vaf_raw):
+        return False, '', '', 'not_assessed', False, '', 'NO_NORMAL_EVIDENCE_COLUMNS'
+    n_alt = to_float(alt_raw, 0.0) if alt_raw else None
+    depth = to_float(depth_raw, 0.0) if depth_raw else None
+    vaf = to_float(vaf_raw, 0.0) if vaf_raw else None
+    pos_reads = float(cfg.get('normal_alt_positive_reads', 3))
+    pos_vaf = float(cfg.get('normal_vaf_positive', 0.02))
+    min_depth = float(cfg.get('normal_support_min_depth', 10))
+    alt_str = str(int(n_alt)) if n_alt is not None else ''
+    basis_parts = ['REPORTED' if vaf_raw else 'VAF_UNAVAILABLE']
+    integrity = ''
+    recalculated = False
+    if vaf is None and n_alt is not None and depth is not None and depth > 0:
+        # Explicit recalculation from the same allele's counts and depth.
+        vaf = n_alt / depth
+        basis_parts = [f'VAF_RECALCULATED_ALT{int(n_alt)}_DEPTH{int(depth)}']
+        recalculated = True
+    # Contradiction detection between reported counts and VAF (the VAF was
+    # reported, not recalculated here, so any disagreement is the data's).
+    if not recalculated and vaf is not None and n_alt is not None and depth is not None and depth > 0:
+        recomputed = n_alt / depth
+        gap = abs(recomputed - vaf)
+        if gap > 0.1 and gap > 0.5 * max(recomputed, vaf):
+            integrity = (
+                f'normal_vaf_contradiction: reported VAF {vaf:.4f} is incompatible with '
+                f'{int(n_alt)} ALT reads at depth {int(depth)} (recalculated {recomputed:.4f})'
+            )
+    if not integrity and vaf is not None and vaf >= pos_vaf and (n_alt or 0) <= 0:
+        integrity = (
+            f'normal_vaf_contradiction: reported VAF {vaf:.4f} with zero normal ALT reads'
+        )
+    status = ''
+    review = False
+    support = False
+    if integrity:
+        status = 'NORMAL_VAF_CONTRADICTION'
+        review = True
+    elif (n_alt or 0) >= pos_reads:
+        if vaf is not None and vaf >= pos_vaf:
+            support = True
+            status = 'normal_alt_support'
+        else:
+            # Positive ALT reads with an unavailable or sub-threshold VAF:
+            # needs validation; never auto-pass and never auto-reject.
+            status = 'NORMAL_SUPPORT_REVIEW'
+            review = True
+    elif (n_alt or 0) > 0 and vaf is None:
+        status = 'NORMAL_SUPPORT_REVIEW'
+        review = True
+    elif depth is not None and depth < min_depth:
+        status = 'NORMAL_COVERAGE_INADEQUATE'
+    else:
+        status = 'no_clear_normal_support'
+    vaf_str = f'{vaf:.4f}' if vaf is not None else ''
+    return support, alt_str, vaf_str, status, review, integrity, ';'.join(basis_parts)
 
 
 def _anchor_only(peptide: str, wt_peptide: str, hla: str) -> tuple[str, str, str]:
@@ -475,16 +572,29 @@ def build_peptide_safety_gate(
     # is context, not proof of the candidate's exact junction. "reject" (the
     # default) keeps the historical production behavior but labels the match
     # level honestly; "review" caps gene-pair-only matches at CAUTION/review.
-    gene_pair_action = str(safety_cfg.get('normal_junction_gene_pair_only_action','reject')).lower()
+    # Review C6-03 (round 3, FURTHER_SUGGESTIONS WS8): the operator decision
+    # makes review-level context the DEFAULT - a recurrent normal fusion of
+    # the same gene pair at a different breakpoint does not prove THIS
+    # candidate's peptide exists in normal tissue.  "reject" remains available
+    # as an explicit conservative override.
+    gene_pair_action = str(safety_cfg.get('normal_junction_gene_pair_only_action','review')).lower()
     rows=[]; event_rows=[]
     for p in peptides:
         e = events.get(p.get('event_id',''), {})
         peptide = (p.get('peptide') or '').upper().strip()
         hla = p.get('hla_allele','')
         reasons=[]; status='SAFETY_PASS'; review='no'
-        normal_support, normal_alt, normal_vaf, normal_status = _event_normal_support(e)
+        normal_support, normal_alt, normal_vaf, normal_status, normal_review, normal_integrity, normal_basis = _event_normal_support(e, safety_cfg)
         if normal_support:
             status='SAFETY_REJECT'; reasons.append('matched_normal_support')
+        elif normal_review:
+            # Review C6-04: ALT-positive / VAF-unavailable (or contradictory)
+            # normal evidence goes to review, not to a silent pass or a
+            # confirmed normal-positive call.
+            if status == 'SAFETY_PASS': status='SAFETY_REVIEW'
+            reasons.append('matched_normal_support_review')
+            if normal_integrity:
+                reasons.append('normal_vaf_integrity_conflict')
         ref_hits = ref_idx.get(peptide, []) if peptide else []
         if ref_hits and ref_reject:
             status='SAFETY_REJECT'; reasons.append('reference_proteome_exact_match')
@@ -501,11 +611,40 @@ def build_peptide_safety_gate(
         candidate_junction_keys = _candidate_junction_keys(p, e)
         jrow = None
         junction_match_level = ''
+        # Review B3b-08: a verified normal-junction match requires the full
+        # strand-aware key.  The candidate's strand is resolved when its own
+        # annotation (junction identifier suffix, transcript/exon structure
+        # upstream, or an explicit strand column) states it uniquely; an
+        # unresolved strand never earns an exact match, in either direction.
+        cand_strands = {
+            m.group(2) for key in candidate_junction_keys
+            if (m := _JUNCTION_COORD_KEY_RE.fullmatch(key)) and m.group(2) in {'+', '-'}
+        }
+        cand_strand = next(iter(cand_strands)) if len(cand_strands) == 1 else ''
         for key in candidate_junction_keys:
-            if junctions.get(key):
-                jrow = junctions[key]
+            hit = junctions.get(key)
+            if not hit:
+                continue
+            coord = _JUNCTION_COORD_KEY_RE.fullmatch(key)
+            if coord is None:
+                # Non-coordinate key (junction/fusion identifier or gene-pair
+                # string): the identifier itself matched exactly.
+                jrow = hit
                 junction_match_level = 'EXACT_NORMAL_JUNCTION_MATCH'
                 break
+            normal_strand = _junction_row_strand(hit) or (coord.group(2) if coord.group(2) in {'+', '-'} else '')
+            if cand_strand and normal_strand in {'+', '-'} and normal_strand != cand_strand:
+                # Both strands resolved and OPPOSITE: coordinates equal is not
+                # this junction. Not even a possible match.
+                continue
+            if cand_strand and normal_strand == cand_strand:
+                jrow = hit
+                junction_match_level = 'EXACT_NORMAL_JUNCTION_MATCH'
+                break
+            # Coordinates match with a strand unknown on at least one side.
+            jrow = hit
+            junction_match_level = 'POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS'
+            break
         if not jrow and gene_pair and junctions.get(gene_pair):
             # Review C6-03: keyed only by the gene pair, this normal junction
             # cannot prove the candidate's specific breakpoint occurs in
@@ -523,7 +662,14 @@ def build_peptide_safety_gate(
         if jrow and is_junction_type:
             max_reads = to_float(first(jrow, ['normal_reads','normal_sample_count','junction_reads','reads'], '0'), 0.0)
             gene_pair_only = junction_match_level == 'GENE_PAIR_ONLY_CONTEXT'
-            if gene_pair_only and gene_pair_action == 'review':
+            strand_ambiguous = junction_match_level == 'POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS'
+            if strand_ambiguous:
+                # Review B3b-08: an unresolved strand makes the match neither
+                # an exact positive nor a definitive negative - review level,
+                # no matter how many reads the catalog row carries.
+                if status == 'SAFETY_PASS': status='SAFETY_REVIEW'
+                reasons.append('possible_normal_junction_strand_ambiguous')
+            elif gene_pair_only and gene_pair_action == 'review':
                 if status == 'SAFETY_PASS': status='SAFETY_REVIEW'
                 reasons.append('gene_pair_only_normal_junction_context')
             elif max_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
@@ -537,9 +683,21 @@ def build_peptide_safety_gate(
         wt_rank = to_float(p.get('wildtype_binding_rank') or p.get('netmhcpan_wt_rank_el') or p.get('netmhcpan_wt_rank_ba'), 99.0)
         mt_rank = to_float(p.get('netmhcpan_el_rank') or p.get('netmhcpan_mt_rank_el') or p.get('binding_rank'), 99.0)
         anchor_only, mut_pos, anchor_status = _anchor_only(peptide, p.get('wildtype_peptide',''), hla)
-        if anchor_only == 'yes' and wt_rank <= float(safety_cfg.get('wildtype_strong_binding_rank', 0.5)):
-            if status == 'SAFETY_PASS': status='SAFETY_REVIEW'
+        anchor_heuristic_hit = anchor_only == 'yes' and wt_rank <= float(safety_cfg.get('wildtype_strong_binding_rank', 0.5))
+        if anchor_heuristic_hit:
+            # Review C6-05: the position-2/C-terminal rule is an approximate
+            # cross-allele heuristic, not an allele-specific structural or
+            # functional validation.  It stays a caution signal by default;
+            # only an explicit, separately justified profile knob may let it
+            # alone drive a hard rejection, and "record_only" keeps it purely
+            # documentary.
+            anchor_action = str(safety_cfg.get('anchor_only_action', 'review')).lower()
             reasons.append('anchor_only_mutation_with_wt_binding')
+            if anchor_action == 'reject':
+                status = 'SAFETY_REJECT'
+                reasons.append('anchor_only_reject_explicitly_enabled')
+            elif anchor_action != 'record_only' and status == 'SAFETY_PASS':
+                status = 'SAFETY_REVIEW'
         sim_raw = str(p.get('self_similarity_score') or '').strip()
         sim = to_float(sim_raw, 0.0)
         similarity_cutoff = float(safety_cfg.get('self_similarity_high_risk', safety_cfg.get('self_similarity_caution', 0.85)))
@@ -598,11 +756,30 @@ def build_peptide_safety_gate(
             'normal_hla_ligand_overlap', 'normal_junction_seen',
             'low_level_normal_junction_seen', 'high_self_similarity_critical_tissue',
             'matched_normal_support',
+            # Review C6-04: review/constraint calls that rest on directly
+            # counted normal evidence.
+            'matched_normal_support_review',
+            'normal_vaf_integrity_conflict',
             # Review C6-03 labels for gene-pair-only matches.
             'normal_junction_seen_gene_pair_only',
             'low_level_normal_junction_gene_pair_only',
             'gene_pair_only_normal_junction_context',
+            # Review B3b-08: coordinate-direct match with unresolved strand.
+            'possible_normal_junction_strand_ambiguous',
         }
+        # Review C6-05 (round 3): every decision names its epistemic basis -
+        # direct molecular evidence, an approximation (heuristic), or neither.
+        heuristic_reason_tokens = {
+            'anchor_only_mutation_with_wt_binding', 'anchor_only_reject_explicitly_enabled',
+        }
+        if any(reason in direct_reason_tokens for reason in reasons):
+            safety_decision_basis = 'DIRECT_ASSESSED_EVIDENCE'
+        elif any(reason in heuristic_reason_tokens for reason in reasons):
+            safety_decision_basis = 'HEURISTIC_ONLY'
+        elif missing:
+            safety_decision_basis = 'EVIDENCE_COMPLETENESS_ONLY'
+        else:
+            safety_decision_basis = 'NO_SAFETY_SIGNAL'
         if status == 'SAFETY_REJECT':
             final_safety_conclusion = 'REJECT_DIRECT_SAFETY_EVIDENCE'
         elif any(reason in direct_reason_tokens for reason in reasons):
@@ -617,6 +794,12 @@ def build_peptide_safety_gate(
             'peptide_consequence': p.get('peptide_consequence',''), 'gene': p.get('gene',''), 'peptide': peptide,
             'hla_allele': hla, 'mhc_class': p.get('mhc_class',''), 'matched_normal_status': normal_status,
             'normal_alt_reads': normal_alt, 'normal_vaf': normal_vaf, 'tumor_only_flag': 'yes' if not e else 'no',
+            # Review C6-04: how the normal VAF was obtained (reported vs
+            # recalculated from the same allele's counts) and any integrity
+            # conflict; review C6-05: direct-vs-heuristic decision basis.
+            'normal_support_evidence_basis': normal_basis,
+            'normal_support_integrity': normal_integrity,
+            'safety_decision_basis': safety_decision_basis,
             'reference_proteome_exact_match': 'yes' if ref_hits else 'no' if ref_assessed else 'not_assessed',
             'reference_proteome_match_type': 'exact' if ref_hits else '',
             'reference_match_gene': '', 'reference_match_protein': ref_hits[0][0] if ref_hits else '',
@@ -654,8 +837,14 @@ def build_peptide_safety_gate(
             'safety_evidence_completeness': f'{completeness:.4f}', 'safety_missing_layers': ';'.join(missing),
             'safety_priority_cap': str(safety_cfg.get('partial_priority_cap','C_CAUTION')) if missing else '',
             'normal_proteome_exact_match_status': 'DETECTED' if ref_hits else 'NOT_DETECTED' if ref_assessed else 'UNASSESSED',
+            # Review WS8: DETECTED now means EXACT strand-aware detection
+            # only.  Gene-pair context and strand-ambiguous coordinate hits
+            # keep their own vocabulary so no downstream consumer can read a
+            # contextual signal as exact junction detection.
             'normal_transcript_junction_match_status': (
-                'DETECTED' if jrow and is_junction_type else
+                'DETECTED' if jrow and is_junction_type and junction_match_level == 'EXACT_NORMAL_JUNCTION_MATCH' else
+                'POSSIBLE_STRAND_AMBIGUOUS' if jrow and is_junction_type and junction_match_level == 'POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS' else
+                'GENE_PAIR_CONTEXT_NOT_EXACT' if jrow and is_junction_type else
                 'NOT_DETECTED' if junction_assessed else
                 'NOT_APPLICABLE' if not is_junction_type else 'UNASSESSED'
             ),
@@ -692,24 +881,48 @@ def build_peptide_safety_gate(
         if matched_normal:
             worst = worst_safety_status(worst, 'FAIL')
             reasons.append('matched_normal_support')
+        elif any(
+            r.get('matched_normal_status') in {'NORMAL_SUPPORT_REVIEW', 'NORMAL_VAF_CONTRADICTION'}
+            for r in rs
+        ):
+            # Review C6-04: the event inherits the review, not the rejection.
+            worst = worst_safety_status(worst, 'CAUTION')
+            reasons.append('matched_normal_support_review')
         junction_rows = [r for r in rs if r.get('normal_junction_seen') == 'yes']
-        # Review C6-03: the rollup keeps the strongest match level seen.
+        # Review C6-03/B3b-08: the rollup treats each match LEVEL by its own
+        # evidence strength - exact strand-aware reads can reject, while
+        # gene-pair context and strand-ambiguous coordinate hits stay at
+        # review unless the operator explicitly keeps the old reject policy.
         exact_junction_rows = [
             r for r in junction_rows
             if r.get('normal_junction_match_level') == 'EXACT_NORMAL_JUNCTION_MATCH'
         ]
-        if junction_rows:
-            max_normal_junction_reads = max(to_float(r.get('normal_junction_max_reads'), 0.0) for r in junction_rows)
-            demoted = gene_pair_action == 'review' and not exact_junction_rows
-            if demoted:
-                worst = worst_safety_status(worst, 'CAUTION')
-                reasons.append('gene_pair_only_normal_junction_context')
-            elif max_normal_junction_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
+        ambiguous_junction_rows = [
+            r for r in junction_rows
+            if r.get('normal_junction_match_level') == 'POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS'
+        ]
+        gene_pair_junction_rows = [
+            r for r in junction_rows
+            if r.get('normal_junction_match_level') == 'GENE_PAIR_ONLY_CONTEXT'
+        ]
+        if exact_junction_rows:
+            max_exact_reads = max(to_float(r.get('normal_junction_max_reads'), 0.0) for r in exact_junction_rows)
+            if max_exact_reads >= float(safety_cfg.get('normal_junction_reject_reads', 3)):
                 worst = worst_safety_status(worst, 'FAIL')
                 reasons.append('normal_junction_seen')
             else:
                 worst = worst_safety_status(worst, 'CAUTION')
                 reasons.append('low_level_normal_junction_seen')
+        if gene_pair_junction_rows:
+            if gene_pair_action == 'reject':
+                worst = worst_safety_status(worst, 'FAIL')
+                reasons.append('normal_junction_seen_gene_pair_only')
+            else:
+                worst = worst_safety_status(worst, 'CAUTION')
+                reasons.append('gene_pair_only_normal_junction_context')
+        if ambiguous_junction_rows:
+            worst = worst_safety_status(worst, 'CAUTION')
+            reasons.append('possible_normal_junction_strand_ambiguous')
         missing_layers = sorted({layer for r in rs for layer in r.get('safety_missing_layers','').split(';') if layer})
         event_rows.append({
             'event_id': eid, 'sample_id': e.get('sample_id',''), 'gene': e.get('gene',''), 'event_type': e.get('event_type',''),
@@ -717,6 +930,7 @@ def build_peptide_safety_gate(
             'normal_junction_status': rs[0].get('normal_junction_assessment_status','UNASSESSED'),
             'normal_junction_match_level': (
                 'EXACT_NORMAL_JUNCTION_MATCH' if exact_junction_rows
+                else 'POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS' if ambiguous_junction_rows
                 else 'GENE_PAIR_ONLY_CONTEXT' if junction_rows else ''
             ),
             'matched_normal_status': 'normal_alt_support' if matched_normal else rs[0].get('matched_normal_status',''),

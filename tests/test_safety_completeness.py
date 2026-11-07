@@ -178,7 +178,25 @@ def test_ctat_normal_fusion_pair_matches_double_dash_catalog(tmp_path):
     assert rows[0]["normal_junction_assessment_status"] == "ASSESSED"
     assert rows[0]["normal_junction_seen"] == "yes"
     assert rows[0]["normal_junction_max_reads"] == "4"
-    assert rows[0]["safety_status"] == "FAIL"
+    # Round-3 operator decision (FURTHER_SUGGESTIONS WS8): a recurrent normal
+    # fusion of the same gene pair is CONTEXT, not proof that THIS candidate's
+    # breakpoint exists in normal tissue - review-level by default, and the
+    # exact-detection field stays honest about it.
+    assert rows[0]["normal_junction_match_level"] == "GENE_PAIR_ONLY_CONTEXT"
+    assert rows[0]["safety_status"] == "CAUTION"
+    assert "gene_pair_only_normal_junction_context" in rows[0]["safety_reason"]
+    assert rows[0]["normal_transcript_junction_match_status"] == "GENE_PAIR_CONTEXT_NOT_EXACT"
+
+    # The conservative override remains available and is explicit.
+    rows_reject, _ = build_peptide_safety_gate(
+        raw_events=events,
+        raw_peptides=peptides,
+        out_peptide_safety=tmp_path / "peptide_safety_reject.tsv",
+        profile={"safety": {"normal_junction_gene_pair_only_action": "reject"}},
+        normal_junctions=junctions,
+    )
+    assert rows_reject[0]["safety_status"] == "FAIL"
+    assert "normal_junction_seen_gene_pair_only" in rows_reject[0]["safety_reason"]
 
 
 def test_fusion_catalog_does_not_mark_splice_junction_assessed(tmp_path):
@@ -381,16 +399,19 @@ def test_c6_03_gene_pair_only_normal_junction_is_labelled_as_context(tmp_path):
         profile=load_profile("default"),
         normal_junctions=junctions,
     )
-    assert rows[0]["safety_status"] == "FAIL"
-    assert "normal_junction_seen_gene_pair_only" in rows[0]["safety_reason"]
+    # Round-3 (FURTHER_SUGGESTIONS WS8): review-level context is the DEFAULT.
+    assert rows[0]["safety_status"] == "CAUTION"
+    assert "gene_pair_only_normal_junction_context" in rows[0]["safety_reason"]
     assert rows[0]["normal_junction_match_level"] == "GENE_PAIR_ONLY_CONTEXT"
     assert event_rows[0]["normal_junction_match_level"] == "GENE_PAIR_ONLY_CONTEXT"
+    assert event_rows[0]["event_safety_status"] != "FAIL"
+    # Gene-pair context must never read as exact junction detection.
+    assert rows[0]["normal_transcript_junction_match_status"] == "GENE_PAIR_CONTEXT_NOT_EXACT"
 
-    # The knob: "review" caps gene-pair-only context at review/CAUTION
-    # instead of a hard reject - the choice is explicit, not silent.
+    # The explicit conservative override restores the old reject policy.
     profile = dict(load_profile("default"))
     safety = dict(profile.get("safety", {}))
-    safety["normal_junction_gene_pair_only_action"] = "review"
+    safety["normal_junction_gene_pair_only_action"] = "reject"
     profile["safety"] = safety
     rows2, event_rows2 = build_peptide_safety_gate(
         raw_events=events,
@@ -400,21 +421,20 @@ def test_c6_03_gene_pair_only_normal_junction_is_labelled_as_context(tmp_path):
         profile=profile,
         normal_junctions=junctions,
     )
-    assert rows2[0]["safety_status"] == "CAUTION"
-    assert "gene_pair_only_normal_junction_context" in rows2[0]["safety_reason"]
-    assert event_rows2[0]["event_safety_status"] != "FAIL"
+    assert rows2[0]["safety_status"] == "FAIL"
+    assert "normal_junction_seen_gene_pair_only" in rows2[0]["safety_reason"]
+    assert event_rows2[0]["event_safety_status"] == "FAIL"
 
 
-def test_c6_03_exact_coordinate_match_keeps_its_own_level(tmp_path):
-    # The honest split only matters if the exact match keeps its own label:
-    # with matching coordinates the level is EXACT_NORMAL_JUNCTION_MATCH and
-    # the plain reject reason applies under both knob settings.
-    events = tmp_path / "x_events.tsv"
-    peptides = tmp_path / "x_peptides.tsv"
+def _coord_junction_case(tmp_path, name, cand_strand, normal_strand):
+    events = tmp_path / f"x_events_{name}.tsv"
+    peptides = tmp_path / f"x_peptides_{name}.tsv"
+    junctions = tmp_path / f"x_junctions_{name}.tsv"
     write_tsv(events, [{
         "event_id": "E1", "sample_id": "S1", "event_type": "Fusion",
         "mutation_source": "SV", "gene": "GENE1::GENE2",
         "chrom": "chr1", "junction_start": "100", "junction_end": "200",
+        **({"strand": cand_strand} if cand_strand else {}),
     }])
     write_tsv(peptides, [{
         "peptide_id": "P1", "event_id": "E1", "sample_id": "S1",
@@ -422,21 +442,205 @@ def test_c6_03_exact_coordinate_match_keeps_its_own_level(tmp_path):
         "peptide": "ABCDEFGHIJK", "hla_allele": "HLA-A*02:01", "mhc_class": "I",
         "binding_rank": "0.2", "el_rank": "0.2",
     }])
-    junctions = tmp_path / "x_junctions.tsv"
     write_tsv(junctions, [{
         "chromosome": "chr1", "junction_start": "100", "junction_end": "200",
         "normal_reads": "9",
+        **({"strand": normal_strand} if normal_strand else {}),
     }])
     rows, event_rows = build_peptide_safety_gate(
         raw_events=events,
         raw_peptides=peptides,
-        out_peptide_safety=tmp_path / "x_peptide_safety.tsv",
-        out_event_safety=tmp_path / "x_event_safety.tsv",
+        out_peptide_safety=tmp_path / f"x_ps_{name}.tsv",
+        out_event_safety=tmp_path / f"x_es_{name}.tsv",
         profile=load_profile("default"),
         normal_junctions=junctions,
     )
-    assert rows[0]["safety_status"] == "FAIL"
-    assert rows[0]["normal_junction_match_level"] == "EXACT_NORMAL_JUNCTION_MATCH"
-    assert "normal_junction_seen" in rows[0]["safety_reason"]
-    assert "normal_junction_seen_gene_pair_only" not in rows[0]["safety_reason"]
-    assert event_rows[0]["normal_junction_match_level"] == "EXACT_NORMAL_JUNCTION_MATCH"
+    return rows[0], event_rows[0]
+
+
+def test_c6_03_exact_coordinate_match_keeps_its_own_level(tmp_path):
+    # The honest split only matters if the exact match keeps its own label:
+    # with matching coordinates AND a strand-aware match the level is
+    # EXACT_NORMAL_JUNCTION_MATCH and the plain reject reason still applies.
+    row, event_row = _coord_junction_case(tmp_path, "exact", "+", "+")
+    assert row["safety_status"] == "FAIL"
+    assert row["normal_junction_match_level"] == "EXACT_NORMAL_JUNCTION_MATCH"
+    assert "normal_junction_seen" in row["safety_reason"]
+    assert row["normal_transcript_junction_match_status"] == "DETECTED"
+    assert event_row["normal_junction_match_level"] == "EXACT_NORMAL_JUNCTION_MATCH"
+
+    # Review B3b-08: equal coordinates with OPPOSITE resolved strands is not
+    # this junction at all - no match, not even a possible one.
+    row_opp, _ = _coord_junction_case(tmp_path, "opposite", "+", "-")
+    assert row_opp["normal_junction_match_level"] == ""
+    assert row_opp["normal_junction_seen"] == "no"
+    assert row_opp["normal_transcript_junction_match_status"] == "NOT_DETECTED"
+    assert row_opp["safety_status"] != "FAIL"
+
+    # One side with an unresolved strand: explicit ambiguous review state -
+    # neither an exact positive (reject) nor a definitive negative.
+    row_amb, event_amb = _coord_junction_case(tmp_path, "amb", "+", "")
+    assert row_amb["normal_junction_match_level"] == "POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS"
+    assert "possible_normal_junction_strand_ambiguous" in row_amb["safety_reason"]
+    assert row_amb["safety_status"] == "CAUTION"
+    assert row_amb["normal_transcript_junction_match_status"] == "POSSIBLE_STRAND_AMBIGUOUS"
+    assert row_amb["final_safety_conclusion"] == "REVIEW_DIRECT_SAFETY_EVIDENCE"
+    assert event_amb["event_safety_status"] == "CAUTION"
+    # The candidate side being unstranded is symmetric.
+    row_amb2, _ = _coord_junction_case(tmp_path, "amb2", "", "+")
+    assert row_amb2["normal_junction_match_level"] == "POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS"
+    # Both sides unstranded never earns "verified" either.
+    row_both, _ = _coord_junction_case(tmp_path, "both", "", "")
+    assert row_both["normal_junction_match_level"] == "POSSIBLE_NORMAL_JUNCTION_STRAND_AMBIGUOUS"
+    assert row_both["safety_status"] == "CAUTION"
+
+
+# --------------------- C6-04 / C6-05 round-3 follow-up (FURTHER_SUGGESTIONS WS5) --
+
+def _normal_variant_event(tmp_path, name, **extra):
+    events = tmp_path / f"events_{name}.tsv"
+    peptides = tmp_path / f"peptides_{name}.tsv"
+    write_tsv(events, [{
+        "event_id": "E1", "sample_id": "S1", "event_type": "SNV",
+        "mutation_source": "SNV", "gene": "KRAS", "event_confidence": "0.9",
+        "event_expression": "10", "driver_relevance": "0.8", "clonality": "0.8",
+        "persistence": "0.8", "tumor_specificity": "0.8", **extra,
+    }])
+    write_tsv(peptides, [{
+        "peptide_id": "P1", "event_id": "E1", "sample_id": "S1",
+        "event_type": "SNV", "mutation_source": "SNV", "gene": "KRAS",
+        "peptide": "VVVGAGGVG", "wildtype_peptide": "VVVGAGGVG",
+        "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+        "binding_rank": "0.2", "el_rank": "0.2", "presentation_score": "0.9",
+        "immunogenicity_score": "0.7", "wildtype_binding_rank": "0.2",
+        "self_similarity_score": "0.1",
+    }])
+    return events, peptides
+
+
+def _gate(tmp_path, name, profile=None, **extra):
+    events, peptides = _normal_variant_event(tmp_path, name, **extra)
+    rows, event_rows = build_peptide_safety_gate(
+        raw_events=events,
+        raw_peptides=peptides,
+        out_peptide_safety=tmp_path / f"ps_{name}.tsv",
+        out_event_safety=tmp_path / f"es_{name}.tsv",
+        profile=profile,
+    )
+    return rows[0], event_rows[0]
+
+
+def test_c6_04_missing_vaf_with_alt_reads_goes_to_review(tmp_path):
+    # ALT-positive normal record with NO VAF: not a measured normal-negative
+    # and not a confirmed normal-positive - a validation review.
+    row, event_row = _gate(tmp_path, "review", normal_alt_count="5")
+    assert row["matched_normal_status"] == "NORMAL_SUPPORT_REVIEW"
+    assert "matched_normal_support_review" in row["safety_reason"]
+    assert row["safety_status"] != "FAIL"
+    assert row["review_required"] == "yes"
+    assert row["final_safety_conclusion"] == "REVIEW_DIRECT_SAFETY_EVIDENCE"
+    assert row["safety_decision_basis"] == "DIRECT_ASSESSED_EVIDENCE"
+    assert event_row["event_safety_status"] == "CAUTION"
+    assert "matched_normal_support_review" in event_row["event_safety_reason"]
+
+
+def test_c6_04_missing_vaf_is_recalculable_from_same_allele_counts(tmp_path):
+    # Counts and depth from the same allele allow an EXPLICIT recalculation;
+    # the basis names the inputs so the recalculation is auditable.
+    row, _ = _gate(tmp_path, "recalc", normal_alt_count="4", normal_depth="50")
+    assert row["matched_normal_status"] == "normal_alt_support"
+    assert row["normal_vaf"] == "0.0800"
+    assert row["normal_support_evidence_basis"] == "VAF_RECALCULATED_ALT4_DEPTH50"
+    assert row["safety_status"] == "FAIL"
+    assert "matched_normal_support" in row["safety_reason"]
+
+
+def test_c6_04_measured_zero_vaf_stays_distinct_from_missing(tmp_path):
+    # Measured zero (0 ALT at real depth) is an ASSESSED normal-negative:
+    # no review is raised for it.
+    row, _ = _gate(tmp_path, "zero", normal_alt_count="0", normal_depth="30", normal_vaf="0.0")
+    assert row["matched_normal_status"] == "no_clear_normal_support"
+    assert "matched_normal_support_review" not in row["safety_reason"]
+    assert row["normal_support_evidence_basis"] == "REPORTED"
+
+
+def test_c6_04_contradictory_counts_and_vaf_warn_instead_of_deciding(tmp_path):
+    # Reported VAF 0.5 with zero normal ALT reads: integrity warning, review,
+    # and NO silent resolution into either a pass or a rejection.
+    row, _ = _gate(
+        tmp_path, "contradiction",
+        normal_alt_count="0", normal_depth="100", normal_vaf="0.5000",
+    )
+    assert row["matched_normal_status"] == "NORMAL_VAF_CONTRADICTION"
+    assert "normal_vaf_contradiction" in row["normal_support_integrity"]
+    assert "normal_vaf_integrity_conflict" in row["safety_reason"]
+    assert row["safety_status"] != "FAIL"
+    assert row["review_required"] == "yes"
+
+
+def test_c6_04_alt_positive_with_subthreshold_vaf_is_review_not_positive(tmp_path):
+    # The old rule called ALT>=3 with VAF exactly 0.0 normal-POSITIVE.  A
+    # read count and a VAF that disagree is ambiguity: review, never reject.
+    row, _ = _gate(
+        tmp_path, "subthresh",
+        normal_alt_count="4", normal_depth="50", normal_vaf="0.0000",
+    )
+    assert row["matched_normal_status"] == "NORMAL_SUPPORT_REVIEW"
+    assert row["safety_status"] != "FAIL"
+
+
+def test_c6_04_inadequate_normal_coverage_is_not_a_measured_negative(tmp_path):
+    row, _ = _gate(tmp_path, "thin", normal_alt_count="0", normal_depth="4", normal_vaf="0.0")
+    assert row["matched_normal_status"] == "NORMAL_COVERAGE_INADEQUATE"
+    assert row["matched_normal_status"] != "no_clear_normal_support"
+
+
+def _anchor_gate(tmp_path, name, profile):
+    events = tmp_path / f"events_{name}.tsv"
+    peptides = tmp_path / f"peptides_{name}.tsv"
+    write_tsv(events, [{
+        "event_id": "E1", "sample_id": "S1", "event_type": "SNV",
+        "mutation_source": "SNV", "gene": "KRAS",
+    }])
+    write_tsv(peptides, [{
+        "peptide_id": "P1", "event_id": "E1", "sample_id": "S1",
+        "event_type": "SNV", "mutation_source": "SNV", "gene": "KRAS",
+        # Single difference at position 2 (an approximate MHC anchor slot)
+        # while the wildtype peptide binds strongly.
+        "peptide": "VAGVGAGGVG", "wildtype_peptide": "VVGVGAGGVG",
+        "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+        "binding_rank": "0.2", "el_rank": "0.2",
+        "wildtype_binding_rank": "0.0001",
+    }])
+    rows, _ = build_peptide_safety_gate(
+        raw_events=events,
+        raw_peptides=peptides,
+        out_peptide_safety=tmp_path / f"ps_{name}.tsv",
+        profile=profile,
+    )
+    return rows[0]
+
+
+def test_c6_05_anchor_heuristic_never_rejects_without_explicit_policy(tmp_path):
+    row = _anchor_gate(tmp_path, "anchor_default", None)
+    assert row["mutation_anchor_only"] == "yes"
+    assert "anchor_only_mutation_with_wt_binding" in row["safety_reason"]
+    # Caution only - the approximate cross-allele rule alone never rejects.
+    assert row["safety_status"] == "CAUTION"
+    assert row["safety_decision_basis"] == "HEURISTIC_ONLY"
+
+    # Purely documentary mode keeps the evidence columns but raises no signal.
+    row_record = _anchor_gate(
+        tmp_path, "anchor_record", {"safety": {"anchor_only_action": "record_only"}},
+    )
+    assert row_record["safety_status"] != "CAUTION"
+    assert row_record["mutation_anchor_only"] == "yes"
+    assert row_record["safety_decision_basis"] == "HEURISTIC_ONLY"
+
+    # Hard rejection is available ONLY as an explicit, separately justified
+    # profile opt-in, and labels itself as such.
+    row_reject = _anchor_gate(
+        tmp_path, "anchor_reject", {"safety": {"anchor_only_action": "reject"}},
+    )
+    assert row_reject["safety_status"] == "FAIL"
+    assert "anchor_only_reject_explicitly_enabled" in row_reject["safety_reason"]
