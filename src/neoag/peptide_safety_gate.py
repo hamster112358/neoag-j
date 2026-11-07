@@ -951,6 +951,34 @@ def build_peptide_safety_gate(
     write_tsv(out_peptide_safety, rows, PEPTIDE_SAFETY_FIELDS)
     if out_event_safety:
         write_tsv(out_event_safety, event_rows, EVENT_SAFETY_FIELDS)
+    # Review C6-02: record the safety-resource preflight next to the gate
+    # outputs so the run manifest and the release-integrity audit can trace
+    # it.  Recording only: the gate itself has already represented absent
+    # resources as UNASSESSED layers with the priority caps in force.
+    from .safety_preflight import run_safety_preflight, write_safety_preflight
+
+    preflight_mode = str(safety_cfg.get('preflight_mode', 'exploratory')).lower()
+    if preflight_mode not in {'exploratory', 'release'}:
+        preflight_mode = 'exploratory'
+    preflight_report = run_safety_preflight(
+        paths={
+            'reference_proteome': reference_proteome,
+            'normal_hla_ligands': normal_hla_ligands,
+            'normal_expression': normal_expression,
+            'normal_junctions': normal_junctions,
+        },
+        event_types=[
+            f"{e.get('event_type', '')} {e.get('mutation_source', '')}" for e in events.values()
+        ],
+        candidate_genes={g for e in events.values() for g in _split_genes(str(e.get('gene', '')))},
+        mode=preflight_mode,
+        waivers=safety_cfg.get('resource_waivers') or [],
+    )
+    write_safety_preflight(
+        preflight_report,
+        Path(out_peptide_safety).with_name('safety_preflight.json'),
+        Path(out_peptide_safety).with_name('safety_preflight.tsv'),
+    )
     return rows, event_rows
 
 

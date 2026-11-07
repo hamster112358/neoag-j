@@ -151,6 +151,52 @@ def cmd_ranking_reports(args):
     print(f"Consensus-based logic ranking report -> {paths['consensus']}")
     print(f"Weight-based ranking report          -> {paths['weight']}")
 
+def cmd_safety_preflight(args):
+    """Validate safety resources before the expensive safety/ranking layers (review C6-02)."""
+    import sys as _sys
+
+    from .safety_preflight import run_safety_preflight, write_safety_preflight
+    from .utils import read_tsv
+
+    event_types: list[str] = []
+    candidate_genes: list[str] = []
+    if args.raw_events:
+        for row in read_tsv(args.raw_events):
+            event_types.append(str(row.get("event_type") or ""))
+            event_types.append(str(row.get("mutation_source") or ""))
+            gene_field = str(row.get("gene") or "")
+            for sep in ("::", ";", "|", ","):
+                gene_field = gene_field.replace(sep, " ")
+            candidate_genes.extend(token for token in gene_field.split() if token)
+    waivers = []
+    for raw in args.waiver or []:
+        parts = [p.strip() for p in str(raw).split(":", 2)]
+        if len(parts) < 3 or not all(parts):
+            raise SystemExit(f"--waiver must be resource:reason:authorized_by (got {raw!r})")
+        waivers.append({"resource": parts[0], "reason": parts[1], "authorized_by": parts[2]})
+    report = run_safety_preflight(
+        paths={
+            "reference_proteome": args.reference_proteome,
+            "normal_hla_ligands": args.normal_hla_ligands,
+            "normal_expression": args.normal_expression,
+            "normal_junctions": args.normal_junctions,
+        },
+        event_types=event_types,
+        candidate_genes=candidate_genes,
+        genome_build=args.genome_build or "",
+        mode=args.mode,
+        waivers=waivers,
+    )
+    out_json, out_tsv = write_safety_preflight(report, args.out_json, args.out_tsv or f"{args.out_json}.tsv")
+    for row in report["rows"]:
+        print(f"  {row['resource']:24s} {row['status']:16s} {row['detail'][:100]}")
+    print(f"safety preflight [{report['mode']}] -> {report['release_decision']}"
+          + (f" (blocking: {report['blocking_resources']})" if report["blocking_resources"] else ""))
+    print(f"machine-readable report -> {out_json}")
+    if report["release_decision"] == "BLOCK_RELEASE":
+        _sys.exit(2)
+
+
 def cmd_appm(args):
     build_appm_lite(args.sample_id, args.vep_tsv, args.expression, args.hla_loh, load_profile(args.profile), args.outdir, cnv_tsv=getattr(args, "cnv", None), raw_peptides=getattr(args, "raw_peptides", None), ccf_tsv=getattr(args, "ccf", None))
     print("Built APPM 2.0 sidecars via compatibility entry point.")
@@ -1191,6 +1237,18 @@ def build_parser():
     rr.add_argument("--out-dir", default=None, help="output directory (default: <case-dir>/reports)")
     rr.add_argument("--top", type=int, default=50, help="rows per ranking table (default 50; counts in the report always cover the full pool)")
     rr.set_defaults(func=cmd_ranking_reports)
+    sp = sub.add_parser("safety-preflight", help="Validate every safety reference (proteome, ligandome, normal expression, normal junctions) BEFORE the expensive safety and ranking layers: existence, readability, schema, genome build, emptiness and locus coverage, event-type-aware; exploratory mode tolerates gaps as UNASSESSED evidence, release mode blocks unless a documented waiver applies (review C6-02). Exit code 2 when release mode blocks.")
+    sp.add_argument("--mode", choices=["exploratory", "release"], default="exploratory")
+    sp.add_argument("--reference-proteome", dest="reference_proteome")
+    sp.add_argument("--normal-hla-ligands", dest="normal_hla_ligands")
+    sp.add_argument("--normal-expression", dest="normal_expression")
+    sp.add_argument("--normal-junctions", dest="normal_junctions")
+    sp.add_argument("--raw-events", dest="raw_events", help="raw_events.tsv: derives candidate event types (applicability) and gene set (locus coverage)")
+    sp.add_argument("--genome-build", dest="genome_build", default="", help="expected build, e.g. GRCh38; resources declaring a different build fail as BUILD_MISMATCH")
+    sp.add_argument("--waiver", action="append", help="resource:reason:authorized_by (may excuse MISSING/EMPTY_VALID/COVERAGE_LOW only; repeatable)")
+    sp.add_argument("--out-json", dest="out_json", required=True, help="machine-readable safety_preflight.json")
+    sp.add_argument("--out-tsv", dest="out_tsv", help="tabular companion (default: <out-json>.tsv)")
+    sp.set_defaults(func=cmd_safety_preflight)
     ap = sub.add_parser("appm-lite")
     ap.add_argument("--sample-id", default="SAMPLE001"); ap.add_argument("--vep-tsv"); ap.add_argument("--expression"); ap.add_argument("--hla-loh"); ap.add_argument("--cnv"); ap.add_argument("--raw-peptides"); ap.add_argument("--ccf"); ap.add_argument("--profile", default="default"); ap.add_argument("--outdir", required=True); ap.set_defaults(func=cmd_appm)
     ap2 = sub.add_parser("appm-2", help="Build APPM 2.0 gene/pathway/peptide evidence sidecars")

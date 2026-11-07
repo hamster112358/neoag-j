@@ -465,6 +465,40 @@ def audit_review_inputs(artifacts: dict[str, str], outdir: str | Path) -> dict[s
     if missing_as_negative:
         overall = "BLOCKED"
 
+    # Review C6-02 (round 3): the safety-resource preflight, when run, must
+    # be traceable in the release audit, and a release-mode BLOCK may not be
+    # quietly ignored.  Its absence is disclosed, not invented.
+    preflight_path = ""
+    for _key in ("run_manifest", "consensus_events"):
+        _base = Path(artifacts.get(_key) or "")
+        for _cand in (_base.parent / "safety_preflight.json", _base.parent.parent / "safety_preflight.json"):
+            if _cand.is_file():
+                preflight_path = str(_cand)
+                break
+        if preflight_path:
+            break
+    if preflight_path:
+        try:
+            _pre = json.loads(Path(preflight_path).read_text(encoding="utf-8"))
+            _decision = str(_pre.get("release_decision") or "")
+            _mode = str(_pre.get("mode") or "")
+            if _decision == "BLOCK_RELEASE":
+                _add(checks, "safety_resource_preflight", "FAIL", "ERROR",
+                     f"mode={_mode}; blocking={_pre.get('blocking_resources', '')}", preflight_path)
+                overall = "BLOCKED"
+            elif _decision == "PROCEED_WITH_UNASSESSED":
+                _add(checks, "safety_resource_preflight", "WARN", "WARNING",
+                     f"mode={_mode}; unresolved={_pre.get('unresolved_resources', '')} - affected layers must stay UNASSESSED with caps in force",
+                     preflight_path)
+            else:
+                _add(checks, "safety_resource_preflight", "PASS", "WARNING",
+                     f"mode={_mode}; all applicable resources OK or waived", preflight_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            _add(checks, "safety_resource_preflight", "FAIL", "ERROR", f"unreadable preflight report: {exc}", preflight_path)
+    else:
+        _add(checks, "safety_resource_preflight", "NOT_RECORDED", "INFO",
+             "safety_preflight.json not found near the run artifacts; pre-run resource validation was not recorded")
+
     if overall == "PASS" and any(row["status"] in {"WARN", "UNASSESSED"} for row in checks):
         overall = "PARTIAL"
     blocking = [row for row in checks if row["status"] == "FAIL"]
