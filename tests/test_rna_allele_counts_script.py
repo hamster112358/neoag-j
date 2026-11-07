@@ -136,6 +136,66 @@ def test_preflight_refuses_missing_index_and_cross_build():
     module.preflight_checks(IndexedBam(), {"1", "chr2"})
 
 
+GRCH37_CHRS = {"1": 249250621, "2": 243199373, "10": 135534747, "17": 81195210, "X": 155270560}
+GRCH38_CHRS = {"1": 248956422, "2": 242193529, "10": 133797422, "17": 83257441, "X": 156040895}
+
+
+def test_fingerprint_build_matches_exact_primary_lengths():
+    module = _module()
+    hg38 = module.fingerprint_build(
+        ("chr1", "chr2", "chr10", "chr17", "chrX", "chrUn_KI270442v1"),
+        tuple(GRCH38_CHRS[c] for c in ("1", "2", "10", "17", "X")) + (3811579,),
+    )
+    assert hg38[0] == "GRCh38" and "5/5" in hg38[1]
+    # Ensembl naming without the chr prefix must also fingerprint.
+    hg37 = module.fingerprint_build(
+        ("1", "2", "10", "17", "X"), tuple(GRCH37_CHRS[c] for c in ("1", "2", "10", "17", "X"))
+    )
+    assert hg37[0] == "GRCh37"
+    # A T2T/CHM13-style primary length matches neither table -> no verdict.
+    other = module.fingerprint_build(("chr1", "chr2"), (207734681, 207734681))
+    assert other[0] == "" and "no fingerprint contig matches" in other[1]
+    # Contigs split across builds stay ambiguous, never a silent pick.
+    mixed = module.fingerprint_build(("chr1", "chr2"), (GRCH38_CHRS["1"], GRCH37_CHRS["2"]))
+    assert mixed[0] == "" and "different builds" in mixed[1]
+
+
+def test_check_genome_build_confirms_infers_and_stays_honest():
+    module = _module()
+    import pytest
+
+    hg38_bam = SimpleNamespace(
+        references=tuple("chr" + c for c in GRCH38_CHRS), lengths=tuple(GRCH38_CHRS.values())
+    )
+    status, detail = module.check_genome_build(hg38_bam, "hg38", False)
+    assert status == "BUILD_CONFIRMED" and "GRCh38" in detail
+    status, _ = module.check_genome_build(hg38_bam, "", False)
+    assert status == "BUILD_INFERRED"
+    # No fingerprint contigs: never a false confirmation, but no hard stop either.
+    odd = SimpleNamespace(references=("GL000207.1",), lengths=(42641,))
+    status, detail = module.check_genome_build(odd, "GRCh38", False)
+    assert status == "BUILD_UNASSESSED" and "expected GRCh38" in detail
+    with pytest.raises(SystemExit, match="unknown --expected-build"):
+        module.check_genome_build(hg38_bam, "mm10", False)
+
+
+def test_check_genome_build_aborts_on_confirmed_cross_build():
+    module = _module()
+    import pytest
+
+    hg38_bam = SimpleNamespace(
+        references=tuple("chr" + c for c in GRCH38_CHRS), lengths=tuple(GRCH38_CHRS.values())
+    )
+    # The operator scenario: an hg19 VCF against an hg38 BAM used to pass the
+    # contig-name preflight untouched because both builds name contigs
+    # chr1..chrY (review C3-01).
+    with pytest.raises(SystemExit, match="fingerprint to GRCh38"):
+        module.check_genome_build(hg38_bam, "hg19", False)
+    # The audited override proceeds and records itself.
+    status, detail = module.check_genome_build(hg38_bam, "hg19", True)
+    assert status == "BUILD_MISMATCH" and "--allow-build-mismatch" in detail
+
+
 def _fake_pysam(bam_factory):
     return SimpleNamespace(AlignmentFile=bam_factory)
 
@@ -158,6 +218,7 @@ def test_main_end_to_end_with_fake_pysam(tmp_path, monkeypatch, capsys):
 
     class FakeBam:
         references = ("chr1",)
+        lengths = (GRCH38_CHRS["1"],)
 
         def check_index(self):
             return None
@@ -192,3 +253,6 @@ def test_main_end_to_end_with_fake_pysam(tmp_path, monkeypatch, capsys):
     assert rows[0]["rna_depth"] == "4" and rows[0]["rna_other_reads"] == "1" and rows[0]["rna_ref_reads"] == "1"
     stdout = capsys.readouterr().out
     assert "cross-check" in stdout
+    # Review C3-01: without --expected-build the run still states which build
+    # the BAM fingerprinted to, so the log is self-auditing.
+    assert "build_check=BUILD_INFERRED" in stdout

@@ -4,9 +4,16 @@
 Review C3-01/02/03 fixes:
   * a missing BAM index (BAI or CSI) aborts the run up front instead of
     surfacing later as swallowed pileup exceptions;
-  * VCF-vs-BAM contig intersection is preflighted, so a cross-build input
-    (e.g. hg19 VCF vs hg38 BAM) fails loudly instead of producing an
-    all-zero table that downstream reads as "no expression";
+  * VCF-vs-BAM contig intersection is preflighted, so a VCF whose contigs
+    are absent from the BAM aborts instead of producing an all-zero table
+    that downstream reads as "no expression";
+  * review C3-01: contig NAMES alone cannot catch a same-name cross-build
+    input (hg19 VCF vs hg38 BAM both use chr1..chrY), so with
+    --expected-build the BAM SQ lengths are fingerprinted against exact
+    GRCh37/GRCh38 tables; a confirmed mismatch aborts unless
+    --allow-build-mismatch records the override in the run summary.
+    Without --expected-build the run reports the inferred build
+    (BUILD_INFERRED) or BUILD_UNASSESSED;
   * per-site pileup failures are marked ERROR (blank numerics) and never
     silently become zeros;
   * multiallelic sites emit one row per ALT with per-ALT counts, and reads
@@ -34,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-tsv", type=Path, required=True)
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--min-baseq", type=int, default=13)
+    p.add_argument("--expected-build", default="",
+                   help="expected BAM reference build (GRCh37/hg19 or GRCh38/hg38); "
+                        "validated against BAM contig lengths (review C3-01)")
+    p.add_argument("--allow-build-mismatch", action="store_true",
+                   help="proceed despite a confirmed --expected-build mismatch; "
+                        "the override is recorded in the run summary")
     return p.parse_args()
 
 
@@ -63,6 +76,90 @@ def normalize_chrom(chrom: str, references: set[str]) -> str:
     if f"chr{chrom}" in references:
         return f"chr{chrom}"
     return chrom
+
+
+# Review C3-01: same-name cross-build guard.  GRCh37 and GRCh38 share the
+# chr1..chrY names, so contig overlap proves nothing; exact primary-assembly
+# lengths do (UCSC and Ensembl agree on these lengths with or without the
+# chr prefix, and hs37d5 shares the GRCh37 primary lengths).
+GENOME_BUILD_FINGERPRINTS = {
+    "GRCh37": {"1": 249250621, "2": 243199373, "10": 135534747, "17": 81195210, "X": 155270560},
+    "GRCh38": {"1": 248956422, "2": 242193529, "10": 133797422, "17": 83257441, "X": 156040895},
+}
+GENOME_BUILD_ALIASES = {
+    "grch37": "GRCh37", "hg19": "GRCh37", "b37": "GRCh37", "hs37d5": "GRCh37",
+    "grch38": "GRCh38", "hg38": "GRCh38", "b38": "GRCh38",
+}
+
+
+def bare_chrom(chrom: str) -> str:
+    return chrom[3:] if chrom.startswith("chr") else chrom
+
+
+def fingerprint_build(references, lengths) -> tuple[str, str]:
+    """Match BAM SQ contig lengths against the GRCh37/GRCh38 tables.
+
+    Returns (build_or_empty, detail); an empty build means the header gave
+    no usable evidence (no fingerprint contigs, or conflicting matches).
+    """
+    present: dict[str, int] = {}
+    for name, length in zip(references, lengths):
+        bare = bare_chrom(name)
+        if bare in GENOME_BUILD_FINGERPRINTS["GRCh38"] and bare not in present:
+            present[bare] = length
+    if not present:
+        return "", "no fingerprint contigs (1/2/10/17/X) in the BAM header"
+    votes: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    for contig, length in sorted(present.items()):
+        hits = [b for b, table in GENOME_BUILD_FINGERPRINTS.items() if table.get(contig) == length]
+        if len(hits) == 1:
+            votes.setdefault(hits[0], []).append(contig)
+        else:
+            unknown.append(f"{contig}:{length}")
+    if len(votes) > 1:
+        return "", f"contigs fingerprint to different builds {votes}"
+    if not votes:
+        return "", f"no fingerprint contig matches GRCh37 or GRCh38 lengths (e.g. {unknown[:3]})"
+    (build, contigs), = votes.items()
+    detail = f"confirmed by {len(contigs)}/{len(present)} fingerprint contigs"
+    if unknown:
+        detail += f"; unmatched {unknown[:3]}"
+    return build, detail
+
+
+def check_genome_build(bam, expected_build: str, allow_mismatch: bool) -> tuple[str, str]:
+    """Resolve --expected-build against the BAM length fingerprint (review C3-01).
+
+    Status is BUILD_CONFIRMED / BUILD_MISMATCH / BUILD_INFERRED /
+    BUILD_UNASSESSED.  Only a confirmed mismatch against an explicit
+    --expected-build aborts, and only without --allow-build-mismatch;
+    everything else proceeds with the status recorded in the summary.
+    """
+    key = (expected_build or "").strip().casefold()
+    expected = GENOME_BUILD_ALIASES.get(key, "")
+    if key and not expected:
+        raise SystemExit(
+            f"unknown --expected-build {expected_build!r}; accepted values: "
+            "GRCh37/hg19/hs37d5 or GRCh38/hg38 (case-insensitive)"
+        )
+    inferred, detail = fingerprint_build(bam.references, bam.lengths)
+    if expected:
+        if inferred == expected:
+            return "BUILD_CONFIRMED", f"BAM lengths match {expected} ({detail})"
+        if inferred and inferred != expected:
+            message = (
+                f"--expected-build {expected} but BAM contig lengths fingerprint to "
+                f"{inferred} ({detail}); allele counts across builds would be silently "
+                "wrong (review C3-01)"
+            )
+            if not allow_mismatch:
+                raise SystemExit(message + "; rerun with --allow-build-mismatch to proceed anyway")
+            return "BUILD_MISMATCH", message + " [proceeded via --allow-build-mismatch]"
+        return "BUILD_UNASSESSED", f"expected {expected}, but {detail}"
+    if inferred:
+        return "BUILD_INFERRED", f"BAM contig lengths fingerprint to {inferred} ({detail})"
+    return "BUILD_UNASSESSED", detail
 
 
 def variant_type(ref: str, alt: str) -> str:
@@ -114,7 +211,9 @@ def preflight_checks(bam, vcf_contigs: set[str]) -> None:
     Review C3-03: pysam's check_index() accepts either a BAI or a CSI, and a
     review B4/01-era missing index must never surface later as swallowed
     pileup exceptions.  Review C3-01: zero overlapping contigs between the
-    VCF and the BAM is a build mismatch, not a biological zero.
+    VCF and the BAM is a build mismatch, not a biological zero; same-name
+    cross-build inputs (GRCh37 vs GRCh38) are caught separately by
+    check_genome_build(), because contig names alone cannot distinguish them.
     """
     try:
         bam.check_index()
@@ -244,6 +343,8 @@ def main() -> None:
     bam = pysam.AlignmentFile(str(args.rna_bam), "rb")
     sites = list(iter_somatic_sites(args.somatic_vcf))
     preflight_checks(bam, {chrom for chrom, _, _, _ in sites})
+    build_status, build_detail = check_genome_build(bam, args.expected_build, args.allow_build_mismatch)
+    print(f"build_check={build_status} {build_detail}", flush=True)
     references = set(bam.references)
     print(
         f"cross-check vcf_contigs={len({chrom for chrom, _, _, _ in sites})} "
@@ -274,7 +375,8 @@ def main() -> None:
         w.writerows(rows)
     print(
         f"wrote {args.output_tsv} sites={len(sites)} rows={len(rows)} "
-        f"with_alt_support={with_support} unassessed_error_rows={len(error_rows)}"
+        f"with_alt_support={with_support} unassessed_error_rows={len(error_rows)} "
+        f"build_check={build_status}"
     )
     if error_rows:
         print(
