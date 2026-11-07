@@ -5,9 +5,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _is_gzip(p: Path) -> bool:
+    try:
+        with p.open("rb") as fh:
+            return fh.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
 def open_text(path: str | Path):
     p = Path(path)
-    if str(p).endswith(".gz"):
+    if str(p).endswith(".gz") or _is_gzip(p):
         return gzip.open(p, "rt", encoding="utf-8", errors="ignore")
     return p.open("r", encoding="utf-8", errors="ignore")
 
@@ -27,11 +35,15 @@ class FastaReference:
     byte-level random access:
 
     * a samtools ``.fai`` index next to the FASTA is used when present and
-      usable (plain FASTA, uniform line layout);
+      consistent with the file (htslib column spec: bases per line and bytes
+      per line including the separator; plain FASTA, uniform line layout);
     * otherwise the file is scanned once in streaming mode, recording only byte
-      offsets per contig (no sequence is retained);
-    * the whole-file load survives only as a fallback for compressed or
-      otherwise seek-incompatible FASTAs, where byte offsets are meaningless.
+      offsets per contig (no sequence is retained); a layout that does not
+      keep one uniform line width is rejected, because byte arithmetic would
+      silently mis-address bases;
+    * the whole-file load survives only as a fallback for compressed, ragged
+      or otherwise seek-incompatible FASTAs, where byte offsets are
+      meaningless.
 
     Normal operation never materialises contig sequences in memory.
     """
@@ -41,7 +53,10 @@ class FastaReference:
         # name -> (length, data_byte_offset, chars_per_line, bytes_per_line)
         self._index: dict[str, tuple[int, int, int, int]] = {}
         self._seqs: dict[str, str] | None = None
-        if self.path.suffix == ".gz":
+        # BGZF-compressed FASTAs carry the gzip magic regardless of file
+        # name; byte offsets are meaningless inside them, so never attempt
+        # random access on such content.
+        if self.path.suffix == ".gz" or _is_gzip(self.path):
             self._load_whole_file()
             return
         if not self._load_fai():
@@ -49,27 +64,60 @@ class FastaReference:
 
     # -- indexing ----------------------------------------------------------
     def _load_fai(self) -> bool:
-        """Read a samtools faidx sidecar.  Returns False if absent/unusable."""
+        """Read a samtools faidx sidecar following the htslib column spec.
+
+        Column 4 holds the number of *bases* per line and column 5 the number
+        of *bytes* per line including the line separator (``len + 1`` for LF,
+        ``len + 2`` for CRLF).  Both are -1 for BGZF or single-line layouts;
+        compressed content is already routed to the whole-file fallback by the
+        gzip-magic check in ``__init__``, so a remaining ``-1 -1`` line can
+        only mean single-line plain sequence and the stride degenerates.
+
+        Anything else — missing columns, columns that do not agree on a 1- or
+        2-byte separator, a declared length the file cannot back up — is
+        treated as untrusted and the caller falls back to scanning.
+        """
         fai = Path(str(self.path) + ".fai")
         if not fai.is_file():
             return False
         try:
+            file_size = self.path.stat().st_size
+            sidecar = fai.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+        try:
             index: dict[str, tuple[int, int, int, int]] = {}
-            for line in fai.read_text(encoding="utf-8").splitlines():
-                parts = line.split("\t")
-                if len(parts) < 4:
-                    continue
-                name = parts[0]
-                length, offset, line_len = int(parts[1]), int(parts[2]), int(parts[3])
-                line_len_b = int(parts[4]) if len(parts) >= 5 else line_len
-                if line_len_b < 0 or line_len < 1 or line_len_b < line_len:
-                    # BGZF (line_len_b == -1) or multi-byte line layout: byte
-                    # offsets cannot be applied to a plain file read.
-                    return False
-                chars_per_line = line_len - 1  # line_len includes the newline
-                if chars_per_line < 1:
-                    return False
-                index[name] = (length, offset, chars_per_line, line_len_b)
+            with self.path.open("rb") as raw:
+                for line in sidecar:
+                    if not line.strip():
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 5:
+                        return False
+                    name = parts[0]
+                    length, offset = int(parts[1]), int(parts[2])
+                    line_bases, line_bytes = int(parts[3]), int(parts[4])
+                    if length < 0 or offset < 0 or offset > file_size:
+                        return False
+                    if line_bases == -1 and line_bytes == -1:
+                        chars_per_line, stride = max(length, 1), max(length, 1)
+                    elif line_bases >= 1 and line_bytes - line_bases in (1, 2):
+                        chars_per_line, stride = line_bases, line_bytes
+                    else:
+                        return False
+                    used = (length // chars_per_line) * stride + length % chars_per_line
+                    if offset + used > file_size:
+                        # The sidecar describes more sequence than the file
+                        # holds (e.g. a re-downloaded/truncated FASTA).
+                        return False
+                    if offset + used < file_size:
+                        raw.seek(offset + used)
+                        nxt = raw.read(1)
+                        if nxt and nxt not in (b"\n", b"\r", b">"):
+                            # Sequence bytes continue past the declared end:
+                            # the sidecar length disagrees with the file.
+                            return False
+                    index[name] = (length, offset, chars_per_line, stride)
         except (OSError, ValueError):
             return False
         if not index:
@@ -78,8 +126,16 @@ class FastaReference:
         return True
 
     def _scan_plain(self) -> None:
-        """One streaming pass recording per-contig byte offsets; no sequences kept."""
+        """One streaming pass recording per-contig byte offsets; no sequences kept.
+
+        The pass also verifies the layout is addressable by byte arithmetic:
+        every data line except a contig's final line must carry exactly the
+        line width recorded from the first line, and sequence data may not
+        contain blank lines.  A violating (ragged) file falls back to the
+        whole-file load, the only mode that stays correct on it.
+        """
         index: dict[str, tuple[int, int, int, int]] = {}
+        ragged = False
         try:
             with self.path.open("rb") as fh:
                 name: str | None = None
@@ -87,6 +143,7 @@ class FastaReference:
                 data_offset = 0
                 chars_per_line = 0
                 stride = 0
+                prev_len: int | None = None
 
                 def flush() -> None:
                     if name is not None and stride > 0 and chars_per_line > 0:
@@ -103,21 +160,29 @@ class FastaReference:
                         chars_per_line = 0
                         stride = 0
                         data_offset = fh.tell()
+                        prev_len = None
                         continue
                     if not name:
                         continue
                     stripped = raw.rstrip(b"\r\n")
                     if not stripped:
+                        if length:
+                            ragged = True  # blank line inside sequence data
                         continue
                     if chars_per_line == 0:
                         chars_per_line = len(stripped)
                         stride = len(raw)
+                    elif prev_len is not None and prev_len != chars_per_line:
+                        # prev_len's line is followed by another data line, so
+                        # it cannot be the contig's (short) final line.
+                        ragged = True
+                    prev_len = len(stripped)
                     length += len(stripped)
                 flush()
         except OSError:
             self._load_whole_file()
             return
-        if index:
+        if index and not ragged:
             self._index = index
         else:
             self._load_whole_file()

@@ -5,7 +5,11 @@ C4-01 find_cn no longer resolves overlapping segments by file order and
 C4-04 _purity_bounds parses structured keys first and free-text ranges only
     when the whole string is exactly a numeric pair (no prose, no %).
 B4-02 FastaReference fetches regions by byte-level random access (.fai or a
-    streaming offset scan) instead of loading the genome into RAM.
+    streaming offset scan) instead of loading the genome into RAM.  The .fai
+    parser follows the htslib spec (col4 = bases per line, col5 = bytes per
+    line including the separator); a sidecar that disagrees with the file,
+    compressed content under any name, and ragged line layouts all fall back
+    honestly instead of mis-addressing bases.
 B4-03 normal_hla_ligand_overlap reports "not_assessed" without a catalogue.
 B4-05 the SV raw-event builder emits no duplicate keys and labels its
     heuristic event components via event_component_status.
@@ -56,10 +60,25 @@ def _write_fasta(path: Path, seq: str, line_width: int = 70, name: str = "chr1")
     path.write_text(f">{name}\n" + "".join(line + "\n" for line in lines), encoding="utf-8")
 
 
-def _write_fai(path: Path, seq_len: int, line_width: int = 70, name: str = "chr1") -> None:
-    header = f">{name}\n"
+def _write_fai(
+    path: Path,
+    seq_len: int,
+    line_width: int = 70,
+    name: str = "chr1",
+    sep_bytes: int = 1,
+    cols45: tuple[int, int] | None = None,
+    offset: int | None = None,
+) -> None:
+    """Write an .fai in the samtools faidx (htslib) column convention:
+    col4 = bases per line, col5 = bytes per line including the separator."""
+    if offset is None:
+        offset = len(f">{name}\n".encode())
+    if cols45 is not None:
+        col4, col5 = cols45
+    else:
+        col4, col5 = line_width, line_width + sep_bytes
     path.write_text(
-        f"{name}\t{seq_len}\t{len(header.encode())}\t{line_width + 1}\t{line_width + 1}\n",
+        f"{name}\t{seq_len}\t{offset}\t{col4}\t{col5}\n",
         encoding="utf-8",
     )
 
@@ -244,6 +263,116 @@ def test_fasta_reference_does_not_load_whole_genome(tmp_path):
     assert ref._seqs is None  # scan mode: no materialised contigs
     ref.fetch("chr1", 1, 10)
     assert ref._seqs is None
+
+
+def test_fasta_reference_reads_samtools_fai_convention(tmp_path):
+    # htslib faidx spec: col4 = bases per line, col5 = bytes per line
+    # including the separator.  A parser that misreads col4 as a
+    # newline-inclusive width strides one base early from line 2 onwards -
+    # silently wrong sequence against every real samtools-indexed reference.
+    seq = _seq(500)
+    fa = tmp_path / "ref.fa"
+    _write_fasta(fa, seq, line_width=60)
+    _write_fai(fa.with_suffix(".fa.fai"), len(seq), line_width=60)
+    ref = FastaReference(fa)
+    assert ref._seqs is None  # random access, no whole-file materialisation
+    assert ref._index["chr1"] == (len(seq), len(b">chr1\n"), 60, 61)
+    for start, end in [(1, 1), (59, 62), (60, 60), (61, 61), (119, 121),
+                       (419, 421), (61, 420), (421, 500)]:
+        assert ref.fetch("chr1", start, end) == seq[start - 1:end]
+
+
+def test_fasta_reference_samtools_fai_with_crlf_separators(tmp_path):
+    seq = _seq(300)
+    crlf = tmp_path / "crlf.fa"
+    lines = [seq[i:i + 70] for i in range(0, len(seq), 70)]
+    crlf.write_bytes(b">chr1\r\n" + b"".join(line.encode() + b"\r\n" for line in lines))
+    # samtools records the byte width including \r\n: 70 bases -> 72 bytes.
+    _write_fai(crlf.with_suffix(".fa.fai"), len(seq), sep_bytes=2,
+               offset=len(b">chr1\r\n"))
+    ref = FastaReference(crlf)
+    assert ref._index["chr1"] == (len(seq), len(b">chr1\r\n"), 70, 72)
+    for start, end in [(61, 85), (139, 142), (295, 300), (1, 300)]:
+        assert ref.fetch("chr1", start, end) == seq[start - 1:end]
+
+
+def test_fasta_reference_single_line_fai_minus_one_columns(tmp_path):
+    seq = _seq(300)
+    fa = tmp_path / "single.fa"
+    fa.write_text(">chr1\n" + seq + "\n", encoding="ascii")
+    _write_fai(fa.with_suffix(".fa.fai"), len(seq), cols45=(-1, -1))
+    ref = FastaReference(fa)
+    assert ref._index["chr1"] == (len(seq), 6, 300, 300)
+    assert ref.fetch("chr1", 250, 299) == seq[249:299]
+    assert ref.fetch("chr1", 1, 300) == seq
+
+
+def test_fasta_reference_gzip_magic_under_plain_name_never_random_accessed(tmp_path):
+    # BGZF-compressed FASTAs keep the gzip magic regardless of file name;
+    # byte offsets are meaningless inside them, so random access is refused
+    # even when an index with the -1/-1 (BGZF) columns is present.
+    seq = _seq(200)
+    fa = tmp_path / "comp.fa"
+    with gzip.open(fa, "wt") as fh:
+        fh.write(">chr1\n" + "".join(seq[i:i + 70] + "\n" for i in range(0, len(seq), 70)))
+    _write_fai(fa.with_suffix(".fa.fai"), len(seq), cols45=(-1, -1))
+    ref = FastaReference(fa)
+    assert ref._seqs is not None  # whole-file fallback, decoded properly
+    assert ref.fetch("chr1", 61, 85) == seq[60:85]
+
+
+def test_fasta_reference_stale_fai_falls_back_to_scan(tmp_path):
+    seq = _seq(400)
+    fa = tmp_path / "ref.fa"
+    _write_fasta(fa, seq, line_width=70)
+
+    # Sidecar over-declares the sequence (FASTA truncated after indexing).
+    _write_fai(fa.with_suffix(".fa.fai"), 900, line_width=70)
+    over = FastaReference(fa)
+    assert over._seqs is None  # still random access, just established by scan
+    assert over._index["chr1"][2:] == (70, 71)  # measured from the file
+    assert over.fetch("chr1", 350, 390) == seq[349:390]
+
+    # Sidecar under-declares the sequence (FASTA extended after indexing).
+    _write_fai(fa.with_suffix(".fa.fai"), 300, line_width=70)
+    under = FastaReference(fa)
+    assert under._index["chr1"][2:] == (70, 71)
+    assert under.fetch("chr1", 350, 390) == seq[349:390]
+
+    # Columns that cannot describe the file's line layout are not trusted.
+    _write_fai(fa.with_suffix(".fa.fai"), len(seq), cols45=(71, 71))
+    odd = FastaReference(fa)
+    assert odd._index["chr1"][2:] == (70, 71)
+    assert odd.fetch("chr1", 65, 80) == seq[64:80]
+
+
+def test_fasta_reference_fetch_boundaries_indexed_mode(tmp_path):
+    seq = _seq(200)
+    fa = tmp_path / "ref.fa"
+    _write_fasta(fa, seq, line_width=70)
+    _write_fai(fa.with_suffix(".fa.fai"), len(seq), line_width=70)
+    ref = FastaReference(fa)
+    assert ref.fetch("chr1", 1, 1) == seq[:1]           # first base
+    assert ref.fetch("chr1", 200, 200) == seq[199:]     # last base, short final line
+    assert ref.fetch("chr1", 70, 71) == seq[69:71]      # straddles a line boundary
+    assert ref.fetch("chr1", 141, 200) == seq[140:200]  # whole short final line
+    assert ref.fetch("chr1", 141, 200, "-") == revcomp(seq[140:200])
+    assert ref.fetch("chr1", 0, 5) == seq[:5]           # start clamped up to 1
+    assert ref.fetch("chr1", 195, 250) == seq[194:200]  # end clamped to contig
+    assert ref.fetch("chr1", 50, 49) == ""              # empty range
+    assert ref.fetch("chr1", 201, 300) == ""            # start beyond contig end
+
+
+def test_fasta_reference_ragged_layout_falls_back_to_whole_file(tmp_path):
+    seq = _seq(250)
+    fa = tmp_path / "ragged.fa"
+    # The 40-base line sits mid-contig: data follows it, so a fixed line
+    # width cannot address this file and scan must not be trusted with it.
+    lines = [seq[0:70], seq[70:140], seq[140:180], seq[180:250]]
+    fa.write_text(">chr1\n" + "".join(line + "\n" for line in lines), encoding="ascii")
+    ref = FastaReference(fa)
+    assert ref._seqs is not None
+    assert ref.fetch("chr1", 135, 190) == seq[134:190]
 
 
 # ---------------------------------------------------------------------------
