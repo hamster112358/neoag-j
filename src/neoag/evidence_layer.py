@@ -186,14 +186,28 @@ def build_expression_evidence(
     return rows
 
 
-def _rna_support_status(alt_reads: str, depth: str, vaf: str, junction_reads: int) -> str:
+def _rna_support_status(
+    alt_reads: str,
+    depth: str,
+    vaf: str,
+    junction_reads: int,
+    count_status: str = "",
+) -> str:
+    # Review C3-04 (round 2): a technical count state (pileup exception,
+    # contig absent from the BAM, complex allele skipped) describes the ALT
+    # counts, not the junction.  It blocks the ALT-read readings entirely -
+    # in either direction - but never erases junction support.
+    from .adapters.rna_vaf import RNA_COUNT_TECHNICAL_STATUSES
+    technical = str(count_status or "").strip().upper() in RNA_COUNT_TECHNICAL_STATUSES
     alt = to_float(alt_reads, 0.0)
     dp = to_float(depth, 0.0)
     vf = to_float(vaf, 0.0)
-    if alt > 0 and (dp > 0 or vf > 0):
+    if not technical and alt > 0 and (dp > 0 or vf > 0):
         return "RNA_ALT_SUPPORTED"
     if junction_reads > 0:
         return "RNA_JUNCTION_SUPPORTED"
+    if technical:
+        return f"UNASSESSED_RNA_COUNT_{str(count_status).strip().upper()}"
     if dp > 0:
         return "RNA_ALT_NOT_DETECTED"
     return "UNASSESSED"
@@ -318,6 +332,7 @@ def build_rna_junction_evidence(
                 rna_fields.get("rna_depth", ""),
                 rna_fields.get("rna_vaf", ""),
                 reads,
+                rna_fields.get("rna_count_status", ""),
             ),
             **_targeted_validation(reads, source, mutation_source, consequence),
         }

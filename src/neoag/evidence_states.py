@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .adapters.rna_vaf import RNA_COUNT_TECHNICAL_STATUSES
 from .status_words import contains_positive
 
 MISSING_TOKENS = ("UNASSESSED", "MISSING", "NOT_AVAILABLE", "NOT ASSESSED", "UNRESOLVED", "NO_EVIDENCE")
@@ -231,19 +232,25 @@ def derive_rna_support(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dict
     cfg = _section(rules, "rna")
     track = event_track(row)
     status = _text(row, "rna_support_status", "expression_evidence_status", "rna_evidence_completeness")
+    # Review C3-04 (round 2): counts from a technically failed assessment
+    # (pileup exception, missing contig, skipped complex allele) are not
+    # measurements - neither positive nor negative - so they read as absent.
+    technical_counts = str(row.get("rna_count_status") or "").strip().upper() in RNA_COUNT_TECHNICAL_STATUSES
     if contains_positive(status, "RNA_ALT_SUPPORTED") or contains_positive(status, "RNA_JUNCTION_SUPPORTED"):
         # An upstream status is only confirmation when the numbers behind it hold
         # up: an unsupported status string (evidence_layer marks alt>0 as
         # RNA_ALT_SUPPORTED) must not outrank the numeric thresholds below.
-        if track in {"FUSION", "SPLICE"}:
-            if _float(row, "rna_junction_reads", "junction_reads") is not None:
-                pass  # fall through to the junction threshold path
-            else:
+        # A technical count failure also blocks the string-only confirmation.
+        if not technical_counts:
+            if track in {"FUSION", "SPLICE"}:
+                if _float(row, "rna_junction_reads", "junction_reads") is not None:
+                    pass  # fall through to the junction threshold path
+                else:
+                    return _result("RNA_CONFIRMED", 3, status)
+            elif _float(row, "rna_alt_reads") is None and _float(row, "rna_vaf") is None:
                 return _result("RNA_CONFIRMED", 3, status)
-        elif _float(row, "rna_alt_reads") is None and _float(row, "rna_vaf") is None:
-            return _result("RNA_CONFIRMED", 3, status)
     if "RNA_ALT_NOT_DETECTED" in status:
-        depth = _float(row, "rna_depth")
+        depth = None if technical_counts else _float(row, "rna_depth")
         evaluable_depth = float(cfg.get("snv_min_evaluable_depth", 10))
         if depth is None or depth <= 0:
             return _result(
@@ -291,8 +298,8 @@ def derive_rna_support(row: Mapping[str, Any], rules: Mapping[str, Any]) -> dict
         if reads == 0:
             return _result("RNA_NEGATIVE", 0, "junction reads=0")
         return _result("RNA_LOW_SUPPORT", 1, f"junction reads={reads:g} below {minimum:g}")
-    alt_reads = _float(row, "rna_alt_reads")
-    vaf = _float(row, "rna_vaf")
+    alt_reads = None if technical_counts else _float(row, "rna_alt_reads")
+    vaf = None if technical_counts else _float(row, "rna_vaf")
     minimum_reads = float(cfg.get("snv_min_alt_reads", 3))
     minimum_vaf = float(cfg.get("snv_min_vaf", 0.02))
     if alt_reads is None and vaf is None:

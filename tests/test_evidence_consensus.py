@@ -975,3 +975,57 @@ def test_rna_metrics_explicit_snv_overrides_stale_junction_consequence():
 
     assert metrics["rna_support_status"] == "RNA_ALT_NOT_DETECTED"
     assert metrics["rna_evidence_completeness"] == "COMPLETE"
+
+
+def test_c3_04_technical_rna_count_states_never_read_as_measured():
+    # Round-2 (HANDOFF section I, C3-04): the count producer's count_status
+    # describes the assessment of the ALT counts, not biology.  An
+    # ERROR / CONTIG_NOT_IN_BAM / UNASSESSED_COMPLEX row must read as
+    # unassessed - in both directions - even when the legacy status string
+    # says "not detected" or numbers are present on the row.
+    rules = {}
+    technical_negative = derive_rna_support(
+        {
+            "event_type": "SNV",
+            "rna_support_status": "RNA_ALT_NOT_DETECTED",
+            "rna_depth": "171", "rna_alt_reads": "0", "rna_vaf": "0",
+            "rna_count_status": "ERROR",
+        },
+        rules,
+    )
+    assert technical_negative["state"] == "RNA_UNASSESSED"
+    string_confirmation_blocked = derive_rna_support(
+        {
+            "event_type": "SNV",
+            "rna_support_status": "RNA_ALT_SUPPORTED",
+            "rna_count_status": "CONTIG_NOT_IN_BAM",
+        },
+        rules,
+    )
+    assert string_confirmation_blocked["state"] != "RNA_CONFIRMED"
+    numbers_blocked = derive_rna_support(
+        {
+            "event_type": "SNV",
+            "rna_alt_reads": "12", "rna_depth": "30", "rna_vaf": "0.4",
+            "rna_count_status": "UNASSESSED_COMPLEX",
+        },
+        rules,
+    )
+    assert numbers_blocked["state"] != "RNA_CONFIRMED"
+    clean_counts = derive_rna_support(
+        {
+            "event_type": "SNV",
+            "rna_alt_reads": "12", "rna_depth": "30", "rna_vaf": "0.4",
+            "rna_count_status": "ASSESSED",
+        },
+        rules,
+    )
+    assert clean_counts["state"] == "RNA_CONFIRMED"
+
+    from neoag.evidence_layer import _rna_support_status
+    # Technical count states block the ALT-read readings only; junction
+    # support, which does not depend on the failed pileup, survives.
+    assert _rna_support_status("5", "30", "0.16", 0, "ERROR") == "UNASSESSED_RNA_COUNT_ERROR"
+    assert _rna_support_status("0", "0", "", 7, "ERROR") == "RNA_JUNCTION_SUPPORTED"
+    assert _rna_support_status("5", "30", "0.16", 0, "ASSESSED") == "RNA_ALT_SUPPORTED"
+    assert _rna_support_status("0", "30", "0", 0) == "RNA_ALT_NOT_DETECTED"

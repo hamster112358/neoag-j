@@ -22,6 +22,11 @@ class RNAVafSupport:
     rna_depth: str = ""
     rna_vaf: str = ""
     source: str = ""
+    # Review C3-04 (round 2): the producer's assessment state must survive
+    # the adapter, so a pileup ERROR / CONTIG_NOT_IN_BAM / UNASSESSED_COMPLEX
+    # row can never be rendered as a measured RNA negative downstream.
+    count_status: str = ""
+    count_error: str = ""
 
     def as_fields(self) -> dict[str, str]:
         return {
@@ -30,7 +35,14 @@ class RNAVafSupport:
             "rna_depth": self.rna_depth,
             "rna_vaf": self.rna_vaf,
             "rna_vaf_source": self.source,
+            "rna_count_status": self.count_status,
+            "rna_count_error": self.count_error,
         }
+
+
+# Technical (not biological) producer states: the counts are missing because
+# the assessment itself failed or was skipped, not because the site was read.
+RNA_COUNT_TECHNICAL_STATUSES = frozenset({"ERROR", "CONTIG_NOT_IN_BAM", "UNASSESSED_COMPLEX"})
 
 
 def _fmt_int(value: str) -> str:
@@ -96,6 +108,8 @@ def parse_rna_vaf_table(path: str | Path) -> list[RNAVafSupport]:
             rna_depth=_fmt_int(depth),
             rna_vaf=vaf,
             source=source,
+            count_status=first(row, ["count_status", "rna_count_status"], "").upper(),
+            count_error=first(row, ["rna_count_error", "count_error"], ""),
         ))
     return out
 
@@ -137,6 +151,8 @@ def support_from_raw_row(row: Mapping[str, str], source: str) -> RNAVafSupport:
         rna_depth=_fmt_int(depth),
         rna_vaf=vaf,
         source=source if any([alt_reads, ref_reads, depth, vaf]) else "",
+        count_status=first(row, ["count_status", "rna_count_status"], "").upper(),
+        count_error=first(row, ["rna_count_error", "count_error"], ""),
     )
 
 
