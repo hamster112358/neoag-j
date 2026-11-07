@@ -240,7 +240,18 @@ def _field_order(rows: Iterable[dict[str, str]]) -> list[str]:
     return fields
 
 
-def _index(rows: list[dict[str, str]], key: str) -> dict[str, dict[str, str]]:
+INTRA_DUPLICATE_FIELDS = [
+    "source", "key_field", "key_value", "field", "kept_value", "dropped_value",
+]
+
+
+def _index(
+    rows: list[dict[str, str]],
+    key: str,
+    *,
+    ledger: list[dict[str, str]] | None = None,
+    source: str = "",
+) -> dict[str, dict[str, str]]:
     result: dict[str, dict[str, str]] = {}
     for row in rows:
         value = str(row.get(key) or "")
@@ -248,8 +259,23 @@ def _index(rows: list[dict[str, str]], key: str) -> dict[str, dict[str, str]]:
             continue
         current = result.setdefault(value, {})
         for field, field_value in row.items():
-            if field_value not in (None, "") and not current.get(field):
+            if field_value in (None, ""):
+                continue
+            if not current.get(field):
                 current[field] = str(field_value)
+            elif str(current[field]) != str(field_value) and ledger is not None:
+                # Review B5-04 (round 2): one source carrying two different
+                # values for one key (two runs, two ORFs, two raw allele
+                # spellings) used to collapse first-non-empty silently.  The
+                # first value is still kept - only the record is new.
+                ledger.append({
+                    "source": source,
+                    "key_field": key,
+                    "key_value": value,
+                    "field": field,
+                    "kept_value": str(current[field]),
+                    "dropped_value": str(field_value),
+                })
     return result
 
 
@@ -315,8 +341,13 @@ def _strict_exact_index(
     return result
 
 
-def _event_index(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
-    result = _index(rows, "event_id")
+def _event_index(
+    rows: list[dict[str, str]],
+    *,
+    ledger: list[dict[str, str]] | None = None,
+    source: str = "",
+) -> dict[str, dict[str, str]]:
+    result = _index(rows, "event_id", ledger=ledger, source=source)
     alias_candidates: dict[str, set[str]] = {}
     for row in rows:
         event_id = str(row.get("event_id") or "")
@@ -433,6 +464,7 @@ def build_comprehensive_peptide_evidence(
     peptide_escape_flags: str | Path | None = None,
     validation_plan: str | Path | None = None,
     conflicts_tsv: str | Path | None = None,
+    intraduplicate_tsv: str | Path | None = None,
 ) -> dict[str, Any]:
     base_rows, base_name = _base_rows(annotated_peptides, ranked_peptides)
     source_paths = {
@@ -455,8 +487,17 @@ def build_comprehensive_peptide_evidence(
         source_rows["presentation_evidence"],
         [*base_rows, *source_rows["raw_peptides"], *source_rows["ranked_peptides"]],
     )
-    peptide_indexes = {name: _index(source_rows[name], "peptide_id") for name in PEPTIDE_SOURCES}
-    event_indexes = {name: _event_index(source_rows[name]) for name in EVENT_SOURCES}
+    # Review B5-04 (round 2): intra-source duplicate-key collisions get a
+    # ledger beside the output; reconciliation order stays first-non-empty.
+    intraduplicate_rows: list[dict[str, str]] = []
+    peptide_indexes = {
+        name: _index(source_rows[name], "peptide_id", ledger=intraduplicate_rows, source=name)
+        for name in PEPTIDE_SOURCES
+    }
+    event_indexes = {
+        name: _event_index(source_rows[name], ledger=intraduplicate_rows, source=name)
+        for name in EVENT_SOURCES
+    }
     presentation_pair_index = _strict_exact_index(
         source_rows["presentation_evidence"],
         key_fn=_peptide_hla_key,
@@ -623,6 +664,11 @@ def build_comprehensive_peptide_evidence(
     conflict_path = Path(conflicts_tsv) if conflicts_tsv else output_path.with_name("evidence_conflicts.tsv")
     write_tsv(output_path, output_rows, fields)
     write_tsv(conflict_path, conflict_rows, CONFLICT_FIELDS)
+    intraduplicate_path = (
+        Path(intraduplicate_tsv) if intraduplicate_tsv
+        else output_path.with_name("evidence_intraduplicate.tsv")
+    )
+    write_tsv(intraduplicate_path, intraduplicate_rows, INTRA_DUPLICATE_FIELDS)
     manifest_path = output_path.with_name("comprehensive_evidence_manifest.json")
     manifest_sources: dict[str, dict[str, Any]] = {}
     manifest_inputs = {"annotated_peptides": annotated_peptides, **source_paths}
@@ -665,11 +711,18 @@ def build_comprehensive_peptide_evidence(
             "rows": len(conflict_rows),
             "peptide_rows_affected": sum(bool(row["evidence_conflict_fields"]) for row in output_rows),
         },
+        "intra_duplicates": {
+            "path": str(intraduplicate_path),
+            "rows": len(intraduplicate_rows),
+            "policy": "first non-empty value kept; every dropped differing value recorded",
+        },
     }
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return {
         "output_tsv": str(output_path),
         "conflicts_tsv": str(conflict_path),
+        "intraduplicate_tsv": str(intraduplicate_path),
+        "intraduplicate_rows": len(intraduplicate_rows),
         "rows": len(output_rows),
         "columns": len(fields),
         "conflicts": len(conflict_rows),

@@ -189,7 +189,14 @@ def test_cap_ladder_is_total_and_deterministic():
     assert apply_priority_cap_value("B", "A") == "B"
     assert apply_priority_cap_value("B", "NONE") == "B"
     assert apply_priority_cap_value("B", "") == "B"
-    assert apply_priority_cap_value("B", "SOMETHING_ELSE") == "B"  # off-ladder ignored
+    # Round-2 correction (HANDOFF II/D2-02): an off-ladder cap token is a
+    # schema mismatch, not a no-op - it holds at D instead of being dropped.
+    assert apply_priority_cap_value("B", "SOMETHING_ELSE") == "D"
+    from neoag.scoring import unknown_priority_cap_label
+    assert unknown_priority_cap_label("something_else") == "SOMETHING_ELSE"
+    assert unknown_priority_cap_label("C_CAUTION") == ""
+    assert unknown_priority_cap_label("") == ""
+    assert unknown_priority_cap_label("A") == ""
     for pri in LADDER:
         for cap in LADDER:
             expected = pri if cap_rank(pri) <= cap_rank(cap) else cap

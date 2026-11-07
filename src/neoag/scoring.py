@@ -83,16 +83,43 @@ def cap_rank(label: str) -> int:
     return _CAP_LADDER.get(str(label or "").strip().upper(), 0)
 
 
+def unknown_priority_cap_label(cap: object) -> str:
+    """Return the normalized label when ``cap`` is present but off-ladder.
+
+    Review D2-02 (round 2): an unrecognized safety-cap token (a producer
+    that renamed its cap vocabulary, a profile typo) used to be silently
+    dropped, which is permissive - the candidate kept its uncapped
+    priority.  Such labels are now held at D and named in
+    ``priority_cap_status`` so a schema mismatch is visible in the output.
+    """
+    label = str(cap or "").strip().upper()
+    if label and label not in _CAP_LADDER and label not in {"A", "NONE"}:
+        return label
+    return ""
+
+
 def apply_priority_cap_value(priority_value: str, cap: str) -> str:
     cap = str(cap or "").strip().upper()
     if not cap or cap in {"A", "NONE"}:
         return priority_value
     if cap not in _CAP_LADDER:
-        # Off-ladder cap tokens are ignored rather than written into
-        # final_priority: the old code could emit a non-ladder label.
-        return priority_value
+        # Review D2-02 (round 2): off-ladder cap tokens hold at D (the
+        # most restrictive ladder rung) instead of being silently ignored.
+        return "D"
     pri = str(priority_value or "D").strip().upper()
     return priority_value if cap_rank(pri) <= cap_rank(cap) else cap
+
+
+def _merge_priority_cap(target: dict, incoming: object) -> None:
+    """Merge an incoming cap label, logging off-ladder labels (D2-02 round 2)."""
+    label = unknown_priority_cap_label(incoming)
+    if target.get("priority_cap"):
+        target["priority_cap"] = apply_priority_cap_value(target.get("priority_cap"), str(incoming))
+    else:
+        target["priority_cap"] = str(incoming)
+    if label:
+        target["priority_cap_status"] = f"OFF_LADDER_CAP:{label}"
+
 
 def merge_appm_modifier(p: dict[str, Any], appm_row: Mapping[str, Any] | None) -> dict[str, Any]:
     if not appm_row:
@@ -104,8 +131,8 @@ def merge_appm_modifier(p: dict[str, Any], appm_row: Mapping[str, Any] | None) -
         val = appm_row.get(k)
         if val in {None, ""}:
             continue
-        if k == "priority_cap" and p.get("priority_cap"):
-            p["priority_cap"] = apply_priority_cap_value(p.get("priority_cap"), str(val))
+        if k == "priority_cap":
+            _merge_priority_cap(p, val)
         else:
             p[k] = val
     return p
@@ -158,9 +185,9 @@ def merge_escape_flags(peptide: dict, flags: Mapping[str, Any] | None) -> dict:
     for k in ["escape_status", "escape_flag", "escape_reason", "resistance_risk", "escape_action", "escape_multiplier", "priority_cap"]:
         val = flags.get(k)
         if val not in {None, ""}:
-            if k == "priority_cap" and peptide.get("priority_cap"):
+            if k == "priority_cap":
                 # keep the stricter cap later via apply_priority_cap_value
-                peptide["priority_cap"] = apply_priority_cap_value(peptide.get("priority_cap"), str(val))
+                _merge_priority_cap(peptide, val)
             else:
                 peptide[k] = val
     if flags.get("escape_status") == "ESCAPE_REJECT":
@@ -186,8 +213,12 @@ def normalize_immunogenicity_score(
 ) -> float:
     """Map PRIME/BigMHC_IM composite (or legacy pVAC/IEDB) to a 0–1 score."""
     if profile is not None:
-        composite, _ = resolve_immunogenicity_score(peptide, presentation, profile)
-        if composite > 0:
+        composite, meta = resolve_immunogenicity_score(peptide, presentation, profile)
+        # Review D2-05 (round 2): availability, not magnitude, decides the
+        # fallback.  A resolved composite of exactly 0.0 is a measured
+        # result and stays authoritative; only the absence of component
+        # scores (source "none") may fall through to the legacy score.
+        if str(meta.get("immunogenicity_source", "none")) != "none":
             return composite
     pres = presentation or {}
     raw = peptide.get("immunogenicity_score") or pres.get("immunogenicity_score", "")
@@ -268,6 +299,13 @@ def appm_multiplier(p, summary, profile=None):
         if hla in loh_set:
             pen = float(profile.get("appm_penalty", {}).get("hla_allele_loh", 0.50))
             base = clamp(base - pen)
+            # Review D2-05 (round 2): name the allele-string provenance -
+            # this penalty was inferred from the sample summary's comma
+            # list, not from a per-candidate APPM modifier row.
+            p["appm_multiplier_reason"] = (
+                "sample_level_appm_summary+hla_loh_allele_string:"
+                f"penalty={pen:g} for {hla}"
+            )
     return clamp(base)
 
 # Review D2-03: the ranking cutoffs used to be inline magic numbers. They are
@@ -456,6 +494,11 @@ def score_peptide(p, e, profile, pres, summary):
     platform_cap = p.get("cross_platform_priority_cap", "")
     if platform_cap:
         p["priority_cap"] = apply_priority_cap_value(p.get("priority_cap", "") or "A", platform_cap)
+    # Review D2-02 (round 2): a cap label that is neither on the ladder nor a
+    # no-op token is a schema mismatch - hold at D and name it, never ignore.
+    unknown_cap = unknown_priority_cap_label(p.get("priority_cap"))
+    if unknown_cap:
+        p.setdefault("priority_cap_status", f"OFF_LADDER_CAP:{unknown_cap}")
     p["final_priority"] = apply_priority_cap_value(pri, p.get("priority_cap", ""))
     p["recommended_use"] = recommended(p, appm, ccf)
     return p

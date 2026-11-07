@@ -66,3 +66,42 @@ def test_score_applies_appm_peptide_modifiers(tmp_path):
     # merge to the STRICTER label instead of silently keeping whichever was
     # applied first (the old code tied C with C_CAUTION).
     assert peps[0]["priority_cap"] == "C_CAUTION"
+
+
+def test_d2_05_zero_composite_is_measured_and_only_source_none_falls_back():
+    # Round-2 (HANDOFF section I, D2-05): availability, not magnitude,
+    # decides the fallback.  A resolved composite of exactly 0.0 is a
+    # measured result and stays authoritative; only the absence of component
+    # scores (immunogenicity_source "none") may fall through to the legacy
+    # immunogenicity_score field.
+    from neoag.config import load_profile
+    from neoag.scoring import normalize_immunogenicity_score
+
+    profile = load_profile("default")
+    presentation_zero = {"bigmhc_im_score": "0.0000", "hla_allele": "HLA-A*02:01"}
+    peptide = {"immunogenicity_score": "0.9000"}
+    assert normalize_immunogenicity_score(peptide, presentation_zero, profile) == 0.0
+    # No component scores -> source "none" -> legacy value still honoured.
+    assert normalize_immunogenicity_score(dict(peptide), {}, profile) == 0.9
+    # Without a profile the composite path is not consulted at all.
+    assert normalize_immunogenicity_score(dict(peptide), presentation_zero, None) == 0.9
+
+
+def test_d2_05_sample_level_loh_penalty_names_its_allele_string_provenance():
+    # Round-2 (HANDOFF section I, D2-05): when the LOH penalty comes from the
+    # sample summary's comma-separated allele list rather than a per-candidate
+    # APPM modifier row, the reason must say so and name the allele.
+    from neoag.config import load_profile
+    from neoag.scoring import appm_multiplier
+
+    profile = load_profile("default")
+    peptide = {"hla_allele": "HLA-A*02:01"}
+    summary = {"mhc_i_integrity_score": "1.0", "hla_loh_alleles": "HLA-A*02:01,HLA-B*07:02"}
+    value = appm_multiplier(peptide, summary, profile)
+    assert value < 1.0
+    reason = peptide["appm_multiplier_reason"]
+    assert reason.startswith("sample_level_appm_summary+hla_loh_allele_string:")
+    assert "HLA-A*02:01" in reason or "A*02:01" in reason
+    untouched = {"hla_allele": "HLA-C*07:02"}
+    appm_multiplier(untouched, summary, profile)
+    assert "appm_multiplier_reason" not in untouched
