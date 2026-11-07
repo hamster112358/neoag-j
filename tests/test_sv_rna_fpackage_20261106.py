@@ -13,7 +13,8 @@ B4-08  fusion joins honour the breakend orientation of the ALT column;
 B4-09  a breakpoint snapped to the nearest CDS base is an APPROXIMATE
        projection, forcing low reconstruction confidence.
 B4-10  SV clustering is the transitive closure of pairwise compatibility,
-       identical for every input order.
+       identical for every input order; event VAF and confidence aggregate
+       only over members compatible with the representative (round 2).
 B4-14  predictor provenance follows the actual producer of the result file,
        not the global binding_stub flag.
 B4-16  a gene missing from the expression table blanks event_expression
@@ -35,8 +36,10 @@ from neoag.sv.phase1 import (
     _event_expression,
     _raw_event_from_sv,
     _support_rollup,
+    _sv_event_row,
     build_sv_phase1_raw,
 )
+from neoag.sv.sv_filter import score_cluster_confidence
 from neoag.sv.protein_reconstruct import reconstruct_cluster_protein
 from neoag.sv.reference import FastaReference, GtfAnnotation
 from neoag.sv.score_pipeline import run_sv_score
@@ -458,3 +461,107 @@ def test_missing_expression_rows_blank_the_value(tmp_path):
     # Absence is blank + status, never a presented TPM 0.0.
     assert raw[0]["event_expression"] == ""
     assert raw[0]["expression_evidence_status"] == "UNASSESSED_ID_NOT_MAPPED"
+
+
+# ------------------------------------------------- B4-10 round-2 follow-up --
+
+def test_b4_10_transitive_chain_counts_only_representative_compatible_evidence():
+    """Operator test 1 (2026-11-07): a transitive SV cluster whose remote
+    member has distinct breakpoints AND an incompatible orientation, with
+    different read counts/depths.  Shows the representative, all member
+    evidence, the calculated VAF, the confidence score and the event
+    consequences; the decision is that only representative-compatible
+    evidence contributes to the event."""
+    # A: GRIDSS DEL chr1:100000-200000 (+/+), 40 alt / 50 depth, CI 10 bp.
+    a = SVRecord(
+        "A", "GRIDSS", "chr1", 100_000, "chr1", 200_000, "DEL",
+        strand1="+", strand2="+", tumor_sr=12, tumor_pe=30,
+        tumor_alt_support=40, tumor_local_depth=50,
+        cipos="0,10", ciend="0,10", tumor_support_status="MEASURED",
+    )
+    # B: Manta at B:100150-200120, strand unknown (./.) - within 200 bp of
+    # both A and C, so it chains them although A and C never agree.
+    b = SVRecord(
+        "B", "Manta", "chr1", 100_150, "chr1", 200_120, "DEL",
+        strand1=".", strand2=".", tumor_sr=0, tumor_pe=1,
+        tumor_alt_support=2, tumor_local_depth=30, tumor_support_status="MEASURED",
+    )
+    # C: SvABA DEL chr1:100300-200300 (-/-): 300 bp from A (beyond the 200 bp
+    # window) with opposite orientation, but 150/180 bp from B - the classic
+    # transitive chain member.  It carries the LARGEST raw counts so an
+    # unrestricted aggregation would let it dominate the event.
+    c = SVRecord(
+        "C", "SvABA", "chr1", 100_300, "chr1", 200_300, "DEL",
+        strand1="-", strand2="-", tumor_sr=18, tumor_pe=90,
+        tumor_alt_support=200, tumor_local_depth=210,
+        sniffles_support=25, cipos="0,3", ciend="0,3",
+        tumor_support_status="MEASURED",
+    )
+    for permutation in itertools.permutations([a, b, c]):
+        clusters = cluster_sv_records(list(permutation), distance=200)
+        assert len(clusters) == 1
+        cluster = clusters[0]
+        assert cluster.representative.caller == "GRIDSS"  # priority + support
+        assert sorted(cluster.record_ids) == ["A", "B", "C"]
+        assert [r.caller for r in cluster.compatible_records] == sorted(
+            [r.caller for r in cluster.compatible_records]
+        )
+    cluster = cluster_sv_records([b, c, a], distance=200)[0]
+    assert [r.record_id for r in cluster.compatible_records] == ["A", "B"]
+    assert [r.record_id for r in cluster.incompatible_records] == ["C"]
+
+    # Member evidence as the operator asked to see it: A 40/50 (0.80),
+    # B 2/30, C 200/210 (0.952).  Aggregated over ALL members (the old
+    # behaviour) the event VAF would read 200/210 = 0.952 and the caller
+    # count would claim 3 callers for an event only two callers described.
+    old_style_vaf = max(a.tumor_alt_support, b.tumor_alt_support, c.tumor_alt_support) / max(
+        a.tumor_local_depth, b.tumor_local_depth, c.tumor_local_depth
+    )
+    assert old_style_vaf == pytest.approx(0.952381, abs=1e-4)
+
+    conf = score_cluster_confidence(cluster)
+    # Compatible members: GRIDSS+Manta -> caller_score 2/3; GRIDSS split/
+    # pair support (12/30) alone clamps support_score to 1.0; GRIDSS CI 10 bp
+    # -> precision_score 1.0; no normal data, no RNA bonus.
+    assert conf.score == pytest.approx(0.30 * (2 / 3) + 0.35 * 1.0 + 0.20 * 1.0, abs=1e-9)
+    assert conf.score == pytest.approx(0.75)
+    # Unrestricted aggregation would have scored C's 3-caller support and
+    # long-read evidence into this event:
+    assert conf.score < 0.30 * 1.0 + 0.35 * 1.0 + 0.20 * 1.0  # 0.85 old-style
+    assert "incompatible_cluster_members_excluded" in conf.reason
+
+    row = _sv_event_row(cluster, "SV1", "S1", {}, conf, None, 0)
+    # Event coordinates/identity come from the single self-consistent
+    # representative record.
+    assert (row["chrom1"], row["pos1"], row["strand1"]) == ("chr1", 100_000, "+")
+    assert (row["chrom2"], row["pos2"], row["strand2"]) == ("chr1", 200_000, "+")
+    # VAF now describes the representative's event: 40/50, not C's 0.952.
+    assert row["sv_vaf_like"] == "0.8000"
+    assert row["tumor_alt_support"] == 40 and row["tumor_local_depth"] == 50
+    assert row["tumor_sr"] == 12 and row["tumor_pe"] == 30  # not C's 18/90
+    assert row["sniffles_support"] == 0  # C's 25 long reads excluded
+    assert row["breakpoint_precision_bp"] == 10  # GRIDSS CI, not C's 3 bp
+    assert row["callers"] == "GRIDSS,Manta" and row["caller_count"] == 2
+    assert row["cluster_all_callers"] == "GRIDSS,Manta,SvABA"
+    # Nothing hidden: all three members stay listed, C named as excluded.
+    assert row["record_ids"] == "A,B,C"
+    assert row["cluster_record_count"] == 3 and row["compatible_record_count"] == 2
+    assert row["excluded_incompatible_record_ids"] == "C"
+    assert row["excluded_incompatible_tumor_alt_max"] == 200
+    assert row["event_evidence_basis"] == "REPRESENTATIVE_COMPATIBLE@v1"
+    assert row["event_confidence_tier"] == conf.tier == "Tier1"
+
+    # Event consequence layer: the phase-1 raw event inherits the corrected
+    # VAF (clonality prior) and honest normal status (specificity cap).
+    raw = _raw_event_from_sv(row, None, {}, {}, "default")
+    assert float(raw["clonality"]) == 1.0  # 0.8/0.35 saturates
+    assert raw["tumor_specificity"] == "0.8500"  # unassessed normal cap (B4-07)
+
+    # A fully compatible cluster keeps the old basis label and discloses no
+    # exclusions.
+    plain = cluster_sv_records([a, b], distance=200)[0]
+    plain_conf = score_cluster_confidence(plain)
+    plain_row = _sv_event_row(plain, "SV0", "S1", {}, plain_conf, None, 0)
+    assert plain_row["event_evidence_basis"] == "ALL_MEMBERS_COMPATIBLE"
+    assert plain_row["excluded_incompatible_record_ids"] == ""
+    assert "incompatible_cluster_members_excluded" not in plain_conf.reason

@@ -27,13 +27,21 @@ def score_cluster_confidence(
     rna_junction_reads: int = 0,
 ) -> ConfidenceResult:
     rep = cluster.representative
-    caller_count = len(cluster.callers)
-    tumor_sr = cluster.max_int("tumor_sr")
-    tumor_pe = cluster.max_int("tumor_pe")
-    sniffles_support = cluster.max_int("sniffles_support")
-    normal_sr = cluster.max_int("normal_sr")
-    normal_pe = cluster.max_int("normal_pe")
-    precision = cluster.best_precision() or rep.breakpoint_precision_bp
+    # Review B4-10 (round 2): clustering is transitive, so the cluster may
+    # contain members chained through an intermediate that are NOT compatible
+    # with the representative (distinct breakpoints or orientations).  The
+    # confidence score describes the event the representative describes, so
+    # every evidence channel - support, caller agreement, precision and the
+    # normal penalty alike - is aggregated only over representative-
+    # compatible members.  Excluded members stay disclosed on the event row
+    # (compatible_record_count / excluded_incompatible_record_ids).
+    caller_count = len(cluster.compatible_callers)
+    tumor_sr = cluster.compatible_max_int("tumor_sr")
+    tumor_pe = cluster.compatible_max_int("tumor_pe")
+    sniffles_support = cluster.compatible_max_int("sniffles_support")
+    normal_sr = cluster.compatible_max_int("normal_sr")
+    normal_pe = cluster.compatible_max_int("normal_pe")
+    precision = cluster.compatible_best_precision() or rep.breakpoint_precision_bp
 
     caller_score = clamp(caller_count / 3.0)
     lr_support_score = clamp(sniffles_support / max(min_tumor_pe * 2, 1))
@@ -74,6 +82,8 @@ def score_cluster_confidence(
         reasons.append("normal_support_penalty")
     if precision and precision > max_breakpoint_ci_bp:
         reasons.append("imprecise_breakpoint")
+    if len(cluster.compatible_records) < len(cluster.records):
+        reasons.append("incompatible_cluster_members_excluded")
 
     assembly_singleton = caller_count == 1 and rep.caller.lower() in {"gridss", "gridss2", "svaba"} and (tumor_sr >= min_tumor_sr or rep.tumor_alt_support >= min_tumor_sr)
     if (caller_count >= 2 and score >= 0.55 and normal_penalty < 0.60) or (assembly_singleton and rna_junction_reads >= 3):

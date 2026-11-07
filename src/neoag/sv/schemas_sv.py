@@ -3,6 +3,8 @@ SV_EVENT_FULL_FIELDS = [
     "chrom1", "pos1", "strand1", "chrom2", "pos2", "strand2", "bnd_alt",
     "cipos", "ciend", "svlen", "inserted_sequence",
     "callers", "caller_count", "record_ids",
+    "cluster_record_count", "compatible_record_count", "cluster_all_callers",
+    "excluded_incompatible_record_ids", "excluded_incompatible_tumor_alt_max", "event_evidence_basis",
     "tumor_sr", "tumor_pe", "tumor_alt_support", "tumor_local_depth",
     "normal_sr", "normal_pe", "normal_alt_support", "normal_local_depth",
     "tumor_support_status", "normal_support_status",

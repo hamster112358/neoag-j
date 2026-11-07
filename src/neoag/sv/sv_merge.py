@@ -45,6 +45,12 @@ class SVCluster:
     # (dataclasses.replace, pickling round-trips) would silently lose.  It is
     # now a declared typed field that survives construction and copying.
     capture_annotation: dict[str, str] = field(default_factory=dict)
+    # Review B4-10 (round 2): the clustering parameters that produced this
+    # partition, so the cluster can re-derive which members are pairwise
+    # compatible with the representative (see compatible_records).
+    distance: int = 200
+    consider_type: bool = True
+    consider_strand: bool = True
 
     @property
     def representative(self) -> SVRecord:
@@ -57,8 +63,34 @@ class SVCluster:
         )[0]
 
     @property
+    def compatible_records(self) -> list[SVRecord]:
+        """Members that agree pairwise with the representative.
+
+        Review B4-10: the partition is a transitive closure, so a chained
+        member can sit at incompatible coordinates or orientation from the
+        representative.  Chaining stays (no record is dropped - every member
+        is still listed on the event row), but read counts, caller agreement,
+        precision and penalties are aggregated only over members whose own
+        breakpoints describe the SAME event the representative describes.
+        """
+        rep = self.representative
+        return [
+            r for r in self.records
+            if _compatible(rep, r, self.distance, self.consider_type, self.consider_strand)
+        ]
+
+    @property
+    def incompatible_records(self) -> list[SVRecord]:
+        included = {id(r) for r in self.compatible_records}
+        return [r for r in self.records if id(r) not in included]
+
+    @property
     def callers(self) -> list[str]:
         return sorted({r.caller for r in self.records})
+
+    @property
+    def compatible_callers(self) -> list[str]:
+        return sorted({r.caller for r in self.compatible_records})
 
     @property
     def record_ids(self) -> list[str]:
@@ -67,8 +99,22 @@ class SVCluster:
     def max_int(self, attr: str) -> int:
         return max((int(getattr(r, attr, 0) or 0) for r in self.records), default=0)
 
+    def compatible_max_int(self, attr: str) -> int:
+        return max(
+            (int(getattr(r, attr, 0) or 0) for r in self.compatible_records),
+            default=0,
+        )
+
     def best_precision(self) -> int:
         vals = [r.breakpoint_precision_bp for r in self.records if r.breakpoint_precision_bp > 0]
+        return min(vals) if vals else 0
+
+    def compatible_best_precision(self) -> int:
+        vals = [
+            r.breakpoint_precision_bp
+            for r in self.compatible_records
+            if r.breakpoint_precision_bp > 0
+        ]
         return min(vals) if vals else 0
 
 
@@ -118,4 +164,12 @@ def cluster_sv_records(records: list[SVRecord], distance: int = 200, consider_ty
     grouped: dict[int, list[SVRecord]] = {}
     for index, rec in enumerate(ordered):
         grouped.setdefault(find(index), []).append(rec)
-    return [SVCluster(sorted(members, key=_norm_chrom_pair)) for _, members in sorted(grouped.items())]
+    return [
+        SVCluster(
+            sorted(members, key=_norm_chrom_pair),
+            distance=distance,
+            consider_type=consider_type,
+            consider_strand=consider_strand,
+        )
+        for _, members in sorted(grouped.items())
+    ]

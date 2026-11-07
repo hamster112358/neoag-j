@@ -91,10 +91,23 @@ def _support_rollup(records, attr: str) -> str:
 
 def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], conf, protein: ProteinReconstruction | None, rna_reads: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     rep = cluster.representative
-    t_alt = max(cluster.max_int("tumor_alt_support"), rep.tumor_alt_support)
-    t_depth = max(cluster.max_int("tumor_local_depth"), rep.tumor_local_depth)
-    n_alt = max(cluster.max_int("normal_alt_support"), rep.normal_alt_support)
-    n_depth = max(cluster.max_int("normal_local_depth"), rep.normal_local_depth)
+    # Review B4-10 (round 2): clustering is transitive, so a chained member
+    # can describe a different breakpoint pair or orientation than the
+    # representative.  Only representative-compatible members contribute to
+    # VAF, support, precision and caller agreement; every member stays
+    # disclosed on the row (record_ids + the *_incompatible_* columns) so
+    # nothing is silently dropped.
+    compatible = cluster.compatible_records
+    compatible_ids = {id(r) for r in compatible}
+    excluded = [r for r in cluster.records if id(r) not in compatible_ids]
+
+    def compat_max(attr: str) -> int:
+        return max((int(getattr(r, attr, 0) or 0) for r in compatible), default=0)
+
+    t_alt = max(compat_max("tumor_alt_support"), rep.tumor_alt_support)
+    t_depth = max(compat_max("tumor_local_depth"), rep.tumor_local_depth)
+    n_alt = max(compat_max("normal_alt_support"), rep.normal_alt_support)
+    n_depth = max(compat_max("normal_local_depth"), rep.normal_local_depth)
     vaf = (t_alt / t_depth) if t_depth else rep.vaf_like
     extra = extra or {}
     return {
@@ -115,31 +128,37 @@ def _sv_event_row(cluster, event_id: str, sample_id: str, meta: dict[str, Any], 
         "ciend": rep.ciend,
         "svlen": rep.svlen,
         "inserted_sequence": rep.inserted_sequence,
-        "callers": ",".join(cluster.callers),
-        "caller_count": len(cluster.callers),
+        "callers": ",".join(cluster.compatible_callers),
+        "caller_count": len(cluster.compatible_callers),
         "record_ids": ",".join(cluster.record_ids),
-        "tumor_sr": cluster.max_int("tumor_sr"),
-        "tumor_pe": cluster.max_int("tumor_pe"),
+        "cluster_record_count": len(cluster.records),
+        "compatible_record_count": len(compatible),
+        "cluster_all_callers": ",".join(cluster.callers),
+        "excluded_incompatible_record_ids": ";".join(r.record_id for r in excluded),
+        "excluded_incompatible_tumor_alt_max": max((r.tumor_alt_support for r in excluded), default=0),
+        "event_evidence_basis": "REPRESENTATIVE_COMPATIBLE@v1" if excluded else "ALL_MEMBERS_COMPATIBLE",
+        "tumor_sr": compat_max("tumor_sr"),
+        "tumor_pe": compat_max("tumor_pe"),
         "tumor_alt_support": t_alt,
         "tumor_local_depth": t_depth,
-        "normal_sr": cluster.max_int("normal_sr"),
-        "normal_pe": cluster.max_int("normal_pe"),
+        "normal_sr": compat_max("normal_sr"),
+        "normal_pe": compat_max("normal_pe"),
         "normal_alt_support": n_alt,
         "normal_local_depth": n_depth,
-        "tumor_support_status": _support_rollup(cluster.records, "tumor_support_status"),
-        "normal_support_status": _support_rollup(cluster.records, "normal_support_status"),
+        "tumor_support_status": _support_rollup(compatible, "tumor_support_status"),
+        "normal_support_status": _support_rollup(compatible, "normal_support_status"),
         "breakpoint1_cds_mapping": meta.get("breakpoint1_cds_mapping", ""),
         "breakpoint2_cds_mapping": meta.get("breakpoint2_cds_mapping", ""),
         "breakpoint_orientation_status": meta.get("breakpoint_orientation_status", ""),
-        "sniffles_support": cluster.max_int("sniffles_support"),
-        "sniffles_coverage": cluster.max_int("sniffles_coverage"),
+        "sniffles_support": compat_max("sniffles_support"),
+        "sniffles_coverage": compat_max("sniffles_coverage"),
         "sniffles_precise": rep.sniffles_precise,
-        "sniffles_rnames_count": cluster.max_int("sniffles_rnames_count"),
+        "sniffles_rnames_count": compat_max("sniffles_rnames_count"),
         "sv_vaf_like": f"{clamp(vaf):.4f}",
         "pon_overlap": "not_assessed",
         "population_sv_overlap": "not_assessed",
         "blacklist_overlap": "not_assessed",
-        "breakpoint_precision_bp": cluster.best_precision() or rep.breakpoint_precision_bp,
+        "breakpoint_precision_bp": cluster.compatible_best_precision() or rep.breakpoint_precision_bp,
         "event_confidence_tier": conf.tier,
         "event_confidence_score": f"{conf.score:.4f}",
         "gene1": meta.get("gene1", ""),
@@ -199,17 +218,24 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
     # 1.0 maximum; without a matched normal the value is capped and the
     # basis is stated in tumor_specificity_status.
     specificity = 1.0
+    specificity_policy = "specificity_rules@v1"
     if float(svrow.get("normal_alt_support") or 0) > 0:
         specificity -= 0.3
         specificity_status = "MATCHED_NORMAL_SUPPORT_DETECTED"
+        specificity_policy += ":matched_normal_support_penalty_0.30"
     elif str(svrow.get("normal_support_status") or "") == "MEASURED":
         specificity_status = "MATCHED_NORMAL_ZERO_SUPPORT"
+        specificity_policy += ":matched_normal_measured"
     else:
         cap = float((sv_rules or {}).get("normal_unassessed_specificity_cap", 0.85))
         specificity = min(specificity, cap)
         specificity_status = "NORMAL_UNASSESSED"
+        # Review B4-07: the cap is a policy choice, so the row states which
+        # policy and value were applied instead of hiding a tuning constant.
+        specificity_policy += f":normal_unassessed_cap={cap:g}"
     if str(svrow.get("population_sv_overlap", "not_assessed")) == "yes":
         specificity -= 0.4
+        specificity_policy += ":population_sv_overlap_penalty_0.40"
     # Review B4-05: these three components are triage priors, not measured
     # quantities.  The clonality number is a VAF proxy (vaf/0.35) that is not
     # calibrated for purity or copy number - the calibrated per-event CCF and
@@ -273,6 +299,7 @@ def _raw_event_from_sv(svrow: dict[str, Any], protein: ProteinReconstruction | N
         "persistence": f"{persistence:.4f}",
         "tumor_specificity": f"{clamp(specificity):.4f}",
         "tumor_specificity_status": specificity_status,
+        "tumor_specificity_policy": specificity_policy,
         "ccf_estimate": "",
         "ccf_status": "",
         "clonality_multiplier": "1.0",
