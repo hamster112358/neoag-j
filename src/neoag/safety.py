@@ -109,11 +109,20 @@ def _normal_expr_for_event_gene(gene_value, normal_expr):
         row = normal_expr.get(g, {})
         if row:
             found = True
-            row_nt = to_float(row.get("normal_tissue_max_tpm"), 0.0)
-            if row_nt >= nt:
+            # Review WS4: a BLANK quantification cell in an existing row is
+            # an unassessed value, not a measured zero - only real numbers
+            # contribute to the aggregation and keep the ASSRESSED status.
+            nt_cell = str(row.get("normal_tissue_max_tpm") or "").strip()
+            hspc_cell = str(row.get("normal_hspc_tpm") or "").strip()
+            if not nt_cell:
+                expr_assessed = False
+            if not hspc_cell:
+                hspc_assessed = False
+            row_nt = to_float(nt_cell, 0.0) if nt_cell else 0.0
+            if nt_cell and row_nt >= nt:
                 nt = row_nt; nt_tissue = row.get("normal_tissue_max_tissue", "")
-            row_hspc = to_float(row.get("normal_hspc_tpm"), 0.0)
-            if row_hspc >= nh:
+            row_hspc = to_float(hspc_cell, 0.0) if hspc_cell else 0.0
+            if hspc_cell and row_hspc >= nh:
                 nh = row_hspc; hspc_unit = row.get("normal_hspc_unit", "TPM")
             row_critical = to_float(row.get("critical_tissue_max_tpm"), row_nt)
             if row_critical >= critical_tpm:
@@ -131,9 +140,32 @@ def _normal_expr_for_event_gene(gene_value, normal_expr):
         "normal_hspc_status": "ASSESSED" if found and hspc_assessed else "UNASSESSED",
     } if found else {}
 
+def _is_junction_derived_event(e) -> bool:
+    event_type = str(e.get("event_type") or "").lower()
+    mutation_source = str(e.get("mutation_source") or "").lower()
+    return (
+        "fusion" in event_type or "splice" in event_type or "junction" in event_type
+        or mutation_source in {"fusion", "splice"}
+    )
+
+
 def apply_event_safety(e, profile, normal_expr):
     safety = profile.get("safety", {})
     expr = _normal_expr_for_event_gene(e.get("gene",""), normal_expr)
+    # Operator decision 2026-11-08 (FURTHER_SUGGESTIONS WS4): a universal
+    # hard exclusion from GENE-LEVEL TPM alone is declined for junction
+    # candidates.  Partner-gene expression does not measure fusion/splice
+    # transcript abundance: a low-TPM partner can still have credible exact-
+    # junction RNA support, and a high-TPM partner does not establish that
+    # its fusion transcript exists.  Exact, quality-controlled junction
+    # evidence (upstream RNA layers) stays the primary expression evidence;
+    # gene TPM for these events is auxiliary and caps at CAUTION.  A hard
+    # expression exclusion would require an event-specific negative
+    # assessment with adequate coverage, which gene TPM never is.
+    # "legacy_fail" restores the old blanket behaviour for comparisons.
+    junction_derived = _is_junction_derived_event(e)
+    gene_tpm_policy = str(safety.get("junction_event_gene_tpm_action", "auxiliary")).upper()
+    gene_tpm_auxiliary = junction_derived and gene_tpm_policy != "LEGACY_FAIL"
     nt = to_float(e.get("normal_tissue_max_tpm"), expr.get("normal_tissue_max_tpm", 0.0))
     critical_tpm = to_float(e.get("critical_tissue_max_tpm"), expr.get("critical_tissue_max_tpm", nt))
     nh = to_float(e.get("normal_hspc_tpm"), expr.get("normal_hspc_tpm", 0.0))
@@ -151,8 +183,12 @@ def apply_event_safety(e, profile, normal_expr):
         reasons.append("normal_hspc_unassessed")
     critical_action = str(safety.get("critical_tissue_expression_action", "FAIL")).upper()
     if expr_assessed and crit and critical_tpm >= float(safety.get("hard_exclusion_critical_tissue_tpm", 10.0)):
-        status = "FAIL" if critical_action in {"FAIL", "REJECT"} else worst_safety_status(status, "CAUTION")
-        reasons.append("critical_tissue_expression")
+        if gene_tpm_auxiliary:
+            status = worst_safety_status(status, "CAUTION")
+            reasons.append("critical_tissue_expression_gene_tpm_auxiliary")
+        else:
+            status = "FAIL" if critical_action in {"FAIL", "REJECT"} else worst_safety_status(status, "CAUTION")
+            reasons.append("critical_tissue_expression")
     elif expr_assessed and crit and critical_tpm >= float(safety.get("caution_critical_tissue_tpm", 1.0)):
         status = worst_safety_status(status, "CAUTION"); reasons.append("critical_tissue_expression")
     fail_key = "normal_hspc_fail_ncpm" if hspc_is_ncpm else "normal_hspc_fail_tpm"
@@ -161,8 +197,12 @@ def apply_event_safety(e, profile, normal_expr):
     hspc_caution = float(safety.get(caution_key, safety.get("normal_hspc_caution_tpm", 2.0)))
     hspc_action = str(safety.get("normal_hspc_expression_action", "FAIL")).upper()
     if hspc_assessed and nh >= hspc_fail:
-        status = "FAIL" if hspc_action in {"FAIL", "REJECT"} else worst_safety_status(status, "CAUTION")
-        reasons.append("normal_HSPC_expression")
+        if gene_tpm_auxiliary:
+            status = worst_safety_status(status, "CAUTION")
+            reasons.append("normal_HSPC_expression_gene_tpm_auxiliary")
+        else:
+            status = "FAIL" if hspc_action in {"FAIL", "REJECT"} else worst_safety_status(status, "CAUTION")
+            reasons.append("normal_HSPC_expression")
     elif hspc_assessed and nh >= hspc_caution and status != "FAIL":
         status = worst_safety_status(status, "CAUTION"); reasons.append("normal_HSPC_expression")
     e.update({
@@ -174,7 +214,13 @@ def apply_event_safety(e, profile, normal_expr):
         "critical_tissue_hit": "yes" if crit else "no",
         "normal_expression_status": "ASSESSED" if expr_assessed else "UNASSESSED",
         "normal_hspc_status": "ASSESSED" if hspc_assessed else "UNASSESSED",
-        "safety_status": status, "safety_reason": combine_safety_reasons(*reasons)
+        "safety_status": status, "safety_reason": combine_safety_reasons(*reasons),
+        # The policy applied to gene-level TPM for THIS event type, stated
+        # on the row so the auxiliary-vs-decisive distinction is auditable.
+        "gene_tpm_policy": (
+            "AUXILIARY_FOR_JUNCTION_EVENTS@v1" if gene_tpm_auxiliary
+            else "DECISIVE@v1" if junction_derived else "DECISIVE_GENE_EVENT@v1"
+        ),
     })
     return e
 

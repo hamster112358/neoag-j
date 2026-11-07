@@ -44,7 +44,7 @@ PEPTIDE_SAFETY_FIELDS = [
 EVENT_SAFETY_FIELDS = [
     'event_id','sample_id','gene','event_type','mutation_source','normal_expression_status','normal_junction_status',
     'normal_junction_match_level',
-    'matched_normal_status','event_safety_status','event_safety_reason',
+    'matched_normal_status','event_safety_status','event_safety_reason','gene_tpm_policy',
     'normal_hspc_status','reference_proteome_status','normal_ligandome_status','anchor_assessment_status',
     'normal_tissue_max_tpm','normal_tissue_max_tissue','critical_tissue_max_tpm','critical_tissue_name',
     'normal_hspc_tpm','normal_hspc_unit','safety_evidence_completeness','safety_missing_layers'

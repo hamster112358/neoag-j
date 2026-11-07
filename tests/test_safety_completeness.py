@@ -644,3 +644,131 @@ def test_c6_05_anchor_heuristic_never_rejects_without_explicit_policy(tmp_path):
     )
     assert row_reject["safety_status"] == "FAIL"
     assert "anchor_only_reject_explicitly_enabled" in row_reject["safety_reason"]
+
+
+# ------------------- Fusion expression-veto policy (FURTHER_SUGGESTIONS WS4) --
+
+def _expr_event(tmp_path, name, event_type="Fusion", mutation_source="SV"):
+    events = tmp_path / f"e_{name}.tsv"
+    peptides = tmp_path / f"p_{name}.tsv"
+    write_tsv(events, [{
+        "event_id": "E1", "sample_id": "S1", "event_type": event_type,
+        "mutation_source": mutation_source, "gene": "PARTNERA::PARTNERB",
+    }])
+    write_tsv(peptides, [{
+        "peptide_id": "P1", "event_id": "E1", "sample_id": "S1",
+        "event_type": event_type, "mutation_source": mutation_source,
+        "gene": "PARTNERA::PARTNERB", "peptide": "ABCDEFGHIJK",
+        "peptide_consequence": "fusion",
+        "hla_allele": "HLA-A*02:01", "mhc_class": "I",
+    }])
+    return events, peptides
+
+
+def _partner_normal(tmp_path, name, **overrides):
+    row = {
+        "gene": "PARTNERA", "normal_tissue_max_tpm": "80",
+        "normal_tissue_max_tissue": "Lung",
+        "critical_tissue_max_tpm": "75", "critical_tissue_name": "Brain",
+        "critical_tissue_hit": "yes", "normal_hspc_tpm": "730",
+        "normal_hspc_unit": "TPM",
+    }
+    row.update(overrides)
+    quiet = dict(row)
+    quiet.update({
+        "gene": "PARTNERB", "normal_tissue_max_tpm": "2",
+        "critical_tissue_max_tpm": "0.5", "critical_tissue_hit": "no",
+        "normal_hspc_tpm": "0.4",
+    })
+    normal = tmp_path / f"n_{name}.tsv"
+    write_tsv(normal, [row, quiet])
+    return normal
+
+
+def test_ws4_fusion_partner_gene_tpm_is_auxiliary_not_a_hard_veto(tmp_path):
+    from neoag.safety import apply_event_safety, load_normal_expression
+
+    normal = _partner_normal(tmp_path, "aux")
+    norm_expr = load_normal_expression(normal)
+    event = {"event_id": "E1", "gene": "PARTNERA::PARTNERB",
+             "event_type": "SV_Fusion", "mutation_source": "SV"}
+    out = apply_event_safety(dict(event), {}, norm_expr)
+    # Partner-gene TPM (critical 75 / HSPC 730) no longer hard-vetoes a
+    # junction candidate by itself: it caps at CAUTION and says so.
+    assert out["safety_status"] == "CAUTION"
+    assert "critical_tissue_expression_gene_tpm_auxiliary" in out["safety_reason"]
+    assert "normal_HSPC_expression_gene_tpm_auxiliary" in out["safety_reason"]
+    assert out["gene_tpm_policy"] == "AUXILIARY_FOR_JUNCTION_EVENTS@v1"
+
+    # The legacy blanket behaviour stays available for shadow comparisons.
+    legacy_profile = {"safety": {"junction_event_gene_tpm_action": "legacy_fail"}}
+    out_legacy = apply_event_safety(dict(event), legacy_profile, norm_expr)
+    assert out_legacy["safety_status"] == "FAIL"
+    assert out_legacy["gene_tpm_policy"] == "DECISIVE@v1"
+
+    # Non-junction events keep the decisive gene-level rule unchanged.
+    snv = {"event_id": "E2", "gene": "PARTNERA::PARTNERB",
+           "event_type": "SNV", "mutation_source": "SNV"}
+    out_snv = apply_event_safety(dict(snv), {}, norm_expr)
+    assert out_snv["safety_status"] == "FAIL"
+    assert "critical_tissue_expression" in out_snv["safety_reason"]
+
+
+def test_ws4_high_partner_tpm_without_junction_support_is_not_rna_evidence(tmp_path):
+    # Expression columns and RNA support are separate vocabularies: a huge
+    # partner TPM must never appear as junction-based RNA confirmation.
+    events, peptides = _expr_event(tmp_path, "rna")
+    normal = _partner_normal(tmp_path, "rna")
+    rows, event_rows = build_peptide_safety_gate(
+        raw_events=events, raw_peptides=peptides,
+        out_peptide_safety=tmp_path / "ps_rna.tsv",
+        out_event_safety=tmp_path / "es_rna.tsv",
+        normal_expression=normal,
+    )
+    assert rows[0]["normal_tissue_max_tpm"] != ""
+    # The safety gate itself never states RNA confirmation from TPM.
+    row_text = ";".join(str(v) for v in rows[0].values())
+    assert "RNA_CONFIRMED" not in row_text
+    assert event_rows[0]["event_safety_status"] == "CAUTION"
+
+
+def test_ws4_blank_quantification_is_unassessed_not_a_measured_zero(tmp_path):
+    from neoag.safety import apply_event_safety, load_normal_expression
+
+    blank = tmp_path / "n_blank.tsv"
+    write_tsv(blank, [{
+        "gene": "PARTNERA", "normal_tissue_max_tpm": "",
+        "critical_tissue_max_tpm": "", "critical_tissue_hit": "no",
+        "normal_hspc_tpm": "",
+    }])
+    event = {"event_id": "E1", "gene": "PARTNERA", "event_type": "SNV",
+             "mutation_source": "SNV"}
+    out = apply_event_safety(dict(event), {}, load_normal_expression(blank))
+    # A row that exists but quantifies nothing is UNASSESSED (uncertainty),
+    # never a measured zero expression ("we could not look" != "no RNA").
+    assert out["normal_expression_status"] == "UNASSESSED"
+    assert out["normal_hspc_status"] == "UNASSESSED"
+    assert out["safety_status"] == "SAFETY_PARTIAL"
+    assert "normal_expression_unassessed" in out["safety_reason"]
+
+    # The measured-zero sibling stays ASSESSED (covered also by
+    # test_zero_expression_is_assessed_when_gene_is_present).
+
+
+def test_ws4_score_treatment_of_blank_versus_measured_zero_expression():
+    # The deliberate, documented numeric choice: a blank event_expression
+    # contributes the SAME (zero) expression term as a measured zero.  It is
+    # conservative - missing evidence never INFLATES the expression score -
+    # and the row-level expression_evidence_status keeps the two states
+    # distinguishable (UNASSESSED_* vs GENE_TPM_MEASURED).
+    from neoag.scoring import score_event
+
+    base = {
+        "event_confidence": "0.8", "driver_relevance": "0.5",
+        "clonality": "0.8", "persistence": "0.7", "tumor_specificity": "0.9",
+    }
+    blank = score_event(dict(base, event_expression=""), {})["event_score"]
+    zero = score_event(dict(base, event_expression="0.0"), {})["event_score"]
+    assert blank == zero  # intentional equivalence, never an inflation
+    high = score_event(dict(base, event_expression="40"), {})["event_score"]
+    assert float(high) > float(blank)
