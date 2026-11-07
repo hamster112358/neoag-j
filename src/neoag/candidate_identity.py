@@ -51,6 +51,13 @@ def candidate_identity(row: Mapping[str, Any]) -> dict[str, str]:
     The event identity remains event-specific. A shared peptide-HLA identity can
     therefore collapse duplicate ranking positions while preserving links to
     distinct breakpoints, transcript hypotheses or ORFs.
+
+    event_identity_status states how the event identity was derived
+    (review D4-04) so consumers can honour an UNRESOLVED_ROW_FALLBACK
+    without string-sniffing the id prefix:
+      EXACT_PRIMARY_ID       - a caller-supplied event id was present
+      COORDINATE_DERIVED_ID  - synthesised from event_type/gene/coordinates
+      UNRESOLVED_ROW_FALLBACK- row digest; NOT a biological event identity
     """
     event_source = _text(
         row,
@@ -60,13 +67,16 @@ def candidate_identity(row: Mapping[str, Any]) -> dict[str, str]:
         "source_event_id",
         "event_name",
     )
-    if not event_source:
+    if event_source:
+        identity_status = "EXACT_PRIMARY_ID"
+    else:
         coordinate_parts = [
             _text(row, field)
             for field in ("event_type", "gene", "chrom", "pos", "ref", "alt")
         ]
         if any(coordinate_parts):
             event_source = "|".join(coordinate_parts)
+            identity_status = "COORDINATE_DERIVED_ID"
         else:
             # Review D4-04: with no primary id AND no coordinates the old code
             # hashed the literal string "|||||", so every unrelated unknown row
@@ -78,6 +88,7 @@ def candidate_identity(row: Mapping[str, Any]) -> dict[str, str]:
                 f"{key}={row.get(key, '')}" for key in sorted(row, key=str)
             )
             event_source = "UNRESOLVED_EVENT_ROW:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+            identity_status = "UNRESOLVED_ROW_FALLBACK"
     event_id = _stable_id("EVT", event_source)
 
     protein_change = _text(
@@ -101,6 +112,7 @@ def candidate_identity(row: Mapping[str, Any]) -> dict[str, str]:
         "protein_change_identity_id": protein_id,
         "peptide_sequence_id": peptide_id,
         "peptide_hla_id": peptide_hla_id,
+        "event_identity_status": identity_status,
     }
 
 

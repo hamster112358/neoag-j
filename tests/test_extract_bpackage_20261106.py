@@ -228,3 +228,57 @@ def test_b1_05_header_only_csf_sniff_now_samples_records(tmp_path):
         encoding="utf-8",
     )
     assert vcf_has_csq_annotations(annotated)
+
+
+def test_b2_01_protein_context_loss_warns_loudly_and_names_its_scope(tmp_path, capsys):
+    # Round-2 (HANDOFF section II, B2-01): WT-context loss is a sensitivity
+    # risk.  The counter alone was too quiet - the run must say so on stderr
+    # and say whether the loss is row-level (column present, row empty) or
+    # batch-wide (protein plugin never ran, column absent).
+    entry = csq_entry("T", "missense_variant", pos="4", aa="K/N", wt="")
+    vcf = tmp_path / "rowloss.vcf"
+    _write_vcf(
+        vcf,
+        header_extra=SINGLE,
+        records=[f"chr1\t100\t.\tA\tT\t.\tPASS\tCSQ={entry}\tGT:AD:AF\t0/1:20,5:0.25"],
+    )
+    summary = extract_variant_peptides_from_vcf(vcf, tmp_path / "pep.tsv", sample_id="T1", lengths=(8,))
+    assert summary["variants_dropped_no_protein_context"] == 1
+    assert summary["sensitivity_warning"].startswith("1 of 1 variant(s) produced no peptide")
+    assert "per-reason funnel" in summary["sensitivity_warning"]
+    assert capsys.readouterr().err.startswith("WARNING: 1 of 1 variant(s) produced no peptide")
+
+    trimmed = [field for field in CSQ_FIELDS if field != "WildtypeProtein"]
+    header_trimmed = (
+        '##INFO=<ID=CSQ,Number=.,Type=String,Description="Consequence annotations from Ensembl VEP. '
+        "Format: " + "|".join(trimmed) + '">'
+    )
+    row = {name: "" for name in trimmed}
+    row.update({
+        "Allele": "T", "Consequence": "missense_variant", "IMPACT": "MODERATE",
+        "SYMBOL": "GENE1", "Gene": "ENSG0001", "Feature_type": "Transcript",
+        "Feature": "ENST00001.1", "BIOTYPE": "protein_coding",
+        "Protein_position": "4", "Amino_acids": "K/N",
+    })
+    vcf2 = tmp_path / "batchloss.vcf"
+    vcf2.write_text(
+        "\n".join([header_trimmed, SINGLE,
+                   f"chr1\t100\t.\tA\tT\t.\tPASS\tCSQ={'|'.join(row[f] for f in trimmed)}\tGT:AD:AF\t0/1:20,5:0.25"]) + "\n",
+        encoding="utf-8",
+    )
+    summary2 = extract_variant_peptides_from_vcf(vcf2, tmp_path / "pep2.tsv", sample_id="T1", lengths=(8,))
+    assert summary2["variants_dropped_no_protein_context"] == 1
+    assert "batch-wide" in summary2["sensitivity_warning"]
+    assert capsys.readouterr().err.count("WARNING:") == 1
+
+    # A fully annotated variant carries no warning.
+    vcf3 = tmp_path / "clean.vcf"
+    clean_entry = csq_entry("T", "missense_variant", pos="4", aa="K/N")
+    _write_vcf(
+        vcf3,
+        header_extra=SINGLE,
+        records=[f"chr1\t100\t.\tA\tT\t.\tPASS\tCSQ={clean_entry}\tGT:AD:AF\t0/1:20,5:0.25"],
+    )
+    summary3 = extract_variant_peptides_from_vcf(vcf3, tmp_path / "pep3.tsv", sample_id="T1", lengths=(8,))
+    assert summary3["sensitivity_warning"] == ""
+    assert summary3["variants_with_peptides"] == 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -1119,6 +1120,24 @@ def extract_variant_peptides_from_vcf(
         )
 
     write_tsv(out, rows, OUTPUT_FIELDS)
+    # Review B2-01 (round 2): WT-context loss is a sensitivity risk, so it
+    # must be loud, not just counted.  The CSQ header check is the preflight:
+    # no WildtypeProtein column means the protein-sequence VEP plugin did
+    # not run and every missense/nonsense variant can drop at once.
+    csq_wt_present = bool(csq_idx and csq_idx.get("WildtypeProtein", -1) >= 0)
+    sensitivity_warning = ""
+    if variants_dropped_no_protein_context > 0:
+        sensitivity_warning = (
+            f"{variants_dropped_no_protein_context} of {variants_seen} variant(s) produced no peptide "
+            "because no WT/frameshift protein context exists (review B2-01 never fabricates WT); "
+            + (
+                "the CSQ table has NO WildtypeProtein column, so the protein VEP plugin likely did not "
+                "run and this drop is batch-wide - re-annotate before trusting sensitivity"
+                if not csq_wt_present
+                else "see variants_no_peptides_by_consequence for the per-reason funnel"
+            )
+        )
+        print(f"WARNING: {sensitivity_warning}", file=sys.stderr)
     return {
         "input_vcf": str(path),
         "output_tsv": str(out),
@@ -1126,6 +1145,7 @@ def extract_variant_peptides_from_vcf(
         "variants_with_peptides": variants_with_peptides,
         "variants_skipped_multi_aa": variants_skipped_multi_aa,
         "variants_dropped_no_protein_context": variants_dropped_no_protein_context,
+        "sensitivity_warning": sensitivity_warning,
         "filter_status_counts": dict(sorted(filter_counts.items())),
         "variants_no_peptides_by_consequence": dict(sorted(variants_no_peptides_by_consequence.items())),
         "csq_wildtype_column": "yes" if csq_idx and csq_idx.get("WildtypeProtein", -1) >= 0 else "no",
