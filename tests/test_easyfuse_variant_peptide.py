@@ -529,3 +529,168 @@ def test_snv_only_run_has_no_fusion_columns(tmp_path):
     assert rows
     # VCF path without a reference proteome: unassessed, not fabricated "no".
     assert all(r["in_normal_proteome"] == "UNASSESSED" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-10 follow-up investigation regressions: which inputs can produce
+# peptides made ENTIRELY of downstream-partner residues (downstream_probe.py
+# cases A-F). Each test pins the corrected tree's behaviour and, where the
+# corrected tree deliberately keeps a documented residual gap, pins that too.
+# Sequences use only sanitizer-whitelist letters ACDEFGHIKLMNPQRSTVWY.
+# ---------------------------------------------------------------------------
+
+_HEAD22 = "MNACDEFGHIKLMNPQRSTVWY"          # 22 aa
+_TAIL20 = "KMSEQWAPRTVYHCGDNFVC"            # 20 aa
+
+
+def test_downstream_first_context_stays_eligible_documents_residual_gap(tmp_path):
+    # Residual gap (documented, fix requires parent-order verification): a
+    # context that starts with the downstream partner but self-reports a
+    # valid internal junction is consumed unvalidated. The coordinate fix
+    # guarantees windows straddle the ASSEMBLED junction (so no window can
+    # lie entirely in the N-terminal head), but eligibility cannot be
+    # denied from sequence alone.
+    bad = _TAIL20 + _HEAD22  # label says head gene first; sequence says otherwise
+    table = _fusion_table(
+        tmp_path,
+        fusion_protein_sequence=bad,
+        fusion_protein_sequence_bp="20",
+    )
+    result = build_easyfuse_catalog(table, "S1", "default", lengths=(8,))
+    rows = result.catalog_rows
+    assert rows
+    for r in rows:
+        assert int(r["peptide_start_aa"]) <= 20 < int(r["peptide_end_aa"])
+        # nothing emitted from the pure-downstream N-terminal head band
+        assert int(r["peptide_end_aa"]) > 20
+        assert r["junction_eligibility"] == "ELIGIBLE_JUNCTION_OVERLAP"
+    assert min(int(r["peptide_start_aa"]) for r in rows) == 14  # 20-8+2
+
+
+def test_internal_start_assembly_never_emits_head_natives(tmp_path):
+    # Deployed defect: windows anchored at constant position 13 emitted the
+    # assembled head verbatim (EWSR1::WT1 RTHTGKTSEK = WT1 403-412 pattern).
+    # Corrected: windows sit at the reported junction 22, so no pure-head
+    # substring is emitted at all - even when the head IS a normal protein.
+    fusion = _HEAD22 + _TAIL20
+    table = _fusion_table(
+        tmp_path,
+        fusion_protein_sequence=fusion,
+        fusion_protein_sequence_bp="22",
+    )
+    fasta = tmp_path / "head.fa"
+    fasta.write_text(f">head_parent\n{_HEAD22}\n", encoding="utf-8")
+    index = build_proteome_kmer_index(read_fasta_sequences(fasta), (8,))
+    result = build_easyfuse_catalog(
+        table, "S1", "default", lengths=(8,),
+        peptide_cfg=EasyFusePeptideConfig(
+            normal_proteome_index=index, normal_proteome_source="unit-test",
+        ),
+    )
+    rows = result.catalog_rows
+    assert rows
+    emitted = {r["mutant_peptide"] for r in rows}
+    assert not any(pep in _HEAD22 for pep in emitted)
+    head_band = {fusion[i:i + 8] for i in range(2, 14)}  # deployed N-term band
+    assert emitted.isdisjoint(head_band)
+    for r in rows:
+        assert r["in_normal_proteome"] == "no"
+        assert int(r["peptide_start_aa"]) <= 22 < int(r["peptide_end_aa"])
+
+
+def test_inconsistent_neo_bp13_cannot_reach_downstream_only_windows(tmp_path):
+    # An inconsistent explicit neo bp (13 while the fusion junction is 10)
+    # used to open the fully-downstream channel (probe B2: 12 native
+    # downstream peptides). Corrected: the validated fusion coordinate wins,
+    # the disagreement is flagged, and no window starts past the junction.
+    fusion = "ACDEFGHIKL" + _TAIL20  # junction after residue 10
+    table = _fusion_table(
+        tmp_path,
+        fusion_protein_sequence=fusion,
+        fusion_protein_sequence_bp="10",
+        neo_peptide_sequence=fusion[:26],
+        neo_peptide_sequence_bp="13",
+    )
+    fasta = tmp_path / "down.fa"
+    fasta.write_text(f">down_parent\n{_TAIL20}\n", encoding="utf-8")
+    index = build_proteome_kmer_index(read_fasta_sequences(fasta), (8,))
+    result = build_easyfuse_catalog(
+        table, "S1", "default", lengths=(8,),
+        peptide_cfg=EasyFusePeptideConfig(
+            normal_proteome_index=index, normal_proteome_source="unit-test",
+        ),
+    )
+    rows = result.catalog_rows
+    assert rows
+    assert _TAIL20[:8] not in {r["mutant_peptide"] for r in rows}
+    for r in rows:
+        assert int(r["peptide_start_aa"]) <= 10  # never downstream-only
+        assert int(r["peptide_end_aa"]) > 10
+        assert r["peptide_context_ambiguous_coordinates"] == "yes"
+        assert r["junction_eligibility"] == "UNASSESSED_AMBIGUOUS_COORDINATES"
+        assert r["in_normal_proteome"] == "no"  # every window is chimeric
+
+
+def test_multi_ftid_collapse_selects_reads_regardless_of_context(tmp_path):
+    # Probe E: one BPID, two FTID hypotheses. Selection (max_junction_reads)
+    # is by read support only - a downstream-first hypothesis with more
+    # reads wins and supplies all peptides under the shared event label.
+    # Pinned as a documented residual gap of the current design.
+    bad = _TAIL20 + _DEEP_LEFT[:20]
+    path = tmp_path / "ef_two.tsv"
+    row_tpl = {
+        "BPID": "BP_X", "Fusion_Gene": "A::B",
+        "Breakpoint1": "chr1:100:+", "Breakpoint2": "chr2:200:-",
+        "type": "trans", "frame": "in_frame",
+        "neo_peptide_sequence": "", "neo_peptide_sequence_bp": "",
+        "prediction_prob": "0.9", "prediction_class": "positive",
+        "ft_anch_cnt": "30",
+    }
+    lines = ["\t".join(_EF_COLS)]
+    for ftid, protein, bp, junc in (
+            ("FT_good", _DEEP_FUSION, "60", "5"),
+            ("FT_bad", bad, "20", "20")):
+        row = dict(row_tpl, FTID=ftid, fusion_protein_sequence=protein,
+                   fusion_protein_sequence_bp=bp, ft_junc_cnt=junc)
+        lines.append("\t".join(str(row[c]) for c in _EF_COLS))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = build_easyfuse_catalog(path, "S1", "default", lengths=(8,))
+    assert result.collapse_qc
+    qc = result.collapse_qc[0]
+    assert qc["selected_ftid"] == "FT_bad"
+    assert qc["rejected_ftids"] == "FT_good"
+    rows = result.catalog_rows
+    assert rows and all(r["fusion_transcript_id"] == "FT_bad" for r in rows)
+    for r in rows:
+        assert int(r["peptide_start_aa"]) <= 20 < int(r["peptide_end_aa"])
+        assert r["gene"] == "A::B"  # label from the event, protein from FT_bad
+
+
+def test_shared_segment_junction_window_is_native_and_still_eligible(tmp_path):
+    # Probe F: a window straddling a GENUINE junction can exact-match a
+    # normal protein when the parents share sequence. The native flag must
+    # not silently revoke junction eligibility (orthogonal columns), and
+    # junction eligibility must not pretend the window is novel.
+    fusion = _HEAD22[:20] + _TAIL20  # junction after residue 20
+    window = fusion[13:21]  # residues 14..21, straddles the junction
+    table = _fusion_table(
+        tmp_path,
+        fusion_protein_sequence=fusion,
+        fusion_protein_sequence_bp="20",
+    )
+    fasta = tmp_path / "shared.fa"
+    fasta.write_text(f">shared_protein\nM{window}P\n", encoding="utf-8")
+    index = build_proteome_kmer_index(read_fasta_sequences(fasta), (8,))
+    result = build_easyfuse_catalog(
+        table, "S1", "default", lengths=(8,),
+        peptide_cfg=EasyFusePeptideConfig(
+            normal_proteome_index=index, normal_proteome_source="unit-test",
+        ),
+    )
+    hit = [r for r in result.catalog_rows if r["mutant_peptide"] == window]
+    assert hit
+    for r in hit:
+        assert r["in_normal_proteome"] == "yes"
+        assert r["contains_novel_aa"] == "no"
+        assert r["junction_eligibility"] == "ELIGIBLE_JUNCTION_OVERLAP"
+        assert r["crosses_junction"] == "yes"
