@@ -103,6 +103,8 @@ PEPTIDE_FIELDS = [
     "fusion_left_gene","fusion_right_gene","fusion_left_peptide","fusion_right_peptide",
     "fusion_junction_display","fusion_peptide_classification","fusion_orf_comparison_status",
     "peptide_context","peptide_context_bp","peptide_context_status",
+    "peptide_context_ambiguous_coordinates","junction_eligibility",
+    "junction_protein_position","in_normal_proteome","normal_proteome_source",
     "rna_junction_reads","rna_junction_source","rna_frame_status",
     "unique_junction_reads","junction_total_coverage","splice_psi",
     "junction_read_qc_status","junction_read_qc_failed_checks",

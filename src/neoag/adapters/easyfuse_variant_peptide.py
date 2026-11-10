@@ -103,6 +103,20 @@ SUMMARY_QC_FIELDS = [
     "peptide_context_neo_fallback_rows",
     "peptide_context_invalid_rows",
     "generation_method",
+    "generation_fingerprint",
+]
+
+# Peptide-level provenance that must survive into the merged
+# variant_peptides.tsv whenever fusion rows are present (fusion audit
+# requirement: preserve peptide-level provenance end to end).
+FUSION_PEPTIDE_PROVENANCE_FIELDS = [
+    "peptide_context",
+    "peptide_context_bp",
+    "peptide_context_status",
+    "peptide_context_ambiguous_coordinates",
+    "junction_eligibility",
+    "junction_protein_position",
+    "normal_proteome_source",
 ]
 
 
@@ -115,6 +129,12 @@ class EasyFusePeptideConfig:
     isoform_strategy: EasyFuseIsoformStrategy = "max_junction_reads"
     mini_len: int = 10
     minigene_total_len: int | None = None
+    # Optional exact-match index of the pinned normal proteome (build it with
+    # vep.extract_peptides.build_proteome_kmer_index). When absent,
+    # in_normal_proteome/contains_novel_aa stay UNASSESSED - they are never
+    # asserted without an actual comparison.
+    normal_proteome_index: dict[int, set[str]] | None = None
+    normal_proteome_source: str = ""
 
 
 @dataclass
@@ -144,6 +164,47 @@ def fusion_generation_method(
         parts.append("dedup_per_event")
     parts.append(f"isoform={isoform_strategy}")
     return ";".join(parts)
+
+
+def fusion_generation_fingerprint(
+    lengths: tuple[int, ...],
+    *,
+    junction_only: bool,
+    dedup_per_event: bool,
+    isoform_strategy: str,
+    normal_proteome_provided: bool = False,
+    normal_proteome_source: str = "",
+) -> str:
+    """Deterministic digest of everything that changes fusion peptide output.
+
+    The production runner reuses existing outputs purely on file existence,
+    so a stale fusion catalog can outlive the code that produced it (2026-11
+    fusion audit, mechanism F). Embedding this fingerprint in summary_qc makes
+    stale reuse auditable: it changes whenever the generation parameters, the
+    pinned normal-proteome identity behind the eligibility flags, or this
+    module's own source changes, and any rerun can be diffed against it.
+    """
+    import hashlib
+    import inspect
+
+    module = inspect.getmodule(fusion_generation_fingerprint)
+    try:
+        module_source = inspect.getsource(module) if module is not None else ""
+    except (OSError, TypeError):
+        module_source = ""
+    module_digest = hashlib.sha256(module_source.encode("utf-8")).hexdigest()[:16]
+    parts = [
+        "EFGEN1",
+        "k=%s" % ",".join(str(x) for x in lengths),
+        "junction_only=%d" % int(junction_only),
+        "dedup_per_event=%d" % int(dedup_per_event),
+        "isoform=%s" % isoform_strategy,
+        "proteome_index=%s" % ("yes" if normal_proteome_provided else "no"),
+        "proteome_source=%s" % normal_proteome_source,
+        "module_sha256=%s" % module_digest,
+    ]
+    payload = ";".join(parts)
+    return "EFGEN1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
 def build_fusion_centered_minigene(
@@ -210,14 +271,27 @@ def select_fusion_peptide_context(row: dict[str, str]) -> dict[str, Any]:
     fp_bp = _bp_int(fp_bp_raw)
     neo_bp = _bp_int(neo_bp_raw)
     if fusion_protein and fp_bp is not None and 0 < fp_bp < len(fusion_protein):
+        # Cross-check the two coordinate spaces when BOTH carry a valid
+        # breakpoint: the neo window is by construction a slice of the fusion
+        # protein centred on the junction, so its implied start
+        # (fp_bp - neo_bp) must be non-negative. A negative implied start
+        # means the two spaces disagree about where the junction sits; window
+        # coordinates are then NOT eligible as junction evidence.
+        ambiguous = bool(neo and neo_bp is not None and fp_bp - neo_bp < 0)
         return {
             "sequence": fusion_protein,
             "context": "fusion_protein",
             "bp_pos": fp_bp,
             "status": "CONTEXT_FUSION_PROTEIN",
+            "ambiguous_coordinates": "yes" if ambiguous else "no",
             "detail": (
                 f"fusion_protein_sequence_bp={fp_bp_raw} valid for "
                 f"fusion_protein length {len(fusion_protein)}"
+                + (
+                    f"; neo_peptide_sequence_bp={neo_bp} inconsistent "
+                    f"(implied neo start {fp_bp - neo_bp} < 0)"
+                    if ambiguous else ""
+                )
             ),
         }
     if neo and neo_bp is not None and 0 < neo_bp < len(neo):
@@ -226,6 +300,7 @@ def select_fusion_peptide_context(row: dict[str, str]) -> dict[str, Any]:
             "context": "neo_peptide",
             "bp_pos": neo_bp,
             "status": "CONTEXT_NEO_FALLBACK",
+            "ambiguous_coordinates": "no",
             "detail": (
                 f"no valid fusion protein coordinate (fusion_protein length "
                 f"{len(fusion_protein)}, fusion_protein_sequence_bp={fp_bp_raw or 'missing'}); "
@@ -237,6 +312,7 @@ def select_fusion_peptide_context(row: dict[str, str]) -> dict[str, Any]:
         "context": "",
         "bp_pos": 0,
         "status": "CONTEXT_INVALID",
+        "ambiguous_coordinates": "no",
         "detail": (
             f"no coordinate validated: fusion_protein length {len(fusion_protein)} "
             f"bp={fp_bp_raw or 'missing'}; neo length {len(neo)} "
@@ -396,6 +472,15 @@ def easyfuse_row_to_variant_peptide_rows(
         return []
     bp_pos = int(ctx["bp_pos"])
     peptide_context = str(ctx["sequence"])
+    if ctx.get("ambiguous_coordinates") == "yes":
+        junction_eligibility = "UNASSESSED_AMBIGUOUS_COORDINATES"
+    else:
+        junction_eligibility = "ELIGIBLE_JUNCTION_OVERLAP"
+    proteome_index = peptide_cfg.normal_proteome_index
+    proteome_source = (
+        peptide_cfg.normal_proteome_source
+        or ("provided" if proteome_index is not None else "not_provided")
+    )
     g1, g2 = _gene_pair(row)
     gene = _gene_label(g1, g2)
     chrom, pos = _breakpoint_chrom_pos(first(row, ["Breakpoint1", "breakpoint1"], ""))
@@ -419,7 +504,16 @@ def easyfuse_row_to_variant_peptide_rows(
     out: list[dict[str, str]] = []
     for win_idx, win in enumerate(windows, start=1):
         pid = f"{sample_id}.EF{row_index}.{win_idx}"
-        out.append({
+        peptide_seq = win["mutant_peptide"]
+        if proteome_index is None:
+            in_normal_proteome = "UNASSESSED"
+            contains_novel_aa = "UNASSESSED"
+        else:
+            from ..vep.extract_peptides import peptide_in_normal_proteome
+            hit = peptide_in_normal_proteome(peptide_seq, proteome_index)
+            in_normal_proteome = "yes" if hit else "no"
+            contains_novel_aa = "no" if hit else "yes"
+        row_out = {
             "peptide_id": pid,
             "gene": gene,
             "ensembl_gene_id": "",
@@ -447,7 +541,7 @@ def easyfuse_row_to_variant_peptide_rows(
                 minigene_total_len=peptide_cfg.minigene_total_len,
             ),
             "minigene_nt": "",
-            "in_normal_proteome": "no",
+            "in_normal_proteome": in_normal_proteome,
             "variant_key": variant_key,
             "candidate_union_source": event.get("candidate_union_source", ""),
             "internal_tool_count": event.get("internal_tool_count", ""),
@@ -457,6 +551,10 @@ def easyfuse_row_to_variant_peptide_rows(
             "peptide_context": ctx["context"],
             "peptide_context_bp": str(bp_pos),
             "peptide_context_status": ctx["status"],
+            "peptide_context_ambiguous_coordinates": ctx.get("ambiguous_coordinates", "no"),
+            "junction_eligibility": junction_eligibility,
+            "junction_protein_position": str(bp_pos),
+            "normal_proteome_source": proteome_source,
             "peptide_label": (
                 f"GENE={gene}|FUSION={fusion_gene}|EF={eid}"
                 f"|NEO={win['mutant_peptide']}|BP={bp_pos}"
@@ -473,7 +571,12 @@ def easyfuse_row_to_variant_peptide_rows(
             "source_file": str(first(row, ["source_file"], "")),
             "source_record_id": first(row, ["BPID", "bpid", "FTID", "ftid"], ""),
             **win,
-        })
+        }
+        # Novelty is a claim about sequence comparison, not about window
+        # geometry: replace the per-window geometric value with the exact-match
+        # verdict against the pinned normal proteome (UNASSESSED when absent).
+        row_out["contains_novel_aa"] = contains_novel_aa
+        out.append(row_out)
     return out
 
 
@@ -501,6 +604,14 @@ def build_easyfuse_catalog(
         junction_only=peptide_cfg.junction_only,
         dedup_per_event=peptide_cfg.dedup_per_event,
         isoform_strategy=peptide_cfg.isoform_strategy,
+    )
+    generation_fingerprint = fusion_generation_fingerprint(
+        lengths,
+        junction_only=peptide_cfg.junction_only,
+        dedup_per_event=peptide_cfg.dedup_per_event,
+        isoform_strategy=peptide_cfg.isoform_strategy,
+        normal_proteome_provided=peptide_cfg.normal_proteome_index is not None,
+        normal_proteome_source=peptide_cfg.normal_proteome_source,
     )
 
     catalog_rows: list[dict[str, str]] = []
@@ -631,6 +742,7 @@ def build_easyfuse_catalog(
         "peptide_context_neo_fallback_rows": str(context_counts.get("CONTEXT_NEO_FALLBACK", 0)),
         "peptide_context_invalid_rows": str(context_counts.get("CONTEXT_INVALID", 0)),
         "generation_method": generation_method,
+        "generation_fingerprint": generation_fingerprint,
     }
 
     return EasyFuseCatalogResult(

@@ -117,6 +117,17 @@ def peptide_from_variant_row(
         "peptide_context": row.get("peptide_context", ""),
         "peptide_context_bp": row.get("peptide_context_bp", ""),
         "peptide_context_status": row.get("peptide_context_status", ""),
+        # Fusion audit: the normal-parent exact-match verdict and the
+        # junction-eligibility verdict travel with the peptide into
+        # prediction/ranking.  No comparison performed = UNASSESSED, never
+        # an implied pass.
+        "in_normal_proteome": row.get("in_normal_proteome") or "UNASSESSED",
+        "junction_eligibility": row.get("junction_eligibility") or "UNASSESSED",
+        "peptide_context_ambiguous_coordinates": row.get(
+            "peptide_context_ambiguous_coordinates", ""
+        ),
+        "junction_protein_position": row.get("junction_protein_position", ""),
+        "normal_proteome_source": row.get("normal_proteome_source", ""),
         "transcript_id": row.get("transcript_id", ""),
         "rna_junction_reads": "",
         "hla_allele": hla,
@@ -349,13 +360,29 @@ def run_variant_peptide_upstream(
     ef_events: list[dict[str, str]] = []
     ef_qc_paths: dict[str, str] = {}
     if easyfuse_file:
+        peptide_cfg = resolve_easyfuse_peptide_config(cfg)
+        if peptide_cfg.normal_proteome_index is None and opts["normal_proteome_fasta"]:
+            # Same pinned proteome the SNV path compares against (same input
+            # key / env var), so a fusion window that is a native-parent
+            # peptide is flagged with the exact same lookup the audit used.
+            from ..vep.extract_peptides import (
+                build_proteome_kmer_index,
+                read_fasta_sequences,
+            )
+
+            proteome_seqs = read_fasta_sequences(str(opts["normal_proteome_fasta"]))
+            if proteome_seqs:
+                peptide_cfg.normal_proteome_index = build_proteome_kmer_index(
+                    proteome_seqs, opts["lengths"]
+                )
+                peptide_cfg.normal_proteome_source = str(opts["normal_proteome_fasta"])
         ef_result = build_easyfuse_catalog(
             easyfuse_file,
             sample_id,
             profile_name,
             lengths=opts["lengths"],
             filter_cfg=resolve_easyfuse_filter_config(cfg),
-            peptide_cfg=resolve_easyfuse_peptide_config(cfg),
+            peptide_cfg=peptide_cfg,
         )
         ef_rows = ef_result.catalog_rows
         ef_events = ef_result.events
@@ -372,7 +399,16 @@ def run_variant_peptide_upstream(
             f"{f' and {easyfuse_file}' if easyfuse_file else ''}"
         )
 
-    write_tsv(variant_tsv, catalog_rows, OUTPUT_FIELDS)
+    out_fields = list(OUTPUT_FIELDS)
+    if ef_rows:
+        # Fusion runs carry the peptide-level junction/proteome provenance
+        # into the merged catalog; SNV-only output stays byte-identical.
+        from .easyfuse_variant_peptide import FUSION_PEPTIDE_PROVENANCE_FIELDS
+
+        out_fields.extend(
+            f for f in FUSION_PEPTIDE_PROVENANCE_FIELDS if f not in out_fields
+        )
+    write_tsv(variant_tsv, catalog_rows, out_fields)
 
     events, peptides = variant_peptide_rows_to_raw_tables(
         vcf_rows,

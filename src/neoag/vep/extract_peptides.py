@@ -1104,7 +1104,9 @@ def extract_variant_peptides_from_vcf(
                         peptide_end_aa=pep.get("peptide_end_aa"),
                         peptide_centered=peptide_centered_minigene,
                     )
-                    in_normal = "no"
+                    # No comparison, no claim: without an index the verdict
+                    # is UNASSESSED, never an implied "no" (fusion audit).
+                    in_normal = "UNASSESSED"
                     if proteome_index is not None:
                         in_normal = (
                             "yes"
